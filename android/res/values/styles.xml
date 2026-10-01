@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Framework-only theme: no AppCompat/AndroidX dependency is pulled in. -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/brand_deep</item>
+        <item name="android:statusBarColor">@color/brand_deep</item>
+        <item name="android:navigationBarColor">@color/brand_deep</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

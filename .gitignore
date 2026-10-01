@@ -1,0 +1,61 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+credentials/
+
+# Test / coverage artefacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local scratch
+*.log
+*.tmp
+_out.txt
+_report.txt
+
+# Generated artefacts — regenerable, so never committed.
+#   python scripts/handoff_pdf.py   -> ActionMesh-Handoff.pdf
+#   python scripts/snapshot.py      -> actionmesh-snapshot-<stamp>.zip (beside the tree)
+ActionMesh-Handoff.pdf
+*actionmesh-snapshot*
+
+# Android build toolchain and outputs — large, downloaded, regenerable.
+#   python scripts/build_apk.py     -> dist/actionmesh-<version>.apk
+android-toolchain/
+*.keystore
+*.jks
+

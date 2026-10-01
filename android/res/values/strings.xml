@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ActionMesh</string>
+    <!-- Base URL of the ActionMesh server. 10.0.2.2 is the host machine as seen
+         from the Android emulator. The build script's URL option can override
+         this, so a build can be pre-pointed at a real host. -->
+    <string name="default_server_url">http://10.0.2.2:8000</string>
+</resources>
