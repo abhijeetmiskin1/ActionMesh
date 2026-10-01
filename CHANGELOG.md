@@ -9,6 +9,25 @@ complete when its tests have actually been executed and passed.
 
 ## [Unreleased] — 2026-09-30
 
+## Repository — version control restored (the history still does not exist)
+
+- `HANDOFF.md` claimed git "cannot be installed" because this machine's network
+  blocked github.com and git-scm.com. **That is no longer true.** github.com is
+  reachable, and git 2.53.0 is now installed into `~/.local/git` without root —
+  the Ubuntu `.deb` fetched with `apt-get download` and unpacked with
+  `dpkg-deb -x` — and added to `~/.bashrc`.
+- The repository was initialised on `main` with one first commit capturing the
+  verified C0–C18 state: **131 tracked files**, `ruff` clean, **417 tests OK**.
+  Nothing from `.venv/`, `build/`, `dist/`, `android-toolchain/`, caches, the
+  generated PDF or any keystore is tracked; `git fsck` reports a valid object
+  store.
+- **This history starts after the reconstruction, not during it.** The original
+  tree and its `.git/` are gone and cannot be recovered, so there is no history
+  before this commit — a real limitation, not a formality.
+- `scripts/snapshot.py` is kept as an independent zip backup (belt and braces).
+  Its "run it after every significant change" advice is now a secondary habit
+  rather than the only defence against losing the work.
+
 ## C18 — Intent to plan (the pipeline stage that was missing)
 
 ### Added — a planner, and the trust boundary it draws

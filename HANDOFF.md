@@ -56,6 +56,8 @@ python -m actionmesh.cli dashboard
 python scripts/snapshot.py
 python scripts/handoff_pdf.py
 python scripts/build_apk.py            # signed Android APK -> dist/
+git status                             # what changed since the last commit
+git --no-pager log --oneline
 ```
 
 For a local HTTP server, install the optional server extra and run
@@ -195,10 +197,12 @@ An action with no verification strategy is UNSUPPORTED, not successful.
 
 ## Known gaps and risks (be honest about these)
 
-- **No git repository exists**, and git cannot be installed — this machine's
-  network blocks github.com and git-scm.com (only python.org was reachable).
-  `scripts/snapshot.py` writes a timestamped zip outside the tree; **run it
-  after every significant change**. The original tree was lost once already.
+- **Version control exists now; the history does not.** The original `.git/` was
+  lost with the tree, and git was not installed on that machine. git 2.53.0 is now
+  extracted locally (no root required) and the repository was initialised on
+  `main` with a first commit capturing the verified C0–C18 state. So: real diffs,
+  rollback and blame **from that commit onward**, and no history before it.
+  `scripts/snapshot.py` is retained as an independent zip backup.
 - **Docker/ASGI packaging is available.** Docker was not installed locally, but
   the wheel build succeeded. The `actionmesh` CLI exposes
   capability, dashboard, and optional serve commands; deployment still needs

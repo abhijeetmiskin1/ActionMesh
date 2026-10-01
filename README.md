@@ -97,13 +97,15 @@ chain would be a lie in a system built to report what actually happened.
 > ### ⚠️ This repository is a reconstruction
 >
 > The original working tree was deleted during development. `.git/` was lost
-> with it and no backup exists. Everything here was **rewritten from the
-> architecture and design**, then verified by executing it. It is a
-> reconstruction, not a restoration: treat the code as a fresh implementation
-> and re-verify before relying on it.
+> with it. Everything here was **rewritten from the architecture and design**,
+> then verified by executing it. It is a reconstruction, not a restoration:
+> treat the code as a fresh implementation and re-verify before relying on it.
 >
-> `scripts/snapshot.py` exists to create a zip backup of the tree, because
-> there is still no git. Run it after any significant change.
+> **The first commit was made after the reconstruction, not during it.** This
+> history therefore starts from a verified state — real diffs, real rollback and
+> real blame from that commit onward, and no history before it.
+> `scripts/snapshot.py` is kept as an independent zip backup; it is belt and
+> braces, not the primary safety net.
 
 ### What is real vs. simulated
 

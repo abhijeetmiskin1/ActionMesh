@@ -210,5 +210,6 @@ APK plus one snapshot guard, a lint pass un-shadowed 4 cycle tests, and C18 adde
   tests in `tests/unit/test_android_apk.py` (the end-to-end checks skip until an
   APK has been built).
 - **`scripts/snapshot.py`** — offline zip backup written *beside* the tree.
-  Run it after every significant change; the original tree was lost once.
+  Since C0 the repository has been on git (`main`); this is now an independent
+  second copy, not the only defence against losing the work.
   Covered by 11 tests in `tests/unit/test_snapshot.py`.

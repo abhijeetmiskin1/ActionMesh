@@ -704,7 +704,7 @@ def main(argv: list[str] | None = None) -> int:
 
     doc = Document("ActionMesh \u2014 Engineering Handoff")
     facts = [
-        ("Repository", "reconstruction; .git/ absent"),
+        ("Repository", "reconstruction; history starts post-hoc"),
         ("Runtime suite", _tests_line(ROOT)),
         ("Implemented", "C0-C12, C14-C17"),
         ("Deferred", "C13 vendor adapters"),
