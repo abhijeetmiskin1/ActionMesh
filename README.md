@@ -78,16 +78,40 @@ OK** (0 failures, 0 errors).
 
 Two ways to run the control room as an app:
 
-1. **PWA — no toolchain.** Open `/dashboard` in Chrome and choose **Add to home
-   screen**. The control room is a PWA — `manifest.webmanifest`, a service
-   worker, and a maskable SVG icon — so it installs to the home screen and
-   launches full-screen with no browser chrome. No APK, no app store, no
-   signing key.
-2. **Android APK — sideload.** `python scripts/build_apk.py` builds and signs
-   `dist/actionmesh-0.1.0.apk`, a dependency-free native shell (no AndroidX,
-   no Gradle) around the same `/dashboard`. Install with
-   `adb install -r dist/actionmesh-0.1.0.apk`; see
-   [`android/README.md`](android/README.md).
+1. **PWA — no toolchain.** Start the server, open `/dashboard` in Chrome on the
+   phone and choose **Add to home screen**. The control room is a PWA —
+   `manifest.webmanifest`, a service worker, and a maskable SVG icon — so it
+   installs to the home screen and launches full-screen with no browser chrome.
+   No APK, no app store, no signing key.
+2. **Android APK — sideload.** See below.
+
+#### Android, end to end
+
+The APK is a native `WebView` shell around the same `/dashboard` — no AndroidX,
+no Gradle. It needs the ActionMesh server to be reachable, so three steps:
+
+```bash
+# 1. Serve on all interfaces, not just localhost
+python -m actionmesh.cli serve --host 0.0.0.0 --port 8080
+
+# 2. Find this machine's address on the network (phone must share the Wi-Fi)
+hostname -I                       # e.g. 172.20.10.4
+
+# 3. Build an APK pointed at it, so it works with no setup on the device
+python scripts/build_apk.py --url http://172.20.10.4:8080 \
+                            --version-name 0.1.0-lan
+adb install -r dist/actionmesh-0.1.0-lan.apk
+```
+
+`dist/actionmesh-0.1.0.apk` (no `--url`) defaults to `http://10.0.2.2:8000`, the
+host machine as seen from an Android **emulator**. If the server address changes,
+the app never needs rebuilding: open the overflow menu → **Server…** and type the
+new base URL, which is remembered on the device.
+
+The app requests only `INTERNET` and declares `usesCleartextTraffic`, because a
+LAN ActionMesh server is normally plain HTTP. Put the server behind TLS for
+anything beyond a trusted network. Details in
+[`android/README.md`](android/README.md).
 
 The service worker caches **only the app shell**. It deliberately never caches
 `/audit`, `/executions`, or `/capabilities`: a stale execution record or audit

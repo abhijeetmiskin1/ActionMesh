@@ -137,9 +137,17 @@ const setBusy = (id, busy) => {
   button.textContent = busy ? 'Working...' : (button.dataset.idle || 'Done');
 };
 const errorText = error => error.name === 'AbortError' ? 'The service took too long to respond.' : error.message;
+// Element.replaceChildren arrived in Chrome 86. The Android 11 system
+// WebView here is Chrome 83 and genuinely lacks it — this threw a TypeError on
+// every load, so the console showed "Offline" while the API was answering 200.
+// textContent + appendChild works on every engine that can run this page.
+const replaceAll = (element, nodes) => {
+  element.textContent = '';
+  nodes.forEach(node => element.appendChild(node));
+};
 const renderList = (selector, values, formatter) => {
   const list = document.querySelector(selector);
-  list.replaceChildren(...(values.length ? values : ['None']).map(value => {
+  replaceAll(list, (values.length ? values : ['None']).map(value => {
     const row = document.createElement('li');
     row.textContent = typeof value === 'string' ? value : formatter(value);
     return row;
@@ -167,7 +175,7 @@ const renderList = (selector, values, formatter) => {
   document.querySelector('#railStatus').textContent = 'Service online';
     document.querySelector('#updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
   const actions = document.querySelector('#actions');
-  actions.replaceChildren(...capabilities.map(item => {
+  replaceAll(actions, capabilities.map(item => {
     const row = document.createElement('li');
     row.textContent = `${item.action} (${item.risk_level})`;
     return row;
@@ -240,7 +248,7 @@ document.querySelector('#plan').addEventListener('click', async () => {
     plannedActions = body.actions || [];
     const placeholder = planFeed.querySelector('li[data-empty]');
     if (placeholder) placeholder.remove();
-    planFeed.replaceChildren(...(plannedActions.length ? plannedActions.map(describeAction) : ['No actions proposed.']).map(text => {
+    replaceAll(planFeed, (plannedActions.length ? plannedActions.map(describeAction) : ['No actions proposed.']).map(text => {
       const row = document.createElement('li');
       row.textContent = text;
       return row;
