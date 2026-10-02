@@ -65,7 +65,7 @@ Executor acts.  Verifier confirms.  Audit remembers.
 | C17 | Android APK | **Built — signed (v2+v3) — 16 tests** |
 | C18 | Intent → plan (planner) | **Implemented — proposes only — 32 tests** |
 
-**Current test status:** `python -m unittest discover -s tests` → **417 tests,
+**Current test status:** `python -m unittest discover -s tests` → **425 tests,
 OK** (0 failures, 0 errors).
 
 ### Run it

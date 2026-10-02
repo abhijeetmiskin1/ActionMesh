@@ -14,13 +14,28 @@ may never skip them.
 | Layer | Package | Phase | Owns |
 |-------|---------|-------|------|
 | Protocol | `actionmesh/protocol/` | C1 | The vocabulary every layer speaks |
+| Planner | `actionmesh/core/planner.py` | C18 | Turns intent into an **untrusted candidate plan**; proposes only |
 | Registry | `actionmesh/core/registry/` | C2 | What actions exist and what they require |
 | Policy | `actionmesh/core/permissions/` | C3 | Whether an action may proceed |
 | Graph | `actionmesh/core/graph/` | C4 | The shape and order of a plan |
 | Execution | `actionmesh/core/executor/` | C5 | Executes authorized graphs and publishes lifecycle events |
 | Providers | `actionmesh/providers/` | C7 | Simulated domain adapters with independent observation |
 | Transport | `actionmesh/api.py` | C8-C9 | REST, SSE, and WebSocket boundaries |
-| Platform | `actionmesh/core/memory.py`, `devices.py`, `storage.py` | C10-C15 | Memory, presence, and SQLite foundations |
+| Platform | `actionmesh/core/memory.py`, `devices.py`, `storage.py`, `audit/` | C10-C16 | Memory, presence, SQLite persistence, hash-chained audit |
+| Client shell | `android/` | C17 | A native WebView app around the same `/dashboard`; no logic of its own |
+
+## The planner is the only untrusted *producer*
+
+Every other layer begins from data it received. The planner is the one component
+that manufactures data from human text, so it is the most likely place for a
+prompt-injection to land. Its output type is therefore deliberately impoverished:
+`ProposedAction` carries `{type, parameters}` and has **no field** for risk,
+permissions, dependencies, provider or lifecycle state. A model that "argues" for
+a lower risk or a `permissions: ["*"]` payload has nowhere to put it.
+
+Anything the planner cannot map is returned in `Plan.notes` rather than dropped.
+A plan that silently discarded half an intent would look complete, and the user
+would approve something other than what they asked for.
 
 ## Trust boundaries
 
@@ -98,12 +113,17 @@ back-edge in a dependency graph is neither.
 ## What is deliberately absent today
 
 - No live vendor integrations. All 16 seeded actions use simulated providers.
-- No production identity provider, live vendor integration, or deployment-level
-  backup and secret-management policy. The dashboard, CLI, and SQLite-backed
-  consent/idempotency stores are implemented; the default app wiring remains
-  in memory.
-- SQLite currently persists execution records; broader audit and observability
-  remain release work.
+- **The shipped planner is a deterministic rule-based reference planner, not a
+  language model.** No vendor LLM adapter is wired up. The planner is injectable,
+  so adding one changes nothing downstream — and its output is untrusted either
+  way, which is the point.
+- No production identity provider, and no deployment-level rate limiting, backup
+  or secret-management policy. The dashboard, CLI, and SQLite-backed
+  consent/idempotency/audit stores are implemented; the default app wiring
+  remains in memory.
+- Version control history begins **at** the reconstruction. The original `.git/`
+  was lost with the tree and cannot be recovered, so there is no history before
+  the first commit.
 
 Reporting this honestly matters more than shipping a dashboard that implies
 otherwise.

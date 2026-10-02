@@ -9,6 +9,33 @@ complete when its tests have actually been executed and passed.
 
 ## [Unreleased] — 2026-09-30
 
+## Docs — the published docs were stale, and now cannot silently rot again
+
+- **Found by audit, not by reading.** `docs/rest-api.md` still said "realtime
+  events are later phases" and listed 6 of the 21 registered routes. It omitted
+  `/plan`, `/consents`, `/metrics`, `/dashboard`, `/audit`, `/audit/verify`, the
+  PWA assets and both event transports — all shipped long ago.
+- It also showed a request body containing `"grants"`, **which the API
+  rejects**. The doc contradicted the very boundary it was describing.
+- Rewrote `docs/rest-api.md` (full route table, a `POST /plan` section, and a
+  "two gates, both required" section recording the measured finding that a
+  consent without a matching policy rule is still denied).
+- `docs/architecture.md` gained the missing **Planner** layer, a note on why the
+  planner is the only untrusted *producer*, and corrected its "deliberately
+  absent" list (audit persistence shipped; the shipped planner is rule-based, not
+  a model; history begins at the reconstruction).
+- `docs/deployment.md` gained an environment-variable table, portable shell
+  commands, and the Android client section.
+- `docs/security.md`'s open-threat row said "no untrusted content reaches the
+  planner" — true only because no planner existed. Replaced with the real
+  injection surface (`POST /plan` and the intent box) and its concrete
+  mitigations, rated **Low** with the caveat that a plan can still be *wrong*.
+- **8 new tests in `tests/unit/test_docs_freshness.py` compare the documented
+  surface against the routes the app actually registers, in both directions** — a
+  route nobody documented is a gap, and a documented path that does not exist is
+  a lie. Proven to fail: deleting one row from the table produced two failures.
+  The suite is now **425 passing tests**.
+
 ## Repository — version control restored (the history still does not exist)
 
 - `HANDOFF.md` claimed git "cannot be installed" because this machine's network

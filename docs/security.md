@@ -34,7 +34,7 @@ missing layer lands?"* rather than a comfortable "n/a".
 
 | Threat | Why open | Exposure today |
 |--------|----------|----------------|
-| Prompt injection via retrieved content | No retrieval layer exists. When one lands, retrieved text must be modelled as untrusted data — never as instruction | **None** — no untrusted content reaches the planner |
+| Prompt injection via the intent box | `POST /plan` and the control room turn **user text** into `ProposedAction` values — the first point where untrusted text becomes structured data. No retrieval layer exists; when one lands, retrieved text must be modelled as untrusted data too | **Low** — `ProposedAction` carries only `{type, parameters}`, so injected text has no risk/permission/state field to occupy; `plan_to_graph` re-validates every action, unmapped clauses surface in `Plan.notes`, and the browser can never hand the server a permission. A plan can still be *wrong*; policy and approval bound the damage |
 | Replay of a signed request | No request signing; the API-key boundary is optional by default | **High if exposed** — terminate TLS and require a key at the edge |
 | Device impersonation | C11 device identity is in-process only, not a production identity system | **Medium** — the mesh is not yet reachable across machines |
 | Resource exhaustion beyond request size | Per-request bounds exist (`wait_s`, `max_attempts`, body size); there is no global rate limiting or per-caller quota | **Medium** — enforce at the reverse proxy / WAF |

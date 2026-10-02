@@ -192,10 +192,10 @@ statically reviewed only · `[ ]` not started
 python -m unittest discover -s tests
 ```
 
-Last run: **417 tests, OK** (0 failures, 0 errors) on Python 3.14.4 (Linux).
+Last run: **425 tests, OK** (0 failures, 0 errors) on Python 3.14.4 (Linux).
 (The reconstruction was originally verified with 358 tests; C17 added 16 for the
 APK plus one snapshot guard, a lint pass un-shadowed 4 cycle tests, and C18 added
-38 for the planner and its dashboard panel.)
+46 for the planner, its dashboard panel, and the docs-drift guard.)
 
 ## Deliverables
 

@@ -12,7 +12,7 @@ carries over from the lost tree — it does not.
 
 ```text
 Command:  python -m unittest discover -s tests
-Result:   Ran 417 tests — OK (0 failures, 0 errors)
+Result:   Ran 425 tests — OK (0 failures, 0 errors)
 Python:   3.14.4 (Linux); originally verified on 3.12.10
 Deps:     FastAPI at runtime; httpx in the development environment
 ```
