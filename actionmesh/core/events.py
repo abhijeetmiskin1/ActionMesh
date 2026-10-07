@@ -84,11 +84,11 @@ class EventHub:
             for event in self.history(execution_id):
                 yield event
             while True:
-                event = await queue.get()
-                if event is None:
+                pending = await queue.get()
+                if pending is None:
                     return
-                if execution_id is None or event.execution_id == execution_id:
-                    yield event
+                if execution_id is None or pending.execution_id == execution_id:
+                    yield pending
         finally:
             self._subscribers.discard(queue)
 

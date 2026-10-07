@@ -102,10 +102,10 @@ class MockHarnessMixin:
         """
         return {}
 
-    @property
-    def simulated(self) -> bool:
-        """All harness-based providers are simulators. Real adapters override."""
-        return True
+    #: All harness-based providers are simulators. A plain class attribute
+    #: rather than a property, so it stays writable and can sit alongside the
+    #: equally writable ``ActionProvider.simulated`` without a Liskov clash.
+    simulated: bool = True
 
     def observe(self, action: Action) -> dict[str, Any] | None:
         """Expose the record this action actually produced.

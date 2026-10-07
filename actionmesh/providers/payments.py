@@ -82,27 +82,27 @@ class MockPaymentProvider(MockHarnessMixin, ActionProvider):
             return {"payment_id": payment_id, "state": "prepared"}
 
         if action.type == "payment.confirm":
-            payment_id = params.get("payment_id")
-            intent = self.intents.get(str(payment_id))
+            raw_payment_id = params.get("payment_id")
+            intent = self.intents.get(str(raw_payment_id))
             if intent is None:
-                raise ProviderError(f"unknown payment {payment_id!r}",
+                raise ProviderError(f"unknown payment {raw_payment_id!r}",
                                     FailureKind.INVALID_INPUT)
             if intent["state"] != "prepared":
                 # Confirming twice must not double-confirm.
                 raise ProviderError(
-                    f"payment {payment_id!r} is {intent['state']}, not prepared",
+                    f"payment {raw_payment_id!r} is {intent['state']}, not prepared",
                     FailureKind.INVALID_INPUT,
                 )
             intent["state"] = "confirmed"
-            return {"payment_id": payment_id, "state": "confirmed"}
+            return {"payment_id": raw_payment_id, "state": "confirmed"}
 
         if action.type == "payment.verify":
-            payment_id = params.get("payment_id")
-            intent = self.intents.get(str(payment_id))
+            raw_payment_id = params.get("payment_id")
+            intent = self.intents.get(str(raw_payment_id))
             if intent is None:
-                raise ProviderError(f"unknown payment {payment_id!r}",
+                raise ProviderError(f"unknown payment {raw_payment_id!r}",
                                     FailureKind.INVALID_INPUT)
-            return {"payment_id": payment_id, "state": intent["state"]}
+            return {"payment_id": raw_payment_id, "state": intent["state"]}
 
         raise ProviderError(f"unsupported action {action.type!r}", FailureKind.PERMANENT)
 

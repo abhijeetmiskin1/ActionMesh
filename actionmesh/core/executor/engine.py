@@ -37,7 +37,11 @@ from actionmesh.core.graph import (
     validate_graph_structure,
 )
 from actionmesh.core.observability import Metrics
-from actionmesh.core.permissions.context import PolicyContext, build_context
+from actionmesh.core.permissions.context import (
+    PermissionGrant,
+    PolicyContext,
+    build_context,
+)
 from actionmesh.core.permissions.engine import PolicyEngine
 from actionmesh.core.registry.registry import ActionRegistry
 from actionmesh.core.storage import SQLiteStore
@@ -56,8 +60,10 @@ from actionmesh.protocol.models import (
     ExecutionRecord,
     FailureKind,
     GraphNode,
+    Identity,
     MeshEvent,
     NodeType,
+    Policy,
     VerificationResult,
 )
 from actionmesh.providers.base import ActionProvider, ProviderError, ProviderResult
@@ -173,9 +179,9 @@ class ExecutionEngine:
         self._approvals: dict[str, ApprovalRequest] = {}
         self._records: dict[str, ExecutionRecord] = {}
         # Set by `execute` for the duration of one run.
-        self._actor = None
-        self._grants: list = []
-        self._policy = None
+        self._actor: Identity | None = None
+        self._grants: list[PermissionGrant] = []
+        self._policy: Policy | None = None
         self._allow_high_risk = False
 
     # -- approvals --------------------------------------------------------
@@ -461,10 +467,13 @@ class ExecutionEngine:
             self.metrics.increment("compensations.attempted")
             outcome = await self._run_node(graph, comp_node, execution_id)
             ok = outcome.state is ActionState.SUCCESS
+            # CompensationRunner.select() skips nodes that carry no action, so
+            # this is not None in practice; the guard keeps that invariant local.
+            target_action = target.action
             attempt = CompensationAttempt(
                 node_id=comp_node.node_id,
                 target_node=target.node_id,
-                action_type=target.action.type or "",
+                action_type=(target_action.type or "") if target_action else "",
                 compensated=ok,
                 state=outcome.state.value,
                 error=outcome.error,
@@ -587,13 +596,16 @@ class ExecutionEngine:
                     self.metrics.increment("nodes.completed")
                     self.metrics.increment(f"nodes.state.{outcome.state.value}")
                     result.simulated = result.simulated and outcome.simulated
+                    # Bind the node once: re-subscripting ``index`` inside the
+                    # conditional would defeat narrowing of ``.action``.
+                    node = index[nid]
                     self.events.publish(
                         MeshEvent(
                             event_type="node.completed",
                             execution_id=execution_id,
-                            action_id=index[nid].action.action_id
-                            if index[nid].action is not None
-                            else "",
+                            action_id=(
+                                node.action.action_id if node.action is not None else ""
+                            ),
                             actor=self._actor.id if self._actor else "system",
                             payload={
                                 "node_id": outcome.node_id,

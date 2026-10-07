@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import os
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -13,7 +14,7 @@ from actionmesh.core.audit import AuditLog, FileAuditAnchor, SqliteAuditBackend
 from actionmesh.core.executor import ExecutionEngine
 from actionmesh.core.graph.errors import GraphError
 from actionmesh.core.graph.serialization import graph_from_dict
-from actionmesh.core.permissions import Consent, ConsentStore, PolicyEngine
+from actionmesh.core.permissions import Consent, ConsentStore, PolicyContext, PolicyEngine
 from actionmesh.core.planner import Planner, RuleBasedPlanner
 from actionmesh.core.registry import ActionRegistry
 from actionmesh.dashboard import (
@@ -27,6 +28,7 @@ from actionmesh.dashboard import (
     service_worker as service_worker_source,
 )
 from actionmesh.protocol.models import (
+    ActionGraph,
     ApprovalRequest,
     Policy,
     PolicyDecision,
@@ -70,7 +72,7 @@ def _policy(raw: Any) -> Policy:
     )
 
 
-def _validated_graph(raw: Any):
+def _validated_graph(raw: Any) -> ActionGraph:
     graph = graph_from_dict(raw)
     for node in graph.nodes:
         if node.action is not None:
@@ -80,7 +82,7 @@ def _validated_graph(raw: Any):
     return graph
 
 
-def _context(payload: dict[str, Any], consent_store: ConsentStore):
+def _context(payload: dict[str, Any], consent_store: ConsentStore) -> PolicyContext:
     from actionmesh.core.permissions.context import build_context
 
     if "grants" in payload:
@@ -162,7 +164,9 @@ def create_app(
         raise ValueError("ACTIONMESH_MAX_REQUEST_BYTES must be at least 1024")
 
     @app.middleware("http")
-    async def require_api_key(request: Request, call_next):
+    async def require_api_key(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
@@ -269,7 +273,7 @@ def create_app(
 
     @app.get("/events")
     async def events(execution_id: str | None = None) -> StreamingResponse:
-        async def stream():
+        async def stream() -> AsyncIterator[str]:
             async for event in engine.events.subscribe(execution_id):
                 yield f"event: {event.event_type}\ndata: {event.model_dump_json()}\n\n"
 

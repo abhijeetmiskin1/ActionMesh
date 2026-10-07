@@ -31,7 +31,6 @@ What this does and does not buy
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -51,7 +50,6 @@ class AnchorMismatchError(RuntimeError):
     """
 
 
-@dataclass(frozen=True)
 class AuditAnchor(Protocol):
     """Somewhere outside the audit store that remembers the expected head."""
 

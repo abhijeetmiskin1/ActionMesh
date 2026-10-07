@@ -14,7 +14,9 @@ from actionmesh.core.registry.errors import DefinitionError
 from actionmesh.protocol.models import ActionDefinition, RiskLevel
 from actionmesh.protocol.validate import ValidationError, require_type
 
-_TYPE_MAP = {
+#: Values feed ``isinstance``, which accepts either a single type or a tuple of
+#: them — ``number`` deliberately maps to ``(int, float)`` to accept both.
+_TYPE_MAP: dict[str, type[Any] | tuple[type[Any], ...]] = {
     "string": str,
     "integer": int,
     "number": (int, float),

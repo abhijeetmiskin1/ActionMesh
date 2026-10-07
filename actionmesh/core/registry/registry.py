@@ -8,6 +8,10 @@ authorization (that is C3's :class:`PolicyEngine`).
 
 from __future__ import annotations
 
+# ``ActionRegistry.list`` shadows the builtin ``list`` inside this class body, so a
+# bare ``list[...]`` annotation written here resolves to that method rather than to
+# the builtin. Alias the builtin so annotations on this class stay honest.
+from builtins import list as _builtin_list
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,7 +95,7 @@ class ActionRegistry:
         provider: str | None = None,
         risk: RiskLevel | None = None,
         permission: str | None = None,
-    ) -> list[Capability]:
+    ) -> _builtin_list[Capability]:
         """Filter registered capabilities by name, provider, risk or permission.
 
         Only the *latest* version of each action is returned: a caller asking

@@ -45,21 +45,21 @@ class MockCalendarProvider(MockHarnessMixin, ActionProvider):
             }
             return {"event_id": event_id}
         if action.type == "calendar.update":
-            event_id = params.get("event_id")
-            event = self.events.get(str(event_id))
+            raw_event_id = params.get("event_id")
+            event = self.events.get(str(raw_event_id))
             if event is None:
                 # Updating something that does not exist is a caller error.
-                raise ProviderError(f"unknown event {event_id!r}", FailureKind.INVALID_INPUT)
+                raise ProviderError(f"unknown event {raw_event_id!r}", FailureKind.INVALID_INPUT)
             for field in ("title", "time", "duration_min"):
                 if field in params:
                     event[field] = params[field]
-            return {"event_id": event_id}
+            return {"event_id": raw_event_id}
         if action.type == "calendar.delete":
-            event_id = params.get("event_id")
-            if str(event_id) not in self.events:
-                raise ProviderError(f"unknown event {event_id!r}", FailureKind.INVALID_INPUT)
-            del self.events[str(event_id)]
-            return {"event_id": event_id, "deleted": True}
+            raw_event_id = params.get("event_id")
+            if str(raw_event_id) not in self.events:
+                raise ProviderError(f"unknown event {raw_event_id!r}", FailureKind.INVALID_INPUT)
+            del self.events[str(raw_event_id)]
+            return {"event_id": raw_event_id, "deleted": True}
         raise ProviderError(f"unsupported action {action.type!r}", FailureKind.PERMANENT)
 
 

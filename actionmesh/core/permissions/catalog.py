@@ -89,7 +89,7 @@ def permission(scope: str) -> Permission:
     return _SCOPES[scope]
 
 
-def permission_scope(namespace: str) -> str:
+def permission_scope(namespace: str) -> tuple[str, ...]:
     """All concrete scopes inside a namespace, sorted."""
     if namespace not in NAMESPACES:
         raise KeyError(namespace)

@@ -58,15 +58,15 @@ def _coerce_rule(entry: Any) -> PolicyRule:
     action = entry.get("action")
     if not isinstance(action, str) or not action.strip():
         return PolicyRule(action="*", decision=PolicyDecision.DENY, note="rule without action")
-    limits = entry.get("limits")
-    permissions = entry.get("permissions")
+    raw_limits = entry.get("limits")
+    raw_permissions = entry.get("permissions")
     return PolicyRule(
         action=action.strip(),
         decision=normalize_decision(entry.get("decision")),
         note=str(entry.get("note", "")),
-        limits=dict(limits) if isinstance(limits, dict) else {},
-        permissions=[p for p in permissions if isinstance(p, str)]
-        if isinstance(permissions, list)
+        limits=dict(raw_limits) if isinstance(raw_limits, dict) else {},
+        permissions=[p for p in raw_permissions if isinstance(p, str)]
+        if isinstance(raw_permissions, list)
         else [],
     )
 

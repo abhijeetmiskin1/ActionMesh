@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from actionmesh.core.executor import ExecutionEngine
+from actionmesh.core.executor import ExecutionEngine, ExecutionResult
 from actionmesh.core.graph.serialization import graph_from_dict
 from actionmesh.core.permissions.context import PermissionGrant, build_context
 from actionmesh.core.planner import Plan, Planner, RuleBasedPlanner, plan_to_graph
@@ -46,7 +46,7 @@ class ActionMeshClient:
         grants: list[PermissionGrant] | None = None,
         policy: Policy | None = None,
         allow_high_risk: bool = False,
-    ):
+    ) -> ExecutionResult:
         trusted_graph = graph_from_dict(graph) if isinstance(graph, dict) else graph
         for node in trusted_graph.nodes:
             if node.action is not None:
