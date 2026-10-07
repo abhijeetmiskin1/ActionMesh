@@ -265,7 +265,9 @@ class TestPersistence(unittest.TestCase):
     """The chain must survive process death — and detect edits made on disk."""
 
     def test_empty_store_opens_cleanly(self) -> None:
-        log = AuditLog.open(SqliteAuditBackend())
+        backend = SqliteAuditBackend()
+        self.addCleanup(backend.close)
+        log = AuditLog.open(backend)
         self.assertEqual(len(log), 0)
         self.assertTrue(log.verify())
 
@@ -340,7 +342,9 @@ class TestPersistence(unittest.TestCase):
                 forensic_backend.close()
 
     def test_reset_is_refused_on_a_persisted_chain(self) -> None:
-        log = AuditLog.open(SqliteAuditBackend())
+        backend = SqliteAuditBackend()
+        self.addCleanup(backend.close)
+        log = AuditLog.open(backend)
         log.append(kind="event")
         with self.assertRaises(AuditError):
             log.reset()
@@ -348,6 +352,7 @@ class TestPersistence(unittest.TestCase):
 
     def test_backend_is_exposed(self) -> None:
         backend = SqliteAuditBackend()
+        self.addCleanup(backend.close)
         self.assertIs(AuditLog.open(backend).backend, backend)
         self.assertIsNone(AuditLog().backend)
 
@@ -361,6 +366,7 @@ class TestPersistence(unittest.TestCase):
     def test_duplicate_seq_is_rejected_by_the_store(self) -> None:
         # Append-only is enforced by the schema, not by convention.
         backend = SqliteAuditBackend()
+        self.addCleanup(backend.close)
         record = AuditRecord(seq=0, kind="event")
         backend.write(record)
         with self.assertRaises(sqlite3.IntegrityError):
