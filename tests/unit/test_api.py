@@ -8,11 +8,13 @@ from fastapi.testclient import TestClient
 
 from actionmesh.api import create_app
 
+LOCAL = ("127.0.0.1", 45123)  # the machine's own operator view
+
 
 class TestApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.client = TestClient(create_app())
+        cls.client = TestClient(create_app(), client=LOCAL)
 
     def test_health(self) -> None:
         response = self.client.get("/health")
@@ -72,7 +74,22 @@ class TestApi(unittest.TestCase):
         ]
         self.assertEqual(
             event_types,
-            ["execution.started", "node.completed", "node.completed", "execution.completed"],
+            [
+                "execution.started",
+                # The decision that let the work run is published too, so "policy
+                # decides" is observable rather than merely asserted.
+                "authorization.decided",
+                # C19: the node is announced as it begins, so a phone watching a
+                # long-running laptop action sees "running", not just the result.
+                "node.started",
+                "node.completed",
+                "execution.progress",
+                # The END marker is bookkeeping: it completes, but has no action, so
+                # it produces no authorization/node.started of its own.
+                "node.completed",
+                "execution.progress",
+                "execution.completed",
+            ],
         )
 
     def test_request_body_cannot_inject_permission_grants(self) -> None:
@@ -145,6 +162,36 @@ class TestApi(unittest.TestCase):
         self.assertEqual(consents.status_code, 200)
         self.assertTrue(all(item["granted_by"] == "user-1" for item in consents.json()))
 
+    def test_approval_prompt_reports_the_registry_risk_not_the_callers(self) -> None:
+        # `Action.risk_level` defaults to MEDIUM when a request omits it. If the pending
+        # list echoes that field, a human is told a CRITICAL payment is "medium" on the
+        # screen where they decide to approve it. The registry is authoritative.
+        self.client.post(
+            "/consents",
+            json={"actor_id": "user-9", "scope": "payment.prepare", "max_risk": "critical"},
+        )
+        parked = self.client.post(
+            "/execute",
+            json={
+                "actor": {"id": "user-9"},
+                "graph": {
+                    "nodes": [
+                        {"node_id": "a1", "action": {
+                            "type": "payment.prepare",
+                            "parameters": {"recipient": "alex", "amount": 5},
+                        }},
+                        {"node_id": "end", "node_type": "end", "depends_on": ["a1"]},
+                    ]
+                },
+                "policy": {"rules": [{"action": "payment.prepare", "decision": "allow"}]},
+            },
+        )
+        self.assertEqual(parked.json()["state"], "waiting_permission")
+        waiting = self.client.get("/approvals").json()
+        entry = next(item for item in waiting if item["execution_id"] == parked.json()["execution_id"])
+        action = entry["actions"][0]
+        self.assertEqual(action["risk_level"], "critical")
+
     def test_approval_and_cancel_endpoints(self) -> None:
         approval = self.client.post(
             "/approvals", json={"action_id": "act-1", "status": "approved"}
@@ -160,7 +207,7 @@ class TestPlanEndpoint(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.client = TestClient(create_app())
+        cls.client = TestClient(create_app(), client=LOCAL)
 
     def test_plan_proposes_actions_without_running_them(self) -> None:
         before = len(self.client.get("/executions").json())

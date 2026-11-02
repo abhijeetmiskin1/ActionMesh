@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 from actionmesh.api import create_app
 from actionmesh.core.audit import AuditIntegrityError, AuditLog
 
+LOCAL = ("127.0.0.1", 45123)  # the machine's own operator view
+
 GRAPH = {
     "nodes": [
         {
@@ -43,7 +45,7 @@ def execute(client: TestClient) -> None:
 class TestAuditEndpoints(unittest.TestCase):
     def setUp(self) -> None:
         # A fresh app per test, so chains cannot leak between tests.
-        self.client = TestClient(create_app())
+        self.client = TestClient(create_app(), client=LOCAL)
 
     def test_chain_is_intact_before_anything_runs(self) -> None:
         response = self.client.get("/audit/verify")
@@ -82,7 +84,7 @@ class TestAuditEndpoints(unittest.TestCase):
 
     def test_injected_audit_log_is_used(self) -> None:
         log = AuditLog()
-        client = TestClient(create_app(audit=log))
+        client = TestClient(create_app(audit=log), client=LOCAL)
         execute(client)
         self.assertTrue(log.verify())
         self.assertGreater(len(log), 0)
@@ -106,7 +108,7 @@ class TestAuditPersistenceViaApi(unittest.TestCase):
     @staticmethod
     def _client_with_db(path: Path) -> TestClient:
         with patch.dict(os.environ, {"ACTIONMESH_AUDIT_DB": str(path)}):
-            return TestClient(create_app())
+            return TestClient(create_app(), client=LOCAL)
 
     def test_env_var_persists_the_chain_across_app_instances(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

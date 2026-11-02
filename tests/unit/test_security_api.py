@@ -49,7 +49,9 @@ class TestApiKeyProtection(unittest.TestCase):
         compare.assert_called_once_with("wrong", "secret")
 
     def test_authorized_websocket_receives_live_event(self) -> None:
-        client = TestClient(create_app())
+        # The unscoped operator view is a loopback-only trust; a remote anonymous
+        # caller is denied (see test below). This is the laptop's own dashboard.
+        client = TestClient(create_app(), client=("127.0.0.1", 50000))
         with client.websocket_connect("/ws/events") as websocket:
             event = MeshEvent(event_type="live", execution_id="exec-live")
             client.app.state.engine.events.publish(event)
@@ -57,8 +59,15 @@ class TestApiKeyProtection(unittest.TestCase):
         self.assertEqual(received["event_type"], "live")
         self.assertEqual(received["execution_id"], "exec-live")
 
-    def test_websocket_replays_and_filters_history(self) -> None:
+    def test_a_remote_anonymous_websocket_is_denied(self) -> None:
+        # Losing/never-having a credential must not yield the operator view from off
+        # the machine. TestClient's default peer is non-loopback.
         client = TestClient(create_app())
+        with self.assertRaises(WebSocketDisconnect), client.websocket_connect("/ws/events"):
+            pass
+
+    def test_websocket_replays_and_filters_history(self) -> None:
+        client = TestClient(create_app(), client=("127.0.0.1", 50000))
         client.app.state.engine.events.publish(
             MeshEvent(event_type="target", execution_id="exec-target")
         )
