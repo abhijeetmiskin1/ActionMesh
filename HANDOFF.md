@@ -12,13 +12,21 @@ carries over from the lost tree — it does not.
 
 ```text
 Command:  python -m unittest discover -s tests
-Result:   Ran 425 tests — OK (0 failures, 0 errors)
-Python:   3.14.4 (Linux); originally verified on 3.12.10
+Result:   Ran 1168 tests — OK (0 failures, 0 errors)
+Gates:    ruff check actionmesh tests scripts — clean
+          mypy actionmesh — clean (89 source files)
+          suite runs warning-clean under -W error::ResourceWarning
+Python:   3.14 (Linux); originally verified on 3.12.10
 Deps:     FastAPI at runtime; httpx in the development environment
 ```
 
-C0–C12 and C14–C17 are implemented and runtime-verified. C13 vendor adapters and
-production deployment policy remain intentionally external.
+C0–C12 and C14–C18 are implemented and runtime-verified, and so are the C19 mobile
+control plane (C19a–e, the laptop agent in `actionmesh/agent/`), the P11 production
+platform, the P10 security-hardening pass, the C20–C31 operations arc, and VoiceOS
+slice 1 (`GET /voice`, C32) — a voice surface that can only propose.
+`TASK_BOARD.md`, which is the current record; the sections below predate C19 and are
+kept for the invariants and the gap list, not as a status report. C13 vendor adapters
+and production deployment policy remain intentionally external.
 
 ## Layout
 
@@ -212,10 +220,14 @@ An action with no verification strategy is UNSUPPORTED, not successful.
   C6 makes that independent.
 - **All 16 seeded actions are `provider="mock"`.** Every execution result
   carries `simulated: true`. No real message, file or payment has been sent.
+  Real execution exists only on the laptop device plane (`device.*`, via
+  `actionmesh/agent/`), and those results carry `simulated: false`.
 - **SQLite persistence is available but not the default.** Deployments must
   explicitly inject the durable stores and configure backup/retention policy.
 - **API-key hardening is optional.** Production deployments still need a full
-  identity provider, key rotation, rate limiting, and audit policy.
+  identity provider, TLS termination, key rotation, and audit policy. Rate
+  limiting exists (C19/P10, `core/ratelimit.py`) but is **process-local**: a
+  multi-process deployment must enforce the same budget at the proxy.
 - **Compensation is now executed, not merely planned.** C6 classifies recovery;
   C16 actually performs the undo when a forward run fails. It runs in reverse
   execution order, only for nodes that produced a *verified* side effect, never
@@ -242,6 +254,51 @@ An action with no verification strategy is UNSUPPORTED, not successful.
   success.
 - **Event subscribers are bounded.** A slow live subscriber is disconnected on
   queue overflow and must reconnect to replay retained history.
+- **A detached process's output is discarded unless the operator opens a log directory.**
+  `device.process.start` / `device.server.start` launch with stdout and stderr on
+  `/dev/null` and the record says so (`output_captured: false`) — that is the default, and
+  the default is deliberate. Set `ACTIONMESH_AGENT_LOG_DIR` and each child instead writes a
+  `0600` file with an unguessable name, refused at startup if the directory is inside the
+  workspace, trimmed from the front past 512 KiB on every pass over the process table, and
+  read back by `device.process.logs` over the transient channel (C29). The reason it is a
+  file and not a pipe is structural and must not be "optimized" back: a pipe needs a reader
+  for as long as the child lives, and a reader belonging to a request loop that ends leaves
+  the user's server blocked on its next write. Watching output *as it runs* is still
+  `device.terminal.execute`.
+- **Cancel interrupts the call in flight, and reports what it cannot undo.** `cancel()`
+  sets the flag *and* cancels the provider task the executor is awaiting, then awaits
+  that task's own unwind — which is where the runner kills the child's process group —
+  before the state is recorded (C31). A node cancelled after dispatch reads `cancelled`
+  with `verified: null`, sets `compensation_required` and publishes
+  `compensation.unconfirmed`; it is never replayed as a success and never retried,
+  because a person pressing Cancel is not a transient fault. An outer
+  `asyncio.CancelledError` — a shutdown, not a user stop — still propagates after
+  cleanup. What is *not* guaranteed: a provider whose request already reached a
+  third-party service may have landed its effect, a child that left its process group
+  escapes the group kill, and `_inflight` is loop-local, so a run executing in another
+  process stops only at its next boundary.
+- **VoiceOS is conversational and still has no authority of its own.** `GET /voice`
+  holds a dialogue, a durable task session, and a step-by-step orchestrator; every step
+  is an ordinary `/execute` under the caller's own credential. A message proposes and
+  answers `ran: false`; running is a press; approval is a press; the consent and pairing
+  surfaces are not reachable from the page at all.
+- **No LLM is wired up, and the build says so on screen.**
+  `ACTIONMESH_VOICEOS_LLM_PROVIDER` selects a provider by name; because the package bans
+  outbound network imports outside a reviewed allowlist, a named provider yields no
+  proposal plus a visible note, and the deterministic reasoning answers. Model output is
+  validated down to `{type, parameters}` — an entry asserting its own risk or permission
+  is dropped whole. External provider integration therefore remains **unverified**,
+  deliberately.
+- **Multi-step plans get their details from the operator, never from a guess.**
+  `ACTIONMESH_VOICEOS_TASKS` points at a JSON file of task templates; a template naming
+  an unregistered action is refused at load and the refusal is shown. `run my tests`
+  with no template maps to nothing rather than to an invented command line.
+- **Still not built:** a device picker (one agent per server), barge-in beyond the stop
+  button and the mic, wake words, non-`en-US` recognition, and cross-process
+  reconciliation of a run that outlived its request.
+- **The agent's command timeout is a ceiling, not a suggestion.** A caller's
+  `timeout_s` can only lower `ACTIONMESH_COMMAND_TIMEOUT_S`; the run reports both
+  (`timeout_applied_s`, `timeout_clipped`) rather than stopping silently.
 
 ## Next owner
 
@@ -274,5 +331,6 @@ Kept here because they document real design decisions:
 | Idempotency was completed before verification | Complete the ledger only after independent verification succeeds |
 | `snapshot.py` wrote each backup *inside* the tree it protects (the default was a filename beginning with `..`, not a parent path) and copied older archives into newer ones, reaching **39.8 GB** across 16 files | Default target now resolves beside the tree; prior archives excluded by name pattern; inside-tree writes warn. Same run is now 377 KiB |
 | A COMPENSATION node ran as ordinary forward work: `builder.compensate()` sets no `depends_on`, so Kahn layering saw every undo as a **root node**. A create+delete pair fired in order and the engine reported `success` for a net no-op | Exclude COMPENSATION from the forward schedule, and drop edges pointing at one (an END depending on its compensation looked like a cycle). C16 runs undos in reverse order, only after a failure |
+| `load_key` read the server key file with `.strip()` on **bytes**. A generated key is random, so its first or last byte is a whitespace byte (tab, newline, CR, space) about **once in twenty installs**; the strip dropped it, the file measured 31 bytes, and the "truncated key, refuse to regenerate" guard fired forever. The first run worked and **every restart after it failed to start** | Read the key as undelimited bytes and take the first `KEY_BYTES` of it, which keeps a hand-written file's trailing newline harmless. Guarded by a test that round-trips all 256 byte values at both ends of the key |
 | `tests/unit/test_graph.py` defined `class TestCycleDetection` twice; the second definition shadowed the first, so its four cycle tests were collected by no test loader — tests that were counted as passing but never ran | Renamed the second to `TestDeepChain`; the suite grew from 375 to 379. A reminder that a duplicate class name is a silent hole, not a style nit |
 | An Android `strings.xml` comment contained the literal `--` (from `--url`); an XML comment may not contain `--`, so `aapt2` rejected the resource | Reworded the comment. The resource tests parse every XML file, so a malformed resource now fails a test rather than only the APK build |

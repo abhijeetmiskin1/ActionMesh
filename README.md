@@ -223,10 +223,18 @@ intent → graph → registry → permissions → executor → providers
   re-validates it, and anything it could not map is recorded rather than dropped.
 - **LLM output is untrusted data.** It cannot grant itself a permission, lower
   its own risk, or set a lifecycle state — see `tests/security/`.
+- **VoiceOS presses; it does not decide.** `GET /voice` runs through the same
+  `/plan` → `/execute` → approval → executor path as the control room, and every
+  privileged step is its own press: running is a click on a previewed plan, approving
+  is a click naming one `action_id`, and the consent surface is unreachable from it.
+  There is no audio-capture path — the microphone's text is the only thing it can send.
+  See [`docs/voiceos.md`](docs/voiceos.md).
 
 ## Documentation
 
+- [`PROJECT.md`](PROJECT.md) — the whole picture: what it does, what is verified, what remains, where it is going
 - [`docs/architecture.md`](docs/architecture.md) — layering and trust boundaries
+- [`docs/voiceos.md`](docs/voiceos.md) — the voice surface: its boundary, the browser-speech privacy evaluation, and what is not built
 - [`docs/permissions.md`](docs/permissions.md) — permission & policy model, precedence
 - [`docs/registry.md`](docs/registry.md) — action definition contract
 - [`docs/action-graph.md`](docs/action-graph.md) — node types, cycles, ordering
