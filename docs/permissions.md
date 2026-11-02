@@ -18,6 +18,9 @@ calendar.read   calendar.write   calendar.delete
 message.read    message.send
 file.read       file.write       file.share       file.delete
 device.notify   device.file_transfer             device.control
+device.register  device.file.list  device.project.read  device.process.read
+device.process.control  device.server.read  device.server.control
+device.ide.open
 location.read
 payment.prepare payment.execute  payment.verify
 system.app.launch   system.shell
@@ -26,6 +29,13 @@ reminder.write      search.web
 
 Because the set is closed, "unknown permission" is a *detectable* condition and
 can therefore fail closed. An open namespace would make typos silent.
+
+The `device.*` rows added with C19 are the scopes the **laptop agent** acts on:
+`device.register` and the read-only presence/inspection scopes are LOW, process and
+server control are HIGH, and the editor scope is MEDIUM. What they are *not* is a
+capability list — a paired phone holds no scope until a consent names it, and
+`device.terminal.execute` still asks for `system.shell`, the CRITICAL scope it has
+always had.
 
 ### Grants vs. rules — the distinction that matters
 

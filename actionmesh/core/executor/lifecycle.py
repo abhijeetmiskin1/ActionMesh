@@ -32,7 +32,13 @@ ALLOWED: dict[ActionState, frozenset[ActionState]] = {
         }
     ),
     ActionState.WAITING_PERMISSION: frozenset(
-        {ActionState.AUTHORIZED, ActionState.DENIED, ActionState.CANCELLED, ActionState.TIMEOUT}
+        {
+            ActionState.AUTHORIZED,
+            ActionState.DENIED,
+            ActionState.CANCELLED,
+            ActionState.TIMEOUT,
+            ActionState.INTERRUPTED,
+        }
     ),
     ActionState.AUTHORIZED: frozenset(
         {ActionState.EXECUTING, ActionState.DENIED, ActionState.CANCELLED, ActionState.TIMEOUT}
@@ -45,6 +51,8 @@ ALLOWED: dict[ActionState, frozenset[ActionState]] = {
             ActionState.CANCELLED,
             ActionState.TIMEOUT,
             ActionState.PARTIALLY_COMPLETED,
+            # C35: the owner died. Reconciliation may only ever move a live run here.
+            ActionState.INTERRUPTED,
         }
     ),
     ActionState.RETRYING: frozenset(
@@ -57,6 +65,7 @@ ALLOWED: dict[ActionState, frozenset[ActionState]] = {
             ActionState.REQUIRES_USER,
             ActionState.CANCELLED,
             ActionState.PARTIALLY_COMPLETED,
+            ActionState.INTERRUPTED,
         }
     ),
     # Terminal states permit nothing.
@@ -67,6 +76,9 @@ ALLOWED: dict[ActionState, frozenset[ActionState]] = {
     ActionState.TIMEOUT: frozenset(),
     ActionState.REQUIRES_USER: frozenset({ActionState.AUTHORIZED, ActionState.CANCELLED}),
     ActionState.PARTIALLY_COMPLETED: frozenset(),
+    # Reconciled once, and reconciled once only: an interrupted run is not re-dispatched
+    # and not re-decided by whichever process reads it next.
+    ActionState.INTERRUPTED: frozenset(),
 }
 
 #: No further work will be done from these states.
@@ -78,6 +90,7 @@ TERMINAL = frozenset(
         ActionState.DENIED,
         ActionState.TIMEOUT,
         ActionState.PARTIALLY_COMPLETED,
+        ActionState.INTERRUPTED,
     }
 )
 

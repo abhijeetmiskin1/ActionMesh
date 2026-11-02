@@ -215,8 +215,18 @@ def authorize_graph(
             highest = node_risk
 
     if blocking:
+        # The reasons travel with the refusal. `execute` records this string in an
+        # `execution.denied` event, which the audit chain seals — so "why was this
+        # denied" stays answerable after the fact instead of reducing to a node id.
+        details = "; ".join(
+            f"{item.node_id}: {item.reason}"
+            for item in results
+            if item.node_id in blocking
+        )
         raise GraphAuthorizationError(
-            "graph nodes not authorized: " + ", ".join(sorted(blocking))
+            "graph nodes not authorized: "
+            + ", ".join(sorted(blocking))
+            + (f" ({details})" if details else "")
         )
 
     return GraphAuthorization(

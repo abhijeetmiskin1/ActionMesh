@@ -34,6 +34,31 @@ _SCOPES: dict[str, Permission] = {
         "device.file_transfer", "Transfer files to another device", RiskLevel.MEDIUM
     ),
     "device.control": Permission("device.control", "Control a device remotely", RiskLevel.HIGH),
+    # device agent (C19) — what a laptop-side executor may do on the laptop
+    "device.register": Permission(
+        "device.register", "Register a device and report presence", RiskLevel.LOW
+    ),
+    "device.file.list": Permission(
+        "device.file.list", "List files inside the configured root", RiskLevel.MEDIUM
+    ),
+    "device.project.read": Permission(
+        "device.project.read", "Read project metadata such as git status", RiskLevel.LOW
+    ),
+    "device.process.read": Permission(
+        "device.process.read", "Inspect running processes", RiskLevel.LOW
+    ),
+    "device.process.control": Permission(
+        "device.process.control", "Start or stop a process", RiskLevel.HIGH
+    ),
+    "device.server.read": Permission(
+        "device.server.read", "Report the status of a managed service", RiskLevel.LOW
+    ),
+    "device.server.control": Permission(
+        "device.server.control", "Start or stop a development server", RiskLevel.HIGH
+    ),
+    "device.ide.open": Permission(
+        "device.ide.open", "Open an IDE or editor on a project", RiskLevel.MEDIUM
+    ),
     # location
     "location.read": Permission("location.read", "Read device location", RiskLevel.HIGH),
     # payments

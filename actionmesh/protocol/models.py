@@ -75,6 +75,11 @@ class ActionState(StrEnum):
     REQUIRES_USER = "requires_user"
     RETRYING = "retrying"
     PARTIALLY_COMPLETED = "partially_completed"
+    #: C35 — the process that owned this run is gone and its outcome cannot be
+    #: established. Deliberately *not* FAILED: failure is a statement about the
+    #: action, and a server that lost the thread has no such evidence. Nothing is
+    #: re-dispatched from here either; a human decides what the unknown means.
+    INTERRUPTED = "interrupted"
 
 
 class NodeType(StrEnum):
@@ -107,6 +112,22 @@ class FailureKind(StrEnum):
     TIMEOUT = "timeout"
     PERMANENT = "permanent"
     UNKNOWN = "unknown"
+
+
+class DeviceKind(StrEnum):
+    """Which participant a device record describes.
+
+    A phone, a laptop and the ActionMesh server are *different* principals: an
+    audit entry that says only "a device did this" cannot answer the question a
+    control plane has to answer. ``UNKNOWN`` exists so a device that has not
+    declared its role can be present but never authorized — it is the fail-closed
+    default, not a synonym for "laptop".
+    """
+
+    UNKNOWN = "unknown"
+    PHONE = "phone"
+    LAPTOP = "laptop"
+    SERVER = "server"
 
 
 @dataclass
@@ -303,6 +324,17 @@ class ExecutionRecord(MeshModel):
     node_states: dict[str, str] = field(default_factory=dict)
     results: dict[str, Any] = field(default_factory=dict)
     error: str = ""
+    #: C35 — the execution as a durable object, not as a request's local variable.
+    #: ``updated_at`` is the only honest answer to "how recent is this?", and
+    #: ``owner_id``/``lease_expires_at`` say which process is responsible for
+    #: observing it. A process that disappears leaves both behind, which is how the
+    #: next one knows to reconcile instead of guessing.
+    updated_at: datetime | None = None
+    owner_id: str = ""
+    lease_expires_at: datetime | None = None
+    #: Cancellation addressed at the execution rather than at whichever task happens
+    #: to hold it: any request can record the request, the owner honours it.
+    cancel_requested: bool = False
 
 
 @dataclass
@@ -347,11 +379,25 @@ class Capability(MeshModel):
 
 @dataclass
 class DeviceInfo(MeshModel):
+    """A device's presence record — metadata only, never authority.
+
+    These fields say what a device *claims* to be and what it can do. They do not
+    say what it is permitted to do: that is the policy engine's decision, and a
+    device that lists a capability it was not granted still fails authorization.
+
+    There is deliberately no address or port field. An IP address, a hostname and
+    a user-agent string are not identities (see ``core.identity``).
+    """
+
     device_id: str = ""
     name: str = ""
+    kind: DeviceKind = DeviceKind.UNKNOWN
     platform: str = ""
+    os_version: str = ""
+    agent_version: str = ""
     capabilities: list[str] = field(default_factory=list)
     online: bool = False
     last_seen: datetime | None = None
-
-    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    #: Opaque identity minted by :mod:`actionmesh.core.identity`. Empty until the
+    #: device is enrolled; an unenrolled device can be *seen* but never authorized.
+    identity_id: str = ""

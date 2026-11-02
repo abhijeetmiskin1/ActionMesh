@@ -20,6 +20,7 @@ from actionmesh.protocol.models import (
     MeshModel,
     Policy,
     PolicyDecision,
+    PolicyRule,
     RiskLevel,
 )
 
@@ -121,6 +122,59 @@ class PolicyOutcome(MeshModel):
         )
 
 
+def context_from_payload(raw: dict[str, Any]) -> PolicyContext:
+    """Rebuild the context a parked execution stopped with.
+
+    Only a restart needs this, and only for a run that is already waiting for a human.
+    It is deliberately not a parser for caller input: the payload comes from ActionMesh's
+    own store, and when the run resumes, authorization runs again over it from scratch —
+    a restored context grants nothing by itself.
+    """
+    actor = raw.get("actor")
+    grants = [
+        PermissionGrant(
+            scope=str(item.get("scope") or ""),
+            granted_by=str(item.get("granted_by") or "user"),
+            max_risk=RiskLevel(item.get("max_risk") or RiskLevel.HIGH.value),
+            granted_at=_as_moment(item.get("granted_at")) or _utcnow(),
+            expires_at=_as_moment(item.get("expires_at")),
+        )
+        for item in raw.get("grants") or []
+        if isinstance(item, dict)
+    ]
+    rules = [
+        PolicyRule(
+            action=str(item.get("action") or ""),
+            decision=PolicyDecision(str(item.get("decision") or PolicyDecision.DENY.value)),
+        )
+        for item in (raw.get("policy") or {}).get("rules") or []
+        if isinstance(item, dict)
+    ]
+    return PolicyContext(
+        actor=(
+            Identity(
+                id=str(actor.get("id") or ""),
+                kind=str(actor.get("kind") or "device"),
+                display=str(actor.get("display") or ""),
+            )
+            if isinstance(actor, dict)
+            else None
+        ),
+        grants=grants,
+        policy=Policy(rules=rules),
+        allow_high_risk=bool(raw.get("allow_high_risk", False)),
+    )
+
+
+def _as_moment(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 def build_context(
     action: Action | None,
     definition: ActionDefinition | None,
@@ -151,4 +205,5 @@ __all__ = [
     "PolicyContext",
     "PolicyOutcome",
     "build_context",
+    "context_from_payload",
 ]

@@ -120,6 +120,87 @@ class TestRuleBasedPlanner(unittest.TestCase):
         self.assertTrue(any("unregistered" in note for note in plan.notes))
 
 
+class TestDeviceCommandPhrases(unittest.TestCase):
+    """The laptop-agent rules VoiceOS relies on (C33).
+
+    The interesting property is not that common phrases map — it is what refuses to
+    map. A command that needs a target must not be guessed into one, and a request the
+    planner cannot resolve must come back empty rather than as an invented shell line.
+    """
+
+    def setUp(self) -> None:
+        self.planner = RuleBasedPlanner()
+
+    def _one(self, intent: str) -> ProposedAction:
+        actions = self.planner.plan(intent).actions
+        self.assertEqual(len(actions), 1, f"expected one action for {intent!r}")
+        return actions[0]
+
+    def test_inventory_questions_map_to_the_read_only_actions(self) -> None:
+        cases = {
+            "what is my laptop running": "device.process.list",
+            "show me the processes": "device.process.list",
+            "what servers are running": "device.server.status",
+            "show my projects": "device.project.list",
+            "what editors are installed": "device.ide.list",
+            "show my files": "device.file.list",
+        }
+        for intent, action_type in cases.items():
+            with self.subTest(intent=intent):
+                self.assertEqual(self._one(intent).type, action_type)
+
+    def test_a_named_target_travels_with_the_action(self) -> None:
+        self.assertEqual(
+            dict(self._one("stop the process proc_7").parameters), {"process_id": "proc_7"}
+        )
+        self.assertEqual(
+            dict(self._one("stop the dev server web").parameters), {"name": "web"}
+        )
+        self.assertEqual(
+            dict(self._one("read this file notes.txt").parameters), {"path": "notes.txt"}
+        )
+
+    def test_an_unnamed_stop_maps_to_nothing_rather_than_a_guess(self) -> None:
+        # "Stop the server" names no server. Proposing device.server.stop with no name
+        # would either fail validation or, worse, be filled in by someone downstream.
+        plan = self.planner.plan("stop the server")
+        self.assertEqual(plan.actions, ())
+        self.assertTrue(any("no rule matched" in note for note in plan.notes))
+
+    def test_a_spoken_command_line_is_transcribed_not_invented(self) -> None:
+        # "run command <argv>" carries the caller's own argv, token for token.
+        action = self._one("run command python3 write_note.py")
+        self.assertEqual(action.type, "device.terminal.execute")
+        self.assertEqual(
+            dict(action.parameters), {"command": "python3", "arguments": ["write_note.py"]}
+        )
+
+    def test_a_bare_program_needs_no_arguments(self) -> None:
+        action = self._one("run the command pwd")
+        self.assertEqual(dict(action.parameters), {"command": "pwd", "arguments": []})
+
+    def test_the_planner_invents_no_test_command(self) -> None:
+        # The voice charter asks for "run my tests". The planner cannot know this
+        # project's command, so it declines; it does not propose a shell line.
+        plan = self.planner.plan("run my tests")
+        self.assertEqual(plan.actions, ())
+
+    def test_the_agent_and_the_simulated_file_action_keep_separate_phrasings(self) -> None:
+        self.assertEqual(self._one("read this file notes.txt").type, "device.file.read")
+        self.assertEqual(self._one("open file /notes/todo.txt").type, "file.read")
+
+    def test_device_rules_do_not_swallow_app_launch_or_messaging(self) -> None:
+        self.assertEqual(self._one("launch spotify").type, "system.launch_app")
+        self.assertEqual(self._one("tell mom I'll be late").type, "message.send")
+
+    def test_a_compound_device_request_keeps_its_order(self) -> None:
+        actions = self.planner.plan("what is my laptop running; show my projects").actions
+        self.assertEqual(
+            [action.type for action in actions],
+            ["device.process.list", "device.project.list"],
+        )
+
+
 class TestTrustBoundary(unittest.TestCase):
     """A plan may carry only what a proposal is allowed to carry."""
 

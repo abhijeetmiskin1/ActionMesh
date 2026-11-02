@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import unittest
 
 from actionmesh.core.executor import (
@@ -40,6 +41,7 @@ from actionmesh.protocol.models import (
     RiskLevel,
 )
 from actionmesh.providers import MockProvider, ProviderError
+from actionmesh.providers.base import ActionProvider, ProviderResult
 
 ALLOW_ALL = policy_from_rules([{"action": "*", "decision": "allow"}])
 
@@ -448,6 +450,316 @@ class TestCancellation(ExecutorCase):
         result = run(self.exec_engine.execute(graph, self.allow_all(["calendar.write"])))
         self.assertIs(result.state, ActionState.CANCELLED)
         self.assertEqual(self.provider.calls, [])
+
+
+class _ContentProvider(ActionProvider):
+    """A real-shaped provider whose payload carries file/command content."""
+
+    name = "content"
+    simulated = False
+
+    def supports(self, action: Action) -> bool:
+        return action.type == "message.send"
+
+    async def execute(self, action: Action) -> ProviderResult:
+        return ProviderResult(
+            ok=True,
+            provider="content",
+            action_id=action.action_id,
+            data={
+                "path": "inbox.txt",
+                "bytes": 6,
+                "content": "SECRET",
+                "stdout": "SECRET",
+                "exit_code": 0,
+                "timeout_requested_s": 600.0,
+                "timeout_applied_s": 60.0,
+                "timeout_clipped": True,
+                "output_captured": False,
+            },
+            simulated=False,
+        )
+
+
+class TestStreamingEvents(ExecutorCase):
+    def _types(self) -> list[str]:
+        return [event.event_type for event in self.exec_engine.events.history()]
+
+    def test_lifecycle_events_are_published(self) -> None:
+        _action, graph = single_graph(Action(**send()))
+        run(self.exec_engine.execute(graph, self.allow_all(["message.send"])))
+        types = self._types()
+        for expected in (
+            "execution.started",
+            "node.started",
+            "node.completed",
+            "execution.progress",
+            "execution.completed",
+        ):
+            self.assertIn(expected, types)
+
+    def test_result_view_exposes_metadata_never_content(self) -> None:
+        self.exec_engine.providers.insert(0, _ContentProvider())
+        _action, graph = single_graph(Action(**send()))
+        result = run(self.exec_engine.execute(graph, self.allow_all(["message.send"])))
+        payload = result.to_dict()
+        # Neither the file body nor the command transcript may reach the client.
+        self.assertNotIn("SECRET", json.dumps(payload))
+        node = payload["nodes"]["a1"]
+        # Which limit stopped the run, and whether anything was reading its output at
+        # all, is metadata the caller is owed. The exact-equality assertion is what
+        # makes dropping either of those from the allowlist a failing change rather
+        # than a quiet one.
+        self.assertEqual(
+            node["result"],
+            {
+                "path": "inbox.txt",
+                "bytes": 6,
+                "exit_code": 0,
+                "timeout_requested_s": 600.0,
+                "timeout_applied_s": 60.0,
+                "timeout_clipped": True,
+                "output_captured": False,
+            },
+        )
+        self.assertEqual(node["provider"], "content")
+        self.assertGreaterEqual(node["duration_ms"], 0)
+
+    def test_approval_required_is_published_on_ask(self) -> None:
+        ask = policy_from_rules([{"action": "message.send", "decision": "ask"}])
+        _action, graph = single_graph(Action(**send()))
+        result = run(
+            self.exec_engine.execute(
+                graph, context(["message.send"], policy=ask)
+            )
+        )
+        self.assertIs(result.state, ActionState.WAITING_PERMISSION)
+        events = [
+            event
+            for event in self.exec_engine.events.history()
+            if event.event_type == "approval.required"
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].action_id, result.nodes["a1"].action_id)
+        self.assertNotIn("authorized", events[0].payload)
+
+
+class _BlockingProvider(ActionProvider):
+    """A provider that stays in flight until a test releases it.
+
+    Cancellation of a running call cannot be tested against a sleep: the race would be
+    the test, not the engine. `entered` says the provider is actually inside its await,
+    and `interrupted` says the cancellation reached it.
+    """
+
+    name = "blocking"
+    simulated = False
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.interrupted = False
+        self.calls = 0
+
+    def supports(self, action: Action) -> bool:
+        return action.type == "message.send"
+
+    async def execute(self, action: Action) -> ProviderResult:
+        self.calls += 1
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.interrupted = True
+            raise
+        return ProviderResult(
+            ok=True,
+            provider=self.name,
+            action_id=action.action_id,
+            data={"sent": True},
+            simulated=False,
+        )
+
+
+class TestInFlightCancellation(ExecutorCase):
+    """C31: a cancel must reach a provider call that is already running.
+
+    C30 measured that it did not: a 60s command cancelled mid-stream kept printing. The
+    guarantees here are that it stops, that the engine waits for the stop before
+    reporting, and that a call which *may* have taken effect is never presented as though
+    nothing happened. Each scenario runs on one loop and synchronises on events, never on
+    a sleep, so there is no race in the test itself.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.blocking = _BlockingProvider()
+        self.exec_engine.providers.insert(0, self.blocking)
+
+    def _cancel_while_running(self, graph) -> tuple[object, bool]:
+        """Run ``graph``, cancel once the provider is provably inside its call."""
+        outcome: dict[str, object] = {}
+
+        async def scenario() -> None:
+            task = asyncio.create_task(
+                self.exec_engine.execute(graph, self.allow_all(["message.send"]))
+            )
+            await asyncio.wait_for(self.blocking.entered.wait(), timeout=5)
+            execution_id = next(iter(self.exec_engine.in_flight()))
+            self.exec_engine.cancel(execution_id)
+            # Cancelling a second time must be a no-op, not a second error path.
+            self.exec_engine.cancel(execution_id)
+            try:
+                outcome["result"] = await task
+            except asyncio.CancelledError:  # pragma: no cover - guards the wrong fix
+                outcome["raised"] = True
+            outcome["interrupted"] = self.blocking.interrupted
+
+        asyncio.run(scenario())
+        return outcome, self.blocking.interrupted
+
+    def test_cancelling_a_running_provider_call_stops_it(self) -> None:
+        _action, graph = single_graph(Action(**send()))
+        outcome, interrupted = self._cancel_while_running(graph)
+        self.assertNotIn("raised", outcome, "a user cancel must not escape as a crash")
+        result = outcome["result"]
+        self.assertIs(result.state, ActionState.CANCELLED)
+        self.assertIs(result.nodes["a1"].state, ActionState.CANCELLED)
+        # Not "we asked" -- the provider's own await observed the cancellation.
+        self.assertTrue(interrupted)
+
+    def test_a_cancelled_dispatch_is_reported_as_an_unconfirmed_effect(self) -> None:
+        # The call was dispatched, so the world may have changed. Reporting a clean
+        # cancellation would be the same lie as reporting it as success.
+        _action, graph = single_graph(Action(**send()))
+        outcome, _ = self._cancel_while_running(graph)
+        result = outcome["result"]
+        self.assertTrue(result.compensation_required, result.to_dict())
+        targets = [c.target_node for c in result.compensations]
+        self.assertIn("a1", targets)
+        reason = next(c.reason for c in result.compensations if c.target_node == "a1")
+        self.assertIn("dispatched", reason)
+
+    def test_a_cancelled_call_is_not_retried(self) -> None:
+        # One dispatch, ever: a retry of an operation whose effect is unknown is how the
+        # idempotency ledger exists to prevent a double send.
+        _action, graph = single_graph(Action(**send()))
+        self._cancel_while_running(graph)
+        self.assertEqual(self.blocking.calls, 1)
+
+    def test_the_cancelled_node_never_reads_back_as_success(self) -> None:
+        _action, graph = single_graph(Action(**send()))
+        outcome, _ = self._cancel_while_running(graph)
+        payload = outcome["result"].to_dict()
+        self.assertEqual(payload["nodes"]["a1"]["state"], "cancelled")
+        self.assertNotIn("sent", json.dumps(payload))
+
+    def test_an_outer_cancellation_propagates_rather_than_becoming_a_user_cancel(
+        self,
+    ) -> None:
+        # engine.cancel() is a request from a user. Cancelling the coroutine that is
+        # running the execution is something else entirely, and swallowing it would hide
+        # a shutdown or a client disconnect behind a tidy "cancelled" result.
+        _action, graph = single_graph(Action(**send()))
+
+        async def scenario() -> tuple[bool, bool]:
+            task = asyncio.create_task(
+                self.exec_engine.execute(graph, self.allow_all(["message.send"]))
+            )
+            await asyncio.wait_for(self.blocking.entered.wait(), timeout=5)
+            task.cancel()
+            raised = False
+            try:
+                await task
+            except asyncio.CancelledError:
+                raised = True
+            return raised, not self.exec_engine._cancelled
+
+        raised, no_user_cancel = asyncio.run(scenario())
+        self.assertTrue(raised, "a genuine CancelledError must still propagate")
+        self.assertTrue(no_user_cancel)
+        self.assertTrue(self.blocking.interrupted)
+
+    def test_cancelling_between_steps_stops_the_next_node(self) -> None:
+        # The C30 behaviour must survive: a cancel that arrives at a step boundary still
+        # prevents the following dispatch.
+        graph = linear_graph(send(), remind())
+
+        async def scenario() -> object:
+            task = asyncio.create_task(
+                self.exec_engine.execute(
+                    graph, self.allow_all(["message.send", "calendar.write"])
+                )
+            )
+            await asyncio.wait_for(self.blocking.entered.wait(), timeout=5)
+            self.exec_engine.cancel(next(iter(self.exec_engine.in_flight())))
+            self.blocking.release.set()
+            return await task
+
+        result = asyncio.run(scenario())
+        self.assertIs(result.state, ActionState.CANCELLED)
+        self.assertIs(result.nodes["a1"].state, ActionState.CANCELLED)
+        # Whatever a2 is reported as, it was never handed to a provider: the point of the
+        # boundary check is that a cancelled run stops producing effects.
+        self.assertEqual(self.blocking.calls, 1)
+        a2 = result.nodes.get("a2")
+        if a2 is not None:
+            self.assertIsNot(a2.state, ActionState.SUCCESS)
+
+    def test_a_cancel_that_arrives_after_completion_does_not_rewrite_the_result(
+        self,
+    ) -> None:
+        # Completion and cancellation race. The rule is first-wins: the execution already
+        # reached a terminal state and was recorded, so a later request cannot restamp it.
+        _action, graph = single_graph(Action(**send()))
+
+        async def scenario() -> tuple[object, object, object]:
+            task = asyncio.create_task(
+                self.exec_engine.execute(graph, self.allow_all(["message.send"]))
+            )
+            await asyncio.wait_for(self.blocking.entered.wait(), timeout=5)
+            self.blocking.release.set()
+            result = await task
+            recorded = self.exec_engine.record(result.execution_id)
+            before = recorded.state
+            self.exec_engine.cancel(result.execution_id)
+            return result, before, self.exec_engine.record(result.execution_id).state
+
+        result, before, after = asyncio.run(scenario())
+        self.assertIs(result.state, before)
+        self.assertIsNot(before, ActionState.CANCELLED)
+        self.assertIs(after, before)
+
+    def test_cancelling_a_parked_execution_then_approving_reports_cancelled(
+        self,
+    ) -> None:
+        ask = policy_from_rules([{"action": "message.send", "decision": "ask"}])
+        _action, graph = single_graph(Action(**send()))
+        context = PolicyContext(
+            actor=Identity(id="user_1"),
+            policy=ask,
+            grants=[PermissionGrant(scope="message.send", max_risk=RiskLevel.HIGH)],
+        )
+
+        async def scenario() -> tuple[object, object]:
+            parked = await self.exec_engine.execute(graph, context)
+            execution_id = parked.execution_id
+            self.exec_engine.cancel(execution_id)
+            self.exec_engine.submit_approval(
+                ApprovalRequest(
+                    action_id=graph.nodes[0].action.action_id, status="approved"
+                )
+            )
+            resumed = await self.exec_engine.resume(execution_id)
+            return parked, resumed
+
+        parked, resumed = asyncio.run(scenario())
+        self.assertIs(parked.state, ActionState.WAITING_PERMISSION)
+        self.assertIsNotNone(resumed)
+        self.assertIs(resumed.state, ActionState.CANCELLED)
+        # Never dispatched, so no effect may be claimed either way.
+        self.assertEqual(self.blocking.calls, 0)
+        self.assertFalse(resumed.compensation_required)
 
 
 if __name__ == "__main__":

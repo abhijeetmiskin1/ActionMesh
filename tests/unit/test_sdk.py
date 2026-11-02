@@ -44,6 +44,60 @@ class TestSdk(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.execute(graph, actor={})
 
+    def _send_graph(self) -> ActionGraph:
+        return ActionGraph(nodes=[
+            GraphNode(
+                node_id="a1",
+                action=Action(type="message.send", parameters={"message": "hi"}),
+            ),
+            GraphNode(node_id="end", node_type=NodeType.END, depends_on=["a1"]),
+        ])
+
+    def test_executions_and_execution_read_back_authoritative_state(self) -> None:
+        result = self.client.execute(
+            self._send_graph(),
+            actor=Identity(id="user-1"),
+            grants=[PermissionGrant(scope="message.send", max_risk=RiskLevel.HIGH)],
+            policy=policy_from_rules([{"action": "message.send", "decision": "allow"}]),
+        )
+        listed = self.client.executions()
+        self.assertEqual([e["execution_id"] for e in listed], [result.execution_id])
+        record = self.client.execution(result.execution_id)
+        assert record is not None
+        self.assertEqual(record["state"], "success")
+        self.assertIsNone(self.client.execution("exec_missing"))
+
+    def test_metrics_snapshot_counts_executions(self) -> None:
+        self.client.execute(
+            self._send_graph(),
+            actor=Identity(id="user-1"),
+            grants=[PermissionGrant(scope="message.send", max_risk=RiskLevel.HIGH)],
+            policy=policy_from_rules([{"action": "message.send", "decision": "allow"}]),
+        )
+        metrics = self.client.metrics()
+        self.assertGreaterEqual(metrics.get("executions.completed", 0), 1)
+
+    def test_approvals_lists_an_execution_stopped_for_a_human(self) -> None:
+        # An ASK policy parks the execution; approvals() names the id to approve.
+        self.client.execute(
+            self._send_graph(),
+            actor=Identity(id="user-1"),
+            grants=[PermissionGrant(scope="message.send", max_risk=RiskLevel.HIGH)],
+            policy=policy_from_rules([{"action": "message.send", "decision": "ask"}]),
+        )
+        waiting = self.client.approvals()
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(waiting[0]["actions"][0]["action_type"], "message.send")
+
+    def test_event_stream_is_the_engine_iterator(self) -> None:
+        # The SDK exposes the same hub the API serves; it is an async iterator.
+        stream = self.client.event_stream()
+        self.assertTrue(hasattr(stream, "__anext__"))
+        import asyncio
+
+        asyncio.run(stream.aclose())
+
+
     def test_plan_proposes_without_claiming_privileges(self) -> None:
         plan = self.client.plan("tell mom I'll be late")
         self.assertEqual([action.type for action in plan.actions], ["message.send"])

@@ -88,6 +88,15 @@ class ActionRegistry:
         """All definitions, name asc then version asc."""
         return [self._defs[k] for k in sorted(self._defs, key=lambda k: (k[0], version_key(k[1])))]
 
+    def has(self, name: str) -> bool:
+        """True when ``name`` is registered at any version.
+
+        A membership test that does not raise, because device capability checks
+        (C19) probe many names at once — turning each lookup into exception
+        control flow would hide the one failure that matters.
+        """
+        return isinstance(name, str) and any(known == name for known, _ in self._defs)
+
     def discover(
         self,
         *,

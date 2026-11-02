@@ -120,6 +120,37 @@ def _notify(m: re.Match[str]) -> dict[str, Any]:
     return {"device_id": m.group("device_id").strip(), "title": m.group("title").strip()}
 
 
+def _none(m: re.Match[str]) -> dict[str, Any]:
+    return {}
+
+
+def _terminal(m: re.Match[str]) -> dict[str, Any]:
+    """Split a spoken ``run command <argv>`` into argv, exactly as it was said.
+
+    Only the caller's own words become the command line. There is no rule that turns
+    "run my tests" into a test command: the planner cannot know this project's command,
+    and inventing one is the failure mode the whole boundary exists to prevent. What the
+    program may be at all is the laptop's allowlist decision, not this one.
+    """
+    argv = m.group("argv").split()
+    return {"command": argv[0], "arguments": argv[1:]}
+
+
+def _named(m: re.Match[str], *groups: str) -> dict[str, Any]:
+    """Take the named groups that matched, dropping the optional ones that did not.
+
+    A device command needs a target — a process id, a server name, a path. Where the
+    phrase does not supply one, the rule does not match: the planner proposes nothing
+    rather than inventing an argument the executor would run against the wrong thing.
+    """
+    out: dict[str, Any] = {}
+    for group in groups:
+        value = m.groupdict().get(group)
+        if value:
+            out[group] = value.strip()
+    return out
+
+
 _RULES: tuple[
     tuple[str, re.Pattern[str], Callable[[re.Match[str]], dict[str, Any]]], ...
 ] = (
@@ -155,6 +186,64 @@ _RULES: tuple[
     # device notification
     ("device.notify", re.compile(
         r"^notify\s+(?P<device_id>\S+)\s*[:,]?\s*(?P<title>.+)$", re.I), _notify),
+    # --- laptop agent (C19 device plane) --------------------------------
+    # These are the phrases the voice surface actually hears. Two rules of the road:
+    # a command that needs a target only matches when the target is present (an
+    # omitted id must not become a guessed one), and nothing here maps "run the tests"
+    # to a command line — the planner cannot know the project's test command, and
+    # inventing a shell invocation is exactly what the boundary forbids.
+    ("device.terminal.execute", re.compile(
+        r"^run\s+(?:the\s+)?command\s+(?P<argv>\S.*)$", re.I), _terminal),
+    ("device.process.list", re.compile(
+        r"^(?:what(?:'s| is| are)? )?(?:my |the )?(?:laptop|machine|computer|device)"
+        r"\s+(?:is\s+|currently\s+)?running\??$", re.I), _none),
+    ("device.process.list", re.compile(
+        r"^what(?:'s| is| are)? running\??$", re.I), _none),
+    ("device.process.list", re.compile(
+        r"^show(?: me)? (?:the |my )?(?:running )?processes\??$", re.I), _none),
+    ("device.process.list", re.compile(
+        r"^what (?:processes|programs) (?:are )?running\??$", re.I), _none),
+    ("device.process.list", re.compile(r"^list (?:the )?processes$", re.I), _none),
+    ("device.server.status", re.compile(
+        r"^what servers? (?:are )?running\??$", re.I), _none),
+    ("device.server.status", re.compile(
+        r"^show(?: me)? (?:the |my )?(?:running )?(?:dev(?:elopment)? )?servers?\??$",
+        re.I), _none),
+    ("device.server.status", re.compile(r"^(?:server|dev server) status$", re.I), _none),
+    ("device.server.status", re.compile(r"^list (?:the )?servers$", re.I), _none),
+    ("device.project.list", re.compile(
+        r"^show(?: me)? my projects?\??$", re.I), _none),
+    ("device.project.list", re.compile(r"^list (?:the |my )?projects$", re.I), _none),
+    ("device.project.list", re.compile(
+        r"^what projects (?:do i have|are there|are open)\??$", re.I), _none),
+    ("device.ide.list", re.compile(
+        r"^show(?: me)? (?:the |my )?editors\??$", re.I), _none),
+    ("device.ide.list", re.compile(
+        r"^what editors? (?:are (?:open|installed|available)|do i have)\??$", re.I), _none),
+    ("device.ide.list", re.compile(r"^list (?:the )?editors$", re.I), _none),
+    ("device.file.list", re.compile(r"^show(?: me)? my files?\??$", re.I), _none),
+    ("device.file.list", re.compile(
+        r"^list (?:the |my )?files(?: in (?P<path>\S+))?$", re.I), lambda m: _named(m, "path")),
+    ("device.file.list", re.compile(
+        r"^what files (?:are there|do i have|are in (?P<path>\S+))\??$", re.I),
+     lambda m: _named(m, "path")),
+    # "read this file x" is the agent; "read the file x" stays the simulated action, so
+    # the two surfaces keep the phrasings their tests already pin.
+    ("device.file.read", re.compile(
+        r"^(?:read|open|show)\s+(?:this|that|my)\s+(?:text\s+)?file\s+(?P<path>\S+)$",
+        re.I), lambda m: _named(m, "path")),
+    ("device.process.logs", re.compile(
+        r"^(?:show|read|get)(?: me)? (?:the )?(?:server |process |dev(?:elopment)? server )?"
+        r"logs?(?: for| of) (?P<process_id>\S+)$", re.I), lambda m: _named(m, "process_id")),
+    ("device.process.stop", re.compile(
+        r"^(?:stop|kill)\s+(?:the |my )?(?:running )?process\s+(?P<process_id>\S+)$",
+        re.I), lambda m: _named(m, "process_id")),
+    ("device.server.stop", re.compile(
+        r"^(?:stop|kill)\s+(?:the |my )?(?:dev(?:elopment)? )?server\s+(?P<name>\S+)$",
+        re.I), lambda m: _named(m, "name")),
+    ("device.project.open", re.compile(
+        r"^(?:open|launch)\s+(?:my |the )?project\s+(?P<project>\S+)"
+        r"(?:\s+in\s+(?P<ide>\S+))?$", re.I), lambda m: _named(m, "project", "ide")),
     # application launch (last: it is the broadest pattern)
     ("system.launch_app", re.compile(
         r"^(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?(?P<app>[\w .+-]+)$", re.I), _launch),
