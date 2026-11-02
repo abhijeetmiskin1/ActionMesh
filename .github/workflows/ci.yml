@@ -1,0 +1,35 @@
+name: CI
+
+# The three gates the project already treats as its definition of done. No secrets,
+# no credentials, no network services: the suite is stdlib-only and runs offline.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (development + server extras only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,server]"
+      - name: Unit / integration / security tests
+        run: python -m unittest discover -s tests -t .
+      - name: Ruff
+        run: ruff check actionmesh tests scripts
+      - name: Mypy
+        run: mypy actionmesh
