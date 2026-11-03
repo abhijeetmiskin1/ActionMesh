@@ -457,6 +457,8 @@ def _record_from_payload(payload_text: str) -> ExecutionRecord:
         owner_id=payload.get("owner_id", ""),
         lease_expires_at=_parse(payload.get("lease_expires_at")),
         cancel_requested=bool(payload.get("cancel_requested", False)),
+        device_id=payload.get("device_id", ""),
+        device_name=payload.get("device_name", ""),
     )
 
 

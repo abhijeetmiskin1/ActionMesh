@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from actionmesh.core.permissions.risk import max_risk
 from actionmesh.protocol.models import (
     ActionDefinition,
     RetryPolicy,
@@ -219,6 +220,58 @@ def device_definitions() -> list[ActionDefinition]:
             {"app": _S}, ["app"],
             "Close an application this laptop agent launched",
         ),
+        # --- screen + GUI (C38) -------------------------------------------
+        # Capture goes through the OS screenshot portal, which is the compositor's own
+        # consent gate: the approval prompt this definition triggers is *in addition* to
+        # that, never instead of it. The result carries a transient reference, not an
+        # image, so a capture is not a way to exfiltrate a screen into a stored payload.
+        _def(
+            "device.screen.capture", RiskLevel.MEDIUM, ["device.screen.read"],
+            {}, [],
+            "Capture this laptop's screen once, through the OS screenshot portal",
+            timeout_s=45.0,
+        ),
+        # Inspection reads the accessibility tree: the machine's own description of its
+        # windows, elements and their bounds. Read-only and cheap; it never drives
+        # anything, which is why it is a MEDIUM read scoped to screen.read.
+        _def(
+            "device.screen.inspect", RiskLevel.MEDIUM, ["device.screen.read"],
+            {"window": _S, "max_elements": _NUM}, [],
+            "Describe the windows and elements on this laptop's accessibility tree",
+            timeout_s=20.0,
+        ),
+        # --- GUI actions (C38) --------------------------------------------
+        # These drive the machine, so they are HIGH and scoped to screen.control -- the
+        # scope that already exists for exactly this ("Drive this laptop's GUI (click,
+        # type, scroll) via accessibility"). Nothing here widens a scope or lowers a
+        # classification: a click is an arbitrary interaction with an arbitrary window,
+        # which is what HIGH already means in this catalog.
+        #
+        # Each names its target by role and label, never by coordinate. The label must
+        # identify exactly one element or the action refuses -- see
+        # ``device_screen._MAX_MATCHES``. Verification is independent: after the action,
+        # the executor re-observes the same element and confirms the machine's state
+        # changed, so "the toolkit accepted the call" is not mistaken for "the effect
+        # happened".
+        _def(
+            "device.gui.click", RiskLevel.HIGH, ["device.screen.control"],
+            {"role": _S, "name": _S, "window": _S}, ["role", "name"],
+            "Activate one named element on this laptop's GUI (a button, a menu item)",
+            timeout_s=20.0,
+        ),
+        _def(
+            "device.gui.type", RiskLevel.HIGH, ["device.screen.control"],
+            {"role": _S, "name": _S, "text": _S, "window": _S}, ["role", "name", "text"],
+            "Insert text into one named editable element on this laptop's GUI",
+            timeout_s=20.0,
+        ),
+        _def(
+            "device.gui.scroll", RiskLevel.HIGH, ["device.screen.control"],
+            {"role": _S, "name": _S, "direction": _S, "window": _S},
+            ["role", "name", "direction"],
+            "Scroll the region holding a named element to an edge (top/bottom/left/right)",
+            timeout_s=20.0,
+        ),
     ]
 
 
@@ -296,6 +349,26 @@ IMPLEMENTED: frozenset[str] = frozenset(
         "device.project.list",
         "device.project.status",
         "device.project.open",
+        "device.screen.capture",
+        "device.screen.inspect",
+        "device.gui.click",
+        "device.gui.type",
+        "device.gui.scroll",
+    }
+)
+
+
+#: Capabilities that need a live graphical session, not a configured root or shell.
+#: They are advertised only when the process can actually reach the desktop — because a
+#: ``device.screen.capture`` on a headless host is a capability that authorizes, prompts,
+#: and then has nothing to capture, the failure mode this gate exists to stop.
+REQUIRING_DESKTOP: frozenset[str] = frozenset(
+    {
+        "device.screen.capture",
+        "device.screen.inspect",
+        "device.gui.click",
+        "device.gui.type",
+        "device.gui.scroll",
     }
 )
 
@@ -333,12 +406,53 @@ def register_device_actions(
     return added
 
 
+def advertised_ceiling(advertised: Iterable[str]) -> RiskLevel:
+    """The risk ceiling this machine's own enrolment should carry.
+
+    A device's ceiling is what that machine may **execute**; it is not a permission
+    to do anything. Every node still passes the policy engine, approval, consent and
+    the credential ceiling, exactly as before. What the ceiling must not do is make a
+    capability impossible to use: ``DeviceInfo.risk_ceiling`` defaults to ``LOW``
+    as a fail-closed default, so a laptop that honestly advertises a
+    ``MEDIUM``-risk capability and enrols at ``LOW`` has announced a capability that
+    can never run — the registry would refuse it after every approval has been given,
+    which is the "authorized, prompted, then failed" outcome the capability gates
+    exist to prevent.
+
+    So the ceiling is derived from what this agent actually advertises, and nothing
+    wider. An agent with no workspace, no shell and no desktop advertises only
+    ``LOW``-risk reads and enrols at ``LOW``; turning on ``allow_shell`` raises it to
+    ``CRITICAL`` because ``device.terminal.execute`` is genuinely critical, and
+    ``allow_desktop`` alone raises it to ``MEDIUM``. The answer moves only when an
+    operator moves a boundary in this process's own configuration.
+
+    That is the correct owner for the value. The device ceiling is set by the machine's
+    owner at enrolment; for this laptop the owner is the person who started the agent
+    with those flags, so re-deriving it at startup is the owner restating a decision,
+    not a third party raising one. Nothing else can move it upwards: pairing sets the
+    *phone's* ceiling, never the laptop's, and :meth:`DeviceRegistry.set_risk_ceiling`
+    still refuses every increase.
+
+    It also means a boundary being closed lowers the ceiling, which is the direction
+    that needs no ceremony.
+    """
+    catalog = {definition.name: definition.risk_level for definition in device_definitions()}
+    ceiling = RiskLevel.LOW
+    for capability in advertised:
+        risk = catalog.get(capability)
+        if risk is not None:
+            ceiling = max_risk(ceiling, risk)
+    return ceiling
+
+
 __all__ = [
     "CAPABILITIES",
     "IMPLEMENTED",
     "PROVIDER",
+    "REQUIRING_DESKTOP",
     "REQUIRING_FILE_ROOT",
     "REQUIRING_SHELL",
+    "advertised_ceiling",
     "device_definitions",
     "register_device_actions",
 ]

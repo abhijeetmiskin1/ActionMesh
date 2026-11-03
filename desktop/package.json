@@ -1,0 +1,88 @@
+{
+  "name": "actionmesh-desktop",
+  "productName": "ActionMesh",
+  "version": "0.1.0",
+  "description": "ActionMesh — your devices, one intent. AI proposes, policy decides, you approve, the laptop acts, verification confirms.",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "ActionMesh",
+    "email": "desktop@actionmesh.invalid"
+  },
+  "homepage": "https://actionmesh.invalid/",
+  "main": "app/main.js",
+  "private": true,
+  "scripts": {
+    "start": "node scripts/start.js",
+    "test": "node --test test/*.test.js app/providers.test.js app/provider_bridge.test.js",
+    "pack": "electron-builder --dir",
+    "dist:linux": "electron-builder --linux deb --x64",
+    "dist:linux-all": "electron-builder --linux deb AppImage rpm --x64",
+    "dist:win": "electron-builder --win nsis msi --x64",
+    "dist:mac": "electron-builder --mac dmg --x64 --arm64"
+  },
+  "devDependencies": {
+    "electron": "45.2.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.actionmesh.voiceos",
+    "productName": "ActionMesh",
+    "copyright": "Copyright © ActionMesh contributors",
+    "artifactName": "ActionMesh-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "app/**/*",
+      "ui/**/*",
+      "assets/**/*",
+      "!app/*.test.js",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime",
+        "to": "runtime"
+      }
+    ],
+    "linux": {
+      "target": [{ "target": "deb", "arch": ["x64"] }],
+      "category": "Utility",
+      "executableName": "actionmesh",
+      "synopsis": "Local-first control plane for your own devices",
+      "description": "ActionMesh turns a spoken or typed intent into a reviewed action plan, asks for permission where the policy requires it, runs only what was approved on your own laptop, and verifies the result independently.",
+      "desktop": {
+        "entry": {
+          "Name": "ActionMesh",
+          "GenericName": "Device Control Plane",
+          "Comment": "Your devices, one intent.",
+          "Categories": "Utility;Development;",
+          "Keywords": "actionmesh;automation;voice;local;agent;",
+          "StartupWMClass": "ActionMesh",
+          "StartupNotify": "true"
+        }
+      }
+    },
+    "deb": {
+      "priority": "optional",
+      "maintainer": "ActionMesh <desktop@actionmesh.invalid>",
+      "recommends": ["libgtk-3-0", "libnotify4", "libnss3"]
+    },
+    "win": {
+      "target": ["nsis", "msi"],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "ActionMesh"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns"
+    }
+  }
+}

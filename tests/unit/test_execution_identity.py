@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -180,6 +181,42 @@ class TestIdentityOutlivesTheProcessThatRecordedIt(_LedgerCase):
         evidence = provider.execution_evidence("exec_git")
         self.assertEqual(evidence["state"], "exited")
         self.assertEqual(evidence["exit_code"], 0)
+
+    def test_a_child_that_died_unwatched_is_not_reported_as_running(self) -> None:
+        """The ledger row is written by whoever *notices* the child end.
+
+        A server killed hard never notices, so the row keeps saying `running` about a
+        pid that no longer exists -- and an agent that repeats that text tells the
+        control plane a finished run is still going, forever. The kernel is the better
+        witness: the pid is gone, so the child ended.
+        """
+        provider = self.provider(self.store())
+        self.in_execution(
+            provider,
+            "exec_killed",
+            type="device.process.start",
+            command="python3",
+            arguments=[self.hold_script()],
+            label="hold",
+        )
+        pid = provider.execution_evidence("exec_killed")["pids"][0]
+        os.kill(pid, signal.SIGKILL)
+
+        # A *different* agent reads the ledger the dead server had been writing to, and
+        # never reaps: no live child of its own, and the row still says `running`.
+        reopened = self.provider(self.store())
+        row = reopened.ledger.list_dispatch("exec_killed")[0]  # type: ignore[union-attr]
+        self.assertEqual(row["state"], "running", "the fixture no longer reproduces the bug")
+
+        evidence = reopened.execution_evidence("exec_killed")
+        self.assertIsNotNone(evidence)
+        self.assertNotEqual(evidence["state"], "running", "a dead pid was reported as alive")
+        self.assertEqual(evidence["pids"], [])
+        action = evidence["actions"][0]
+        self.assertEqual(action["state"], "exited")
+        # The process is gone; *why* it is gone was never observed. Reusing a code the
+        # agent remembers from some other run would hand verification a fabricated fact.
+        self.assertIsNone(action["exit_code"], "an unobserved exit code was invented")
 
     def test_the_effect_of_a_run_is_readable_by_an_agent_that_missed_it(self) -> None:
         """`observe()` is the verifier's only witness, so it must survive too."""

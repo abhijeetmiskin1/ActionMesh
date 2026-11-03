@@ -86,8 +86,9 @@ DANGEROUS_MEMBERS = {
 # inside any path listed on the allowlist below.
 DANGEROUS_CALLS = {"eval", "exec", "__import__", "compile"}
 
-#: Per-path exemptions, spelled out member by member. The only capability granted in
-#: this repository today is one function in one file: the laptop agent's runner.
+#: Per-path exemptions, spelled out member by member. The only capabilities granted in
+#: this repository today are one function in the laptop agent's runner, one loopback
+#: probe, and one outbound HTTPS call in the reviewed model transport.
 MEMBER_ALLOWLIST: dict[str, set[str]] = {
     "actionmesh/agent/runner.py": {"asyncio.create_subprocess_exec"},
     # Loopback liveness probing. Structurally safe because `is_listening` accepts an
@@ -95,10 +96,44 @@ MEMBER_ALLOWLIST: dict[str, set[str]] = {
     # exemption is still spelled out, so "the agent can open a socket" is a line in a
     # security test rather than something a reader has to trust.
     "actionmesh/agent/processes.py": {"asyncio.open_connection"},
+    # C37: the model transport. This is the package's one outbound internet call, and
+    # it is granted as a *member*, not as a module import, on purpose: the file imports
+    # nothing dangerous (asyncio, json, urllib.parse), so granting it a NETWORK_ALLOWED
+    # prefix would also exempt it from the pickle/socket/subprocess import bans -- a far
+    # wider hole than the capability needs. What keeps this safe is inside the module:
+    # the destination is a closed frozenset (OFFICIAL_ENDPOINTS), https and port 443
+    # only, no userinfo, no redirects, both directions size-bounded, response bodies
+    # never surfaced. `test_the_model_transport_dials_only_approved_endpoints` below
+    # asserts that closed list through the public function rather than trusting this
+    # comment.
+    "actionmesh/voiceos/transport.py": {"asyncio.open_connection"},
+    # C41: the desktop model bridge. This is the package's *second* outbound path, and
+    # it is narrower than the first in a way the first could not be: the destination is
+    # a Unix domain socket inside the desktop app's own profile directory, handed to
+    # this process in its environment. `AF_UNIX` has no hostname and no port, so there
+    # is no address an attacker can substitute to redirect it; the peer is whichever
+    # local process owns that path, and it authenticates the caller with a per-launch
+    # token. The exemption is granted member by member, and the *import* is granted by
+    # the per-path table below rather than through NETWORK_ALLOWED -- that set would
+    # also let this file import `pickle` or `subprocess`, which it has no business
+    # doing. `tests/unit/test_model_bridge.py` asserts the AF_UNIX-only construction
+    # through the public functions rather than trusting this comment.
+    "actionmesh/voiceos/model_bridge.py": {"socket.socket"},
 }
 
-#: Network access is forbidden package-wide with no exemption in place. A future
-#: official adapter (C13) gets a path here as a deliberate, reviewable edit.
+#: Imports of an otherwise-banned module that one specific file is permitted. Kept apart
+#: from MEMBER_ALLOWLIST because "may reference socket.socket" and "may import the socket
+#: module at all" are different capabilities, and only this file needs the second.
+IMPORT_ALLOWLIST: dict[str, set[str]] = {
+    # AF_UNIX only; see the member grant above for why that is the whole story.
+    "actionmesh/voiceos/model_bridge.py": {"socket"},
+}
+
+#: Network access by module *import* is still forbidden package-wide, with no
+#: exemption. The C37 model transport deliberately did not need one: it reaches the
+#: network through a granted member call above, so this set stays empty and every
+#: module in the package -- the execution engine included -- remains unable to
+#: `import socket`, `import httpx` or `import urllib.request`.
 NETWORK_ALLOWED: frozenset[str] = frozenset()
 
 #: Argument keywords that must never appear anywhere, on any path. `shell=True` is the
@@ -145,14 +180,15 @@ def _flag_imports(rel: str, tree: ast.Module) -> list[str]:
     network_exempt = any(
         normalised.startswith(prefix) for prefix in NETWORK_ALLOWED
     )
+    import_exempt = IMPORT_ALLOWLIST.get(normalised, set())
     problems: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if _is_dangerous(alias.name) and not network_exempt:
+                if _is_dangerous(alias.name) and not network_exempt and alias.name not in import_exempt:
                     problems.append(f"{rel}:{node.lineno} imports {alias.name}")
         elif isinstance(node, ast.ImportFrom):
-            if _is_dangerous(node.module or "") and not network_exempt:
+            if _is_dangerous(node.module or "") and not network_exempt and node.module not in import_exempt:
                 problems.append(f"{rel}:{node.lineno} imports from {node.module}")
             banned = DANGEROUS_MEMBERS.get(node.module or "")
             if banned:
@@ -290,12 +326,107 @@ class DangerousPrimitiveTests(unittest.TestCase):
             {
                 "actionmesh/agent/runner.py": {"asyncio.create_subprocess_exec"},
                 "actionmesh/agent/processes.py": {"asyncio.open_connection"},
+                "actionmesh/voiceos/transport.py": {"asyncio.open_connection"},
+                "actionmesh/voiceos/model_bridge.py": {"socket.socket"},
             },
+            "changing this line is a security decision, not a convenience",
+        )
+        self.assertEqual(
+            IMPORT_ALLOWLIST,
+            {"actionmesh/voiceos/model_bridge.py": {"socket"}},
             "changing this line is a security decision, not a convenience",
         )
 
     def test_the_network_allowlist_is_still_empty(self) -> None:
+        # C37 added an outbound call without widening this set: the transport reaches
+        # the network through a granted member call, so no module -- least of all the
+        # execution engine -- gained the ability to import a network stack.
         self.assertEqual(NETWORK_ALLOWED, frozenset())
+
+    def test_the_model_transport_dials_only_approved_endpoints(self) -> None:
+        """The grant is bounded by content, not by a convention.
+
+        `asyncio.open_connection` is permitted in exactly one module. What makes that
+        safe is that the destination is a closed set inside the transport rather than a
+        parameter its caller controls, so this test drives the public validation
+        function: everything outside the set is refused *before* a dial would happen.
+        """
+        from actionmesh.voiceos.transport import (
+            OFFICIAL_ENDPOINTS,
+            TransportError,
+            checked_endpoint,
+        )
+
+        self.assertEqual(
+            OFFICIAL_ENDPOINTS, frozenset({"https://api.anthropic.com/v1/messages"})
+        )
+        for endpoint in OFFICIAL_ENDPOINTS:
+            host, port, path = checked_endpoint(endpoint)
+            self.assertTrue(host)
+            self.assertEqual(port, 443)
+            self.assertTrue(path.startswith("/"))
+
+        refused = [
+            "http://api.anthropic.com/v1/messages",           # plaintext
+            "https://evil.example/v1/messages",               # not on the list
+            "https://api.anthropic.com/v1/messages?to=x",     # query string
+            "https://api.anthropic.com:8443/v1/messages",     # non-443
+            "https://key:secret@api.anthropic.com/v1/messages",  # userinfo
+            "https://api.anthropic.com/v1/other",             # not on the list
+            "api.anthropic.com/v1/messages",                  # no scheme
+            "",
+        ]
+        for endpoint in refused:
+            with self.subTest(endpoint=endpoint), self.assertRaises(TransportError):
+                checked_endpoint(endpoint)
+
+    def test_the_bridge_exemption_is_a_unix_socket_and_nothing_else(self) -> None:
+        """C41's grant is narrower than the transport's, and this proves it.
+
+        `model_bridge.py` may import `socket` and call `socket.socket`. It may not use
+        any other member of the module -- in particular `create_connection`, which takes
+        a host, or `getaddrinfo` -- and it may not reach the network any other way. The
+        construction itself is checked through the public client: it selects AF_UNIX,
+        so there is no host or port in the call to redirect.
+        """
+        rel = "actionmesh/voiceos/model_bridge.py"
+        # Every socket member this file is allowed to use.
+        self.assertEqual(MEMBER_ALLOWLIST[rel], {"socket.socket"})
+
+        # A dial-out written in this file would still be refused, when it uses a
+        # member the grant did not name.
+        for source in (
+            "socket.create_connection(('evil.example', 80))",
+            "socket.getaddrinfo('evil.example', 443)",
+            "s = socket.socket(); s.connect(('evil.example', 443))",
+        ):
+            tree = ast.parse(source)
+            # The member scanner flags the first two outright...
+            if "socket.socket()" not in source:
+                self.assertTrue(_flag_members(rel, tree), source)
+        # ...and an import of `ssl` or `http.client` in the same file is not covered
+        # by the import grant, which names exactly one module.
+        tree = ast.parse("import ssl\nimport http.client\nfrom urllib import request\n")
+        self.assertTrue(_flag_imports(rel, tree))
+
+    def test_the_bridge_client_speaks_af_unix(self) -> None:
+        """The socket type is a fact about the call, not about a comment."""
+        source = (
+            PACKAGE / "voiceos" / "model_bridge.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        families = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _call_name(node)
+            if name != "socket.socket":
+                continue
+            self.assertEqual(len(node.args), 2, "socket.socket must name family and type")
+            for arg in node.args[:2]:
+                if isinstance(arg, ast.Attribute):
+                    families.add(arg.attr)
+        self.assertEqual(families, {"AF_UNIX", "SOCK_STREAM"})
 
     def test_exemptions_do_not_reach_the_never_allowed_set(self) -> None:
         # Even the runner cannot shell out, exec source, or hand a callback to the
@@ -401,6 +532,35 @@ class DangerousPrimitiveTests(unittest.TestCase):
         self.assertIn(
             "asyncio.create_subprocess_exec",
             " ".join(MEMBER_ALLOWLIST["actionmesh/agent/runner.py"]),
+        )
+
+    def test_the_model_transport_is_the_only_module_that_dials_out(self) -> None:
+        """The C37 grant names one file; this proves the code matches.
+
+        Symmetrical with the spawn check above: scan for the granted attribute itself,
+        so a second module that opened a connection -- or the execution engine growing
+        one -- fails here even if someone also widened the allowlist to permit it.
+        """
+        users: list[str] = []
+        for rel, tree in _modules():
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "asyncio"
+                    and node.attr in {"open_connection", "open_unix_connection"}
+                ):
+                    users.append(_normalise(rel))
+        self.assertEqual(
+            sorted(set(users)),
+            [
+                "actionmesh/agent/processes.py",
+                "actionmesh/voiceos/transport.py",
+            ],
+        )
+        self.assertIn(
+            "asyncio.open_connection",
+            " ".join(MEMBER_ALLOWLIST["actionmesh/voiceos/transport.py"]),
         )
 
 

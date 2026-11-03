@@ -84,7 +84,11 @@ class VoiceOsStore:
             "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(session_id) DO UPDATE SET updated_at=excluded.updated_at, "
             "payload=excluded.payload",
-            (session.session_id, session.actor_id, session.updated_at, json.dumps(session.to_dict())),
+            # Storage, not the client view: a session reloaded without its `bind` and
+            # `analysis` fields is a different plan -- the bound log read loses its
+            # process id, and the explanation placeholder becomes a dispatchable step
+            # with no action type, which fails the graph validator.
+            (session.session_id, session.actor_id, session.updated_at, json.dumps(session.to_storage())),
         )
         self.connection.commit()
 

@@ -119,8 +119,16 @@ def check_params(
     for name, value in params.items():
         spec = properties.get(name)
         if spec is None:
-            warnings.append(f"unrecognized parameter {name!r} for {defn.name}")
-            continue
+            # Fail closed. A parameter the action does not declare is not carried
+            # through "as opaque data" — it is refused. A warning here is a sentence
+            # nobody acts on: the action still dispatches, with the extra value bound
+            # into the call. That is the second door for untrusted input, and the one
+            # an LLM proposal is most likely to walk through (``{"command": "rm -rf /"}``
+            # smuggled beside a legitimate ``{"to", "message"}``).
+            raise ValidationError(
+                f"unrecognized parameter {name!r} for {defn.name}",
+                f"{path}.parameters.{name}",
+            )
         if not isinstance(spec, dict):
             raise DefinitionError(
                 f"{defn.name}: property spec for {name!r} must be an object, "

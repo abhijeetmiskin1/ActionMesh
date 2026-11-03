@@ -505,6 +505,48 @@ class TestReconciliationUsesTheAgentsEvidence(_DurableCase):
         self.assertEqual(store.get_record(execution_id).state, ActionState.INTERRUPTED)
         self.assertFalse(store.get_record(execution_id).cancel_requested)
 
+    def test_an_ended_action_with_no_exit_code_is_never_given_a_verdict(self) -> None:
+        """A killed agent can prove a child is gone. It cannot prove why.
+
+        The live demo does exactly this: the server is SIGKILLed mid-command, the child
+        keeps running and exits normally 45 seconds later, and the restarted server finds
+        a ledger row still saying ``running`` about a pid that has since ended. The
+        process ending is a fact; its exit code is not. Verifying a *failure* from the
+        absence of a code would claim the command did not run, when it demonstrably did.
+        """
+        execution_id, store, _, _ = self.running_run()
+        stored_graph = json.loads(store.load_body(execution_id)[0])
+        action_node = next(n for n in stored_graph["nodes"] if n.get("action"))
+        action_id = action_node["action"]["action_id"]
+        node_id = action_node["node_id"]
+        watcher = _EvidenceProvider(
+            {
+                execution_id: {
+                    "state": "exited",
+                    "exit_code": None,
+                    "actions": [
+                        {
+                            "action_id": action_id,
+                            "process_id": "",
+                            "state": "exited",
+                            "exit_code": None,
+                        }
+                    ],
+                    "detail": "1 dispatched action(s), 0 alive",
+                }
+            }
+        )
+        second = self.engine(watcher, owner="proc-b", store=store)
+        summary = run(second.reconcile_interrupted())
+        self.assertEqual(summary["settled"], 1)
+        self.assertFalse(watcher.calls, "an unsettleable run was dispatched again")
+        record = store.get_record(execution_id)
+        self.assertEqual(record.state, ActionState.INTERRUPTED, record.error)
+        node = record.results[node_id]
+        self.assertEqual(node["state"], ActionState.INTERRUPTED.value)
+        self.assertIsNone(node["verified"], "an unobserved outcome was given a verdict")
+        self.assertNotIn("exit_code", node["result"], "an exit code was invented")
+
     def test_a_run_the_agent_has_no_record_of_is_never_made_up(self) -> None:
         """`reconcile` must not turn a provider's silence into a success."""
         store = self.store()
@@ -701,6 +743,52 @@ class TestStreamCursorStaysCorrect(unittest.TestCase):
         self.assertIn("id: evt_keep", retained)
         self.assertNotIn("id:", transient)
         self.assertIn("event: execution.output", transient)
+
+    def test_an_element_list_survives_the_wire_uncut(self) -> None:
+        # The framing rule has to hold at *both* layers. `output.py` sends the walk as
+        # one whole document; this is the serializer it then passes through. A 16 KB
+        # backstop that replaced an oversized payload wholesale undid that fix one
+        # layer up, and the UI got a payload-less event over a count of 200.
+        import json
+
+        from actionmesh.api import _event_json
+        from actionmesh.core.output import OUTPUT_EVENT_TYPE
+
+        document = "[" + ",".join(['{"role":"push button","name":"Button"}'] * 1200) + "]"
+        self.assertGreater(len(document), 16384)
+        frame = _event_json(MeshEvent(
+            event_type=OUTPUT_EVENT_TYPE, execution_id="g", actor="voiceos-local",
+            payload={
+                "node_id": "n1", "device_id": "laptop-1", "stream": "elements",
+                "sequence": 1, "chunk": document, "truncated": True, "final": False,
+            },
+        ))
+        payload = json.loads(frame)["payload"]
+        self.assertEqual(len(json.loads(payload["chunk"])), 1200,
+                         "the wire cut a document that parses only when whole")
+
+    def test_program_output_over_the_wire_cap_is_still_refused(self) -> None:
+        # stdout is a byte sequence, so the backstop still applies to it: a runaway
+        # program must not grow a phone's buffer.
+        import json
+
+        from actionmesh.api import _event_json
+        from actionmesh.core.output import OUTPUT_EVENT_TYPE
+
+        frame = _event_json(MeshEvent(
+            event_type=OUTPUT_EVENT_TYPE, execution_id="g", actor="a",
+            payload={
+                "node_id": "n1", "stream": "stdout", "sequence": 1,
+                "chunk": "x" * 20000, "truncated": False, "final": False,
+            },
+        ))
+        payload = json.loads(frame)["payload"]
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["chunk"], "")
+        # The stream name survives, so a client says *which* output was refused
+        # instead of appending an empty string to whatever pane came first.
+        self.assertEqual(payload["stream"], "stdout")
+        self.assertFalse(payload["final"])
 
     def test_a_cursor_that_aged_out_replays_the_window_rather_than_losing_events(self) -> None:
         hub = EventHub()

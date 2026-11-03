@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoiceOS</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app shell" id="app">
+
+  <!-- SIDEBAR ---------------------------------------------------------- -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <img src="../assets/icon.png" alt="" class="brand-mark">
+      <div class="brand-text">
+        <div class="brand-name">VoiceOS</div>
+        <div class="brand-sub">ActionMesh</div>
+      </div>
+    </div>
+
+    <nav class="nav" aria-label="Primary">
+      <button class="nav-item" data-view="home" type="button" title="Home">
+        <span class="nav-glyph" aria-hidden="true">◈</span><span class="nav-label">Home</span>
+      </button>
+      <button class="nav-item" data-view="voice" type="button" title="Voice Commands">
+        <span class="nav-glyph" aria-hidden="true">◎</span><span class="nav-label">Voice Commands</span>
+        <span class="nav-badge live" data-badge="voice" hidden></span>
+      </button>
+      <button class="nav-item" data-view="visual" type="button" title="Visual Intelligence">
+        <span class="nav-glyph" aria-hidden="true">◉</span><span class="nav-label">Visual Intelligence</span>
+        <span class="nav-badge live" data-badge="visual" hidden></span>
+      </button>
+      <button class="nav-item" data-view="tasks" type="button" title="Tasks">
+        <span class="nav-glyph" aria-hidden="true">✦</span><span class="nav-label">Tasks</span>
+        <span class="nav-badge" data-badge="tasks" hidden></span>
+      </button>
+      <button class="nav-item" data-view="automations" type="button" title="Automations">
+        <span class="nav-glyph" aria-hidden="true">↻</span><span class="nav-label">Automations</span>
+        <span class="nav-badge" data-badge="automations" hidden></span>
+      </button>
+      <button class="nav-item" data-view="devices" type="button" title="Devices">
+        <span class="nav-glyph" aria-hidden="true">⌂</span><span class="nav-label">Devices</span>
+        <span class="nav-badge" data-badge="devices" hidden></span>
+      </button>
+      <button class="nav-item" data-view="live" type="button" title="Live Control">
+        <span class="nav-glyph" aria-hidden="true">◐</span><span class="nav-label">Live Control</span>
+        <span class="nav-badge live" data-badge="live" hidden></span>
+      </button>
+      <button class="nav-item" data-view="approvals" type="button" title="Approvals">
+        <span class="nav-glyph" aria-hidden="true">✓</span><span class="nav-label">Approvals</span>
+        <span class="nav-badge warn" data-badge="approvals" hidden></span>
+      </button>
+      <button class="nav-item" data-view="history" type="button" title="History">
+        <span class="nav-glyph" aria-hidden="true">≡</span><span class="nav-label">History</span>
+      </button>
+      <button class="nav-item" data-view="settings" type="button" title="Settings">
+        <span class="nav-glyph" aria-hidden="true">⚙</span><span class="nav-label">Settings</span>
+      </button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="status-line">
+        <span class="dot" id="railDot"></span>
+        <span id="railStatus">Starting…</span>
+      </div>
+      <div class="rail-meta">
+        <span id="railShortcut">Ctrl+Shift+Space</span>
+        <span id="railVersion"></span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN ------------------------------------------------------------- -->
+  <main class="main">
+
+    <!-- HEADER --------------------------------------------------------- -->
+    <header class="headerbar topbar">
+      <div class="header-left">
+        <button class="icon-btn sidebar-toggle" id="sidebarToggle" type="button"
+                title="Collapse sidebar" aria-label="Collapse sidebar">☰</button>
+        <div>
+          <div class="eyebrow" id="viewEyebrow">Control plane</div>
+          <h1 id="viewTitle">Home</h1>
+        </div>
+      </div>
+
+      <div class="header-center">
+        <button class="device-pill" id="devicePill" type="button" title="Current device — open Devices">
+          <span class="dot offline" id="devicePillDot"></span>
+          <span id="devicePillName">No device</span>
+        </button>
+      </div>
+
+      <div class="header-right">
+        <div class="provider-bar">
+          <label class="provider-field">
+            <span class="provider-caption">AI PROVIDER</span>
+            <select id="providerSelect" title="AI provider"></select>
+          </label>
+          <label class="provider-field">
+            <span class="provider-caption">MODEL</span>
+            <select id="modelSelect" title="Model"></select>
+          </label>
+          <span class="provider-caption">CONNECTION</span>
+          <span class="provider-status" id="providerStatus" data-state="not_configured">Not configured</span>
+          <span class="stream-pill" id="streamPill" data-state="closed">stream …</span>
+          <button class="btn ghost small" id="providerConfigure" type="button">CONFIGURE API</button>
+        </div>
+        <button class="icon-btn" id="notifyBtn" type="button" title="Notifications" aria-label="Notifications">
+          <span aria-hidden="true">🔔</span>
+          <span class="badge-dot" id="notifyDot" hidden></span>
+        </button>
+        <button class="icon-btn" id="refreshAll" type="button" title="Refresh" aria-label="Refresh">⟳</button>
+        <button class="icon-btn" id="profileBtn" type="button" title="Settings" aria-label="Settings">⚙</button>
+      </div>
+    </header>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+    <div class="main-scroll" id="mainScroll">
+
+    <!-- HOME ------------------------------------------------------------ -->
+    <section class="view" data-view="home" hidden>
+      <div class="hero">
+        <h1 id="homeGreeting">Good morning. What should we work on?</h1>
+        <p class="hero-sub">Your AI computer workspace.</p>
+        <div class="btn-row">
+          <button class="btn primary" data-goto="voice" type="button">Start Voice Command</button>
+          <button class="btn ghost" data-goto="visual" type="button">Inspect Screen</button>
+          <button class="btn ghost" data-goto="tasks" type="button">New Task</button>
+          <button class="btn ghost" data-goto="automations" type="button">Create Automation</button>
+        </div>
+      </div>
+
+      <div class="grid four">
+        <article class="card stat">
+          <div class="stat-label">Connected computers</div>
+          <div class="stat-value" id="homeDevices">—</div>
+          <div class="stat-note" id="homeDevicesNote">–</div>
+        </article>
+        <article class="card stat">
+          <div class="stat-label">Active executions</div>
+          <div class="stat-value" id="homeBackend">—</div>
+          <div class="stat-note" id="homeBackendNote">–</div>
+        </article>
+        <article class="card stat">
+          <div class="stat-label">Pending approvals</div>
+          <div class="stat-value" id="homeApprovals">—</div>
+          <div class="stat-note">waiting on you</div>
+        </article>
+        <article class="card stat">
+          <div class="stat-label">Saved automations</div>
+          <div class="stat-value" id="homeAudit">—</div>
+          <div class="stat-note" id="homeAuditNote">–</div>
+        </article>
+      </div>
+
+      <article class="card">
+        <h2 class="card-title">Ask for something</h2>
+        <p class="card-note">
+          Type it or hold the microphone. Asking only <em>proposes</em> a plan — nothing runs
+          until you press Run on a step, and any action the policy marks risky waits for a
+          separate approval.
+        </p>
+        <form class="ask" id="homeAsk">
+          <input id="homeAskText" placeholder="e.g. run the long job" autocomplete="off" spellcheck="false">
+          <button class="btn primary" id="homeAskSend" type="button">Propose</button>
+          <button class="btn mic" id="homeAskMic" type="button" title="Hold to talk">◉</button>
+        </form>
+        <div class="reply" id="homeReply" hidden></div>
+      </article>
+
+      <div class="grid two">
+        <article class="card">
+          <div class="card-head">
+            <h2 class="card-title">Recent executions</h2>
+            <button class="btn ghost small" data-goto="live" type="button">Live Control →</button>
+          </div>
+          <ul class="rows" id="homeExecutions"><li class="empty">Loading…</li></ul>
+        </article>
+        <article class="card">
+          <div class="card-head">
+            <h2 class="card-title">Recent tasks</h2>
+            <button class="btn ghost small" data-goto="tasks" type="button">Task Center →</button>
+          </div>
+          <ul class="rows" id="homeSessions"><li class="empty">Loading…</li></ul>
+        </article>
+      </div>
+
+      <article class="card">
+        <div class="card-head">
+          <h2 class="card-title">AI status</h2>
+          <button class="btn ghost small" id="homeProviderConfigure" type="button">Configure</button>
+        </div>
+        <dl class="kv" id="homeProviderKv"></dl>
+      </article>
+    </section>
+
+    <!-- VOICE COMMANDS --------------------------------------------------- -->
+    <section class="view" data-view="voice" hidden>
+      <div class="voice-layout">
+        <article class="card mic-card">
+          <div class="mic-wrap">
+            <button class="mic-button" id="voiceMic" type="button" data-state="idle"
+                    aria-label="Start listening">🎙</button>
+            <div class="mic-state" id="voiceState" data-state="idle">Idle</div>
+            <p class="mic-hint" id="voiceHint">
+              Microphone access starts only when you press the button.
+            </p>
+          </div>
+          <p class="mic-transcript-label">Transcript — edit it before sending if you like</p>
+          <textarea class="textarea" id="voiceTranscript" rows="3"
+                    placeholder="What would you like VoiceOS to do?"></textarea>
+          <div class="btn-row">
+            <button class="btn primary" id="voiceSend" type="button">Send Transcript</button>
+            <button class="btn ghost" id="voiceStopListening" type="button" disabled>Stop Listening</button>
+            <button class="btn ghost" id="voiceStopSpeaking" type="button" disabled>Stop Speaking</button>
+            <button class="btn subtle" id="voiceClear" type="button">Clear</button>
+            <button class="btn danger ghost" id="voiceCancel" type="button">Cancel</button>
+          </div>
+          <!-- Which brain answers the next turn. Read from `/voiceos/status`; the label
+               is a fact about configuration, and the tooltip carries the reason whenever
+               the answer is the deterministic planner rather than a model. -->
+          <p class="fine" id="voiceModel" data-mode="deterministic">Checking which planner will answer…</p>
+          <p class="fine" id="voiceSupport"></p>
+          <div class="reply" id="voiceReply" hidden></div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <h2 class="card-title">Quick commands</h2>
+            <span class="chip">one click</span>
+          </div>
+          <p class="card-note">
+            Each button writes a real request and sends it through the same pipeline as
+            typing. Nothing here is simulated — if a command needs a device or an
+            approval, you will be taken to the screen that asks.
+          </p>
+          <div class="quick-grid" id="quickGrid"></div>
+        </article>
+      </div>
+
+      <article class="card">
+        <h2 class="card-title">Command guide</h2>
+        <p class="card-note">
+          Example phrasings. Whether each one works is not a promise written here — the
+          running backend is asked what its own planner does with it, and the verdict
+          shown is that answer. A phrasing it cannot route says why.
+        </p>
+        <div class="command-help" id="commandHelp"></div>
+      </article>
+    </section>
+
+    <!-- TASK CENTER ------------------------------------------------------ -->
+    <section class="view" data-view="tasks" hidden>
+      <article class="card">
+        <h2 class="card-title">New task</h2>
+        <form class="ask" id="taskAsk">
+          <input id="taskAskText" placeholder="What should happen?" autocomplete="off" spellcheck="false">
+          <button class="btn primary" id="taskAskSend" type="button">Propose</button>
+          <button class="btn mic" id="taskAskMic" type="button" title="Hold to talk">◉</button>
+        </form>
+        <p class="card-note" id="taskNotes"></p>
+      </article>
+
+      <div class="split">
+        <aside class="card list-card">
+          <div class="card-head">
+            <h2 class="card-title">Tasks</h2>
+            <span class="chip" id="taskCount">0</span>
+          </div>
+          <ul class="rows selectable" id="taskList"><li class="empty">No tasks yet.</li></ul>
+        </aside>
+
+        <article class="card detail-card" id="taskDetail">
+          <div class="empty-state">
+            <p>Choose a task to see its steps.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- AUTOMATIONS (C39) ------------------------------------------------ -->
+    <section class="view" data-view="automations" hidden>
+      <div class="page-header">
+        <div>
+          <h2 class="page-title">Workflow library</h2>
+          <p class="page-sub">A saved plan grants nothing. Every step is authorised again when it runs.</p>
+        </div>
+        <div class="btn-row">
+          <button class="btn ghost small" id="automationRefresh" type="button">Refresh</button>
+        </div>
+      </div>
+      <div class="split">
+        <aside class="card list-card">
+          <div class="card-head">
+            <h2 class="card-title">Automations</h2>
+            <span class="chip" id="automationCount">0</span>
+          </div>
+          <p class="card-note" id="automationNotes">
+            A saved plan grants nothing. Every step is authorised again when it runs.
+          </p>
+          <ul class="rows selectable" id="automationList"><li class="empty">Loading…</li></ul>
+        </aside>
+
+        <article class="card detail-card" id="automationDetail">
+          <h2 class="card-title">Describe it in a sentence</h2>
+          <p class="card-note">
+            This reads the sentence into a <em>draft</em> you can check. It stores nothing and
+            runs nothing. Steps only ever come from a phrase an operator wrote; if none
+            matches, the draft says so rather than inventing one.
+          </p>
+          <form class="ask" id="automationDraftForm">
+            <input id="automationText" autocomplete="off" spellcheck="false"
+                   placeholder="e.g. every day at 9am check the build">
+            <button class="btn primary" id="automationDraftGo" type="button">Draft</button>
+          </form>
+          <div id="automationDraft" hidden></div>
+          <div id="automationSelected"></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- HISTORY (C39) ----------------------------------------------------- -->
+    <section class="view" data-view="history" hidden>
+      <article class="card">
+        <div class="card-head">
+          <h2 class="card-title">Automation runs</h2>
+          <span class="chip" id="historyCount">0</span>
+          <button class="btn ghost small" id="historyRefresh" type="button">Refresh</button>
+        </div>
+        <p class="card-note">
+          What actually happened, including occurrences the ticker recorded as
+          <strong>missed</strong> rather than running late. A claimed run that never
+          finished is shown as it was left, never as a success.
+        </p>
+        <ul class="rows" id="historyList"><li class="empty">Loading…</li></ul>
+      </article>
+    </section>
+
+    <!-- LIVE CONTROL ----------------------------------------------------- -->
+    <section class="view" data-view="live" hidden>
+      <div class="split">
+        <aside class="card list-card">
+          <div class="card-head">
+            <h2 class="card-title">Executions</h2>
+            <span class="chip" id="liveCount">0</span>
+            <button class="btn ghost small" id="liveReconnect" type="button">Reconnect</button>
+          </div>
+          <ul class="rows selectable" id="liveList"><li class="empty">None yet.</li></ul>
+        </aside>
+
+        <article class="card detail-card" id="liveDetail">
+          <div class="empty-state">
+            <p>Select an execution to see its nodes, verification and output.</p>
+            <p class="fine">Output below is live and transient: it is never written to the audit chain.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- VISUAL INTELLIGENCE (C38) --------------------------------------- -->
+    <section class="view" data-view="visual" hidden>
+      <div class="visual-grid">
+        <aside class="card visual-left">
+          <div class="card-head">
+            <h2 class="card-title">Screen session</h2>
+            <span class="chip" id="visualSharing" data-state="off">not sharing</span>
+          </div>
+          <p class="card-note">
+            Nothing here reads your screen until you press a button. A capture is one
+            frame, requested through the operating system's own screenshot portal, and
+            it is not kept.
+          </p>
+          <div class="btn-row column">
+            <button class="btn primary" id="visualCapture" type="button">Capture Screen</button>
+            <button class="btn" id="visualInspect" type="button">Inspect Active Window</button>
+            <button class="btn" id="visualAsk" type="button">Ask About Screen</button>
+            <button class="btn danger" id="visualStop" type="button" disabled>Stop Sharing</button>
+          </div>
+
+          <label class="field" id="visualWindowWrap">Window to inspect (leave empty for every top-level window)
+            <input id="visualWindow" autocomplete="off" spellcheck="false"
+                   placeholder="e.g. gtk_target.py">
+          </label>
+
+          <label class="field" id="visualAskWrap" hidden>Question about the screen
+            <input id="visualQuestion" autocomplete="off" spellcheck="false"
+                   placeholder="e.g. What does this error mean?">
+          </label>
+
+          <h3 class="card-title spaced">Observation</h3>
+          <div id="visualObservation" class="visual-observation">
+            <p class="fine">No observation yet. Capture the screen or inspect a window to begin.</p>
+          </div>
+        </aside>
+
+        <article class="card visual-center">
+          <div class="card-head">
+            <h2 class="card-title">Live preview</h2>
+            <span class="chip" id="visualSessionChip">—</span>
+          </div>
+          <div id="visualPreview" class="visual-preview">
+            <div class="empty-state">
+              <p>No screen frame is being held.</p>
+              <p class="fine">
+                This panel shows a capture only if the OS granted one, and only until you
+                stop sharing or capture again.
+              </p>
+            </div>
+          </div>
+          <div id="visualWindowInfo" class="visual-window"></div>
+        </article>
+
+        <aside class="card visual-right">
+          <div class="card-head">
+            <h2 class="card-title">Analysis</h2>
+            <span class="chip" id="visualAnalysisChip">unavailable</span>
+          </div>
+          <div id="visualAnalysis" class="visual-analysis">
+            <p class="fine">
+              AI analysis of the screen is unavailable: no multimodal model credential is
+              configured, so no visual interpretation is produced. Capture and
+              accessibility inspection below are real.
+            </p>
+          </div>
+
+          <h3 class="card-title spaced">
+            Elements <span class="chip" id="visualElementCount">0</span>
+          </h3>
+          <ul class="rows visual-elements" id="visualElements">
+            <li class="empty">Inspect a window to list its elements.</li>
+          </ul>
+
+          <h3 class="card-title spaced">
+            Interaction preview <span class="chip" id="visualActionChip" data-state="idle">none</span>
+          </h3>
+          <div id="visualActionPreview" class="visual-action">
+            <p class="fine">
+              Select an element above to stage an action. Nothing is sent to the machine
+              until you press Approve Action, and the action still passes policy at that
+              moment.
+            </p>
+          </div>
+          <div id="visualActionFields" class="visual-action-fields" hidden>
+            <label class="field">Action
+              <select id="visualActionKind">
+                <option value="click">Activate (click)</option>
+                <option value="type">Type into</option>
+                <option value="scroll">Scroll</option>
+              </select>
+            </label>
+            <label class="field" id="visualTextWrap" hidden>Text to insert
+              <input id="visualActionText" autocomplete="off" spellcheck="false"
+                     placeholder="The text is sent with the action and not stored">
+            </label>
+            <label class="field" id="visualDirectionWrap" hidden>Scroll until the region reaches
+              <select id="visualActionDirection">
+                <option value="top">top</option>
+                <option value="bottom">bottom</option>
+                <option value="left">left</option>
+                <option value="right">right</option>
+              </select>
+            </label>
+          </div>
+          <div class="btn-row">
+            <button class="btn primary small" id="visualApprove" type="button" disabled>
+              Approve Action
+            </button>
+            <button class="btn small" id="visualCancel" type="button" disabled>Cancel</button>
+            <button class="btn ghost small" id="visualRefresh" type="button">
+              Refresh Observation
+            </button>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- APPROVALS -------------------------------------------------------- -->
+    <section class="view" data-view="approvals" hidden>
+      <article class="card">
+        <div class="card-head">
+          <h2 class="card-title">Waiting for your decision</h2>
+          <span class="chip warn" id="approvalCount">0 waiting</span>
+        </div>
+        <p class="card-note">
+          Nothing in this list has run. Approving names the exact action the server asked
+          about; the parameters shown are the request, not its result.
+        </p>
+        <div id="approvalList"><p class="empty">Nothing is waiting.</p></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h2 class="card-title">Standing permissions</h2>
+          <span class="chip" id="consentCount">0</span>
+        </div>
+        <p class="card-note">
+          These are permissions you have granted, so VoiceOS can plan work without asking
+          each time. A grant never substitutes for an approval: an action the policy marks
+          risky still waits here. Removing a grant takes effect immediately.
+        </p>
+        <ul class="rows" id="consentList"><li class="empty">Loading…</li></ul>
+        <div class="btn-row">
+          <label class="field">Scope
+            <input id="consentScope" placeholder="device.process.read" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">Up to risk
+            <select id="consentRisk">
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high" selected>high</option>
+            </select>
+          </label>
+          <button class="btn ghost small" id="consentGrant" type="button">Grant</button>
+        </div>
+      </article>
+    </section>
+
+    <!-- DEVICES ---------------------------------------------------------- -->
+    <section class="view" data-view="devices" hidden>
+      <article class="card">
+        <div class="card-head">
+          <h2 class="card-title">Computers</h2>
+          <button class="btn ghost small" id="devicesRefresh" type="button">Refresh</button>
+        </div>
+        <p class="card-note">Presence is asserted by the agent on the laptop, never by a caller.</p>
+        <ul class="rows" id="deviceList"><li class="empty">Loading…</li></ul>
+      </article>
+
+      <div class="grid two">
+        <article class="card">
+          <h2 class="card-title">Pair a phone</h2>
+          <p class="card-note">
+            A code is minted on this machine only. Choosing the ceiling here is the visible
+            act; the phone cannot raise it.
+          </p>
+          <label class="field">Laptop device id
+            <input id="pairDeviceId" value="laptop-1" autocomplete="off">
+          </label>
+          <label class="field">Grant this pairing up to
+            <select id="pairRisk">
+              <option value="low" selected>low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="critical">critical — run programs</option>
+            </select>
+          </label>
+          <div class="btn-row">
+            <button class="btn primary" id="pairMint" type="button">Pair New Device</button>
+            <button class="btn danger ghost" id="pairRevoke" type="button">Revoke all codes</button>
+          </div>
+          <div class="code-out" id="pairOut" hidden></div>
+        </article>
+
+        <article class="card">
+          <h2 class="card-title">Capabilities available here</h2>
+          <p class="card-note">What this build can actually carry out, given the configuration.</p>
+          <ul class="rows compact" id="capabilityList"><li class="empty">Loading…</li></ul>
+        </article>
+      </div>
+    </section>
+
+    <!-- SETTINGS --------------------------------------------------------- -->
+    <section class="view" data-view="settings" hidden>
+      <div class="grid two">
+        <article class="card">
+          <h2 class="card-title">AI provider</h2>
+          <p class="card-note">
+            A provider only ever <em>proposes</em>; policy, consent and approval decide what
+            happens. The key is stored in the operating system's keyring by the main
+            process and is never sent back to this page.
+          </p>
+          <dl class="kv" id="settingsProviderKv"></dl>
+          <div class="btn-row">
+            <button class="btn primary" id="settingsProviderConfigure" type="button">Configure Provider</button>
+            <button class="btn ghost" id="settingsProviderTest" type="button">Test Connection</button>
+          </div>
+          <p class="fine" id="settingsProviderNote"></p>
+        </article>
+
+        <article class="card">
+          <h2 class="card-title">Backend</h2>
+          <p class="card-note">
+            The window starts the real control plane on a loopback port it chooses. The
+            key it uses exists only in this process's memory.
+          </p>
+          <dl class="kv" id="backendKv"></dl>
+          <div class="btn-row">
+            <button class="btn primary" id="backendRestart" type="button">Restart backend</button>
+            <button class="btn ghost" id="backendStop" type="button">Stop</button>
+            <button class="btn ghost" id="backendOpenData" type="button">Open data folder</button>
+          </div>
+          <details class="logs">
+            <summary>Backend log (tail)</summary>
+            <pre id="backendLog"></pre>
+          </details>
+        </article>
+      </div>
+
+      <div class="grid two">
+        <article class="card">
+          <h2 class="card-title">App</h2>
+          <form id="settingsForm" class="settings-form">
+            <label class="field">Global shortcut
+              <input id="setShortcut" autocomplete="off" spellcheck="false">
+            </label>
+            <p class="fine" id="shortcutStatus"></p>
+            <label class="check"><input type="checkbox" id="setShortcutEnabled"> Enable global shortcut</label>
+            <label class="check"><input type="checkbox" id="setNotifications"> Native notifications</label>
+            <label class="check"><input type="checkbox" id="setAgent"> Run the laptop agent in this app</label>
+            <label class="field">Device name
+              <input id="setDeviceName" autocomplete="off">
+            </label>
+            <label class="field">Workspace root (absolute; empty = app data)
+              <input id="setWorkspace" autocomplete="off" spellcheck="false">
+            </label>
+            <label class="check"><input type="checkbox" id="setAllowShell"> Allow shell execution</label>
+            <label class="check"><input type="checkbox" id="setAllowDesktop"> Allow screen capture and accessibility (this desktop)</label>
+            <label class="field">Allowed programs (comma separated)
+              <input id="setAllowedCommands" autocomplete="off" spellcheck="false">
+            </label>
+            <div class="btn-row">
+              <button class="btn primary" id="settingsSave" type="button">Save settings</button>
+              <button class="btn ghost" id="settingsReset" type="button">Reset</button>
+              <button class="btn ghost" id="settingsAbout" type="button">About VoiceOS</button>
+            </div>
+            <p class="fine" id="settingsSaved"></p>
+          </form>
+        </article>
+
+        <!-- Legacy fields kept because app.js drives them; hidden behind the modal
+             which is the only surface a person is meant to use. -->
+        <article class="card" id="legacyProviderCard" hidden>
+          <label class="field">Provider
+            <input id="setProviderName" placeholder="e.g. anthropic" autocomplete="off">
+          </label>
+          <label class="field">Endpoint
+            <input id="setProviderEndpoint" placeholder="https://…" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">Model
+            <input id="setProviderModel" placeholder="model id" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">API key
+            <input id="setProviderKey" type="password" placeholder="paste to replace" autocomplete="off">
+          </label>
+          <p class="fine" id="keyStatus"></p>
+          <div class="btn-row">
+            <button class="btn primary" id="providerSave" type="button">Save provider</button>
+            <button class="btn danger ghost" id="providerClear" type="button">Clear key</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2 class="card-title">The original pages</h2>
+          <p class="card-note">
+            The browser dashboard and VoiceOS are still part of this app; they open in their
+            own hardened window, signed in by the main process rather than by page script.
+          </p>
+          <div class="btn-row column">
+            <button class="btn ghost" id="openDashboard" type="button">Open dashboard</button>
+            <button class="btn ghost" id="openVoice" type="button">Open VoiceOS</button>
+            <button class="btn ghost" id="clearWeb" type="button">Clear page data</button>
+          </div>
+          <h2 class="card-title spaced">About</h2>
+          <dl class="kv" id="aboutKv"></dl>
+        </article>
+      </div>
+    </section>
+
+    </div><!-- /main-scroll -->
+
+    <!-- PERSISTENT COMMAND BAR ------------------------------------------- -->
+    <div class="command-bar" id="commandBar">
+      <button class="command-mic" id="commandMic" type="button" title="Speak" aria-label="Speak">🎙</button>
+      <input id="commandInput" autocomplete="off" spellcheck="false"
+             placeholder="What would you like VoiceOS to do?" aria-label="Command">
+      <span class="command-status" id="commandStatus" data-state="idle">Idle</span>
+      <button class="btn primary" id="commandSend" type="button">Send</button>
+      <button class="btn subtle" id="commandClear" type="button">Clear</button>
+    </div>
+  </main>
+</div>
+
+<!-- PROVIDER CONFIGURATION MODAL ---------------------------------------- -->
+<div class="modal-backdrop" id="providerModal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="providerModalTitle">
+    <div class="modal-head">
+      <h2 id="providerModalTitle">AI provider configuration</h2>
+      <button class="icon-btn" id="providerModalClose" type="button" aria-label="Close">✕</button>
+    </div>
+
+    <label class="form-row">
+      <span class="form-label">Provider</span>
+      <select class="form-input" id="cfgProvider"></select>
+      <span class="form-hint" id="cfgProviderHint"></span>
+    </label>
+
+    <label class="form-row">
+      <span class="form-label">Model</span>
+      <input class="form-input" id="cfgModel" placeholder="model id" autocomplete="off" spellcheck="false" list="cfgModelOptions">
+      <datalist id="cfgModelOptions"></datalist>
+    </label>
+
+    <label class="form-row" id="cfgBaseUrlRow" hidden>
+      <span class="form-label">Base URL (https)</span>
+      <input class="form-input" id="cfgBaseUrl" placeholder="https://your-endpoint/v1" autocomplete="off" spellcheck="false">
+    </label>
+
+    <label class="form-row">
+      <span class="form-label">API key</span>
+      <input class="form-input" id="cfgApiKey" type="password" autocomplete="off"
+             placeholder="paste to replace; never shown again">
+      <span class="form-hint" id="cfgKeyHint">Stored by the OS keyring. It is never returned to this page.</span>
+    </label>
+
+    <label class="form-row">
+      <span class="form-label">Timeout (seconds)</span>
+      <input class="form-input" id="cfgTimeout" type="number" min="1" max="60" value="12">
+    </label>
+
+    <div class="cfg-status" id="cfgStatus" data-state="idle">Not checked yet.</div>
+
+    <div class="btn-row modal-actions">
+      <button class="btn primary" id="cfgTest" type="button">Test Connection</button>
+      <button class="btn" id="cfgSave" type="button">Save configuration</button>
+      <button class="btn ghost" id="cfgDefault" type="button">Set as default</button>
+      <button class="btn danger ghost" id="cfgRemove" type="button">Remove credentials</button>
+    </div>
+  </div>
+</div>
+
+<script src="voice.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

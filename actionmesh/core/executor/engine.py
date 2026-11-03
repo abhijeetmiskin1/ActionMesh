@@ -31,6 +31,12 @@ from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 
+from actionmesh.core.devices import (
+    EXECUTION_KINDS,
+    DeviceInfo,
+    DeviceRegistry,
+    DeviceUnavailable,
+)
 from actionmesh.core.events import EventHub
 from actionmesh.core.executor.idempotency import IdempotencyLedger
 from actionmesh.core.executor.lifecycle import ActionState, is_terminal
@@ -42,6 +48,7 @@ from actionmesh.core.graph import (
     topological_layers,
     validate_graph_structure,
 )
+from actionmesh.core.identity import IdentityError
 from actionmesh.core.observability import Metrics
 from actionmesh.core.output import OutputPublisher
 from actionmesh.core.output import install as install_output
@@ -53,6 +60,7 @@ from actionmesh.core.permissions.context import (
     context_from_payload,
 )
 from actionmesh.core.permissions.engine import PolicyEngine
+from actionmesh.core.permissions.risk import risk_rank
 from actionmesh.core.registry.registry import ActionRegistry
 from actionmesh.core.scope import install_execution, release_execution
 from actionmesh.core.storage import SQLiteStore
@@ -75,8 +83,10 @@ from actionmesh.protocol.models import (
     MeshEvent,
     NodeType,
     Policy,
+    RiskLevel,
     VerificationResult,
     _utcnow,
+    new_id,
 )
 from actionmesh.protocol.validate import validate_action
 from actionmesh.providers.base import ActionProvider, ProviderError, ProviderResult
@@ -136,6 +146,11 @@ class ExecutionResult:
     #: True when a side effect may still be standing because an undo was refused
     #: (irreversible action) or the undo itself failed. A human must be told.
     compensation_required: bool = False
+    #: C36 — the computer this run was routed to, resolved before dispatch. Empty is
+    #: the local machine, which is what every run before C36 meant. Carried in the
+    #: result, not only in the record, so a caller learns *where* it ran from the same
+    #: object that tells it *whether* it ran.
+    device_id: str = ""
 
     @property
     def succeeded(self) -> bool:
@@ -150,6 +165,7 @@ class ExecutionResult:
         return {
             "execution_id": self.execution_id,
             "state": self.state.value,
+            "device_id": self.device_id,
             "simulated": self.simulated,
             "error": self.error,
             "compensations": [c.to_dict() for c in self.compensations],
@@ -205,15 +221,63 @@ class ExecutionResult:
 #: time, and "wait for the user" must not become a way to grow the process forever.
 MAX_PENDING_EXECUTIONS = 100
 
-#: How long a run's ownership lease stays credible. It is renewed on every write,
-#: so a live owner never has to think about it; a dead one simply stops renewing,
-#: and the next process can reconcile the execution instead of waiting forever for
-#: an owner that is gone. It is deliberately short: the honest answer for a run
+#: How long a run's ownership lease stays credible. A live run renews it every
+#: ``CANCEL_POLL_SECONDS``; a dead one simply stops renewing, and the next process
+#: can reconcile the execution instead of waiting forever for an owner that is gone.
+#:
+#: The window has to be comfortably longer than the time between renewals *and*
+#: long enough that a brief stall on a loaded laptop is not mistaken for a death.
+#: It is deliberately not longer than a few of these: the honest answer for a run
 #: nobody is watching is `interrupted`, not `probably fine`.
 EXECUTION_LEASE_SECONDS = 30.0
 
 #: How often a run checks whether someone else asked it to stop.
 CANCEL_POLL_SECONDS = 0.25
+
+#: How often a server re-examines runs whose owner's lease has lapsed.
+#:
+#: `reconcile_interrupted` runs once at startup, which leaves a hole: a process killed
+#: *hard* (SIGKILL, OOM, a pulled plug) leaves a lease that has not expired yet, so the
+#: process that starts one second later correctly declines to touch it -- and then
+#: nothing ever looks again. The run sits at `executing` forever, and a client asking
+#: "did my command finish?" is told "still going" by a system with no owner for it.
+#: This sweep closes that: the moment a lease lapses, the run is reconciled by the
+#: same rules as startup. It re-dispatches nothing.
+LEASE_SWEEP_SECONDS = 5.0
+
+
+def _unobserved_outcome(node: GraphNode, action: Action) -> NodeOutcome:
+    """A node whose action ended with nobody watching it end.
+
+    The evidence proved the process is gone and proved nothing about what it did. That
+    is neither success nor failure: ``interrupted`` is the state that says so, and the
+    node is given no verdict *and* no exit code, because both would be inventions.
+    """
+    return NodeOutcome(
+        node_id=node.node_id,
+        node_type="action",
+        state=ActionState.INTERRUPTED,
+        action_type=action.type,
+        action_id=action.action_id,
+        verified=None,
+        attempts=0,
+        error=(
+            "the process ended without reporting an exit code, so whether the "
+            "action took effect is unknown"
+        ),
+        failure_kind=FailureKind.UNKNOWN,
+    )
+
+
+def _device_reason(target_device_id: str, exc: BaseException) -> str:
+    """One sentence for "why this run did not go to that computer".
+
+    The device id is quoted from the graph, never from the registry, so a refusal
+    cannot confirm which ids exist. The underlying reason is preserved because an
+    owner asking "why didn't my Linux build run?" needs the real one.
+    """
+    detail = str(exc).strip() or type(exc).__name__
+    return f"target device {target_device_id!r} refused the execution: {detail}"
 
 
 class ExecutionEngine:
@@ -233,6 +297,7 @@ class ExecutionEngine:
         metrics: Metrics | None = None,
         max_pending: int = MAX_PENDING_EXECUTIONS,
         owner_id: str = "",
+        devices: DeviceRegistry | None = None,
     ) -> None:
         self.registry = registry
         self.engine = engine
@@ -249,6 +314,11 @@ class ExecutionEngine:
         #: into every record, so "who owns this?" is answerable after this process
         #: is gone -- and so a second process knows it must reconcile, not re-run.
         self.owner_id = owner_id or f"proc-{uuid.uuid4().hex[:8]}"
+        #: C36 — the computers this engine may route to. ``None`` keeps a bare engine
+        #: (a unit test, an embedded use) exactly as it was, but a graph that *names* a
+        #: target device is refused rather than quietly run here: a routing request that
+        #: cannot be honoured is not permission to use the local machine instead.
+        self.devices = devices
         self._cancelled: set[str] = set()
         #: The provider call currently in flight for an execution, so a cancellation can
         #: reach it. Without this a cancel is only noticed at a step boundary, which for a
@@ -266,11 +336,23 @@ class ExecutionEngine:
         #: happening, and somebody has to notice when it stops or when a cancellation
         #: arrives for it.
         self._reowned: dict[str, asyncio.Task[None]] = {}
+        #: The last reason the periodic sweep failed, if it ever has. Kept as a plain
+        #: attribute (not a metric label) so a support log can say *why*.
+        self.last_sweep_error: str | None = None
         # Set by `execute` for the duration of one run.
         self._actor: Identity | None = None
         self._grants: list[PermissionGrant] = []
         self._policy: Policy | None = None
         self._allow_high_risk = False
+        #: C36 — the device this run was resolved to, and the one the local provider
+        #: serves. Both belong to the run, so a concurrent `execute` (the orchestrator
+        #: and a direct request share one engine) cannot retarget a node mid-flight.
+        self._target: DeviceInfo | None = None
+        #: C36 — which registered computer the in-process providers actually are. Set
+        #: by whoever installs the real agent; empty means "this process cannot prove
+        #: it is any particular registered device", which is a reason to refuse a named
+        #: target, never a licence to assume the target is this machine.
+        self.local_device_id = ""
 
     # -- approvals --------------------------------------------------------
     def submit_approval(self, request: ApprovalRequest) -> ApprovalRequest:
@@ -444,6 +526,12 @@ class ExecutionEngine:
         not a mystery, cheap enough that a run never becomes a polling problem. When
         the flag appears this process calls its own `cancel`, which is the C31 path
         -- the in-flight provider call is interrupted and its cleanup awaited.
+
+        The same tick renews this process's lease while the run is genuinely in
+        flight. Without that, a command longer than the lease makes a live run look
+        abandoned: another server would be entitled to reconcile it, and a restarted
+        one would refuse to adopt it because the lease looked stale. The lease means
+        "I am still watching this", and the watcher is the only thing that knows.
         """
         while True:
             await asyncio.sleep(CANCEL_POLL_SECONDS)
@@ -451,6 +539,26 @@ class ExecutionEngine:
                 self.cancel(execution_id)
                 self.metrics.increment("executions.cancelled_by_other_process")
                 return
+            self._renew_lease(execution_id)
+
+    def _renew_lease(self, execution_id: str) -> None:
+        """Push this process's claim on a live run forward, if it still owns it.
+
+        Cheap and idempotent: the in-memory record is authoritative for a run this
+        process started, and the write only happens when the lease is at least
+        half gone. Re-writing every tick would turn a watchdog into a disk load.
+        """
+        record = self._records.get(execution_id)
+        if record is None or self.store is None:
+            return
+        now = _utcnow()
+        lease = record.lease_expires_at
+        if lease is not None and lease - now > timedelta(
+            seconds=EXECUTION_LEASE_SECONDS / 2
+        ):
+            return
+        self._records[execution_id] = self._stamp(record)
+        self.store.save_record(self._records[execution_id])
 
     def _cancel_requested_elsewhere(self, execution_id: str) -> bool:
         """Has any process recorded a cancellation for this execution?
@@ -530,65 +638,151 @@ class ExecutionEngine:
             ):
                 summary["owned_elsewhere"] += 1
                 continue
-            if record.state is ActionState.WAITING_PERMISSION:
-                stored = self.store.load_body(record.execution_id)
-                if stored is not None:
-                    graph = self._restored_graph(json.loads(stored[0]))
-                    context = context_from_payload(json.loads(stored[1]))
-                    self._pending[record.execution_id] = (graph, context)
-                    self._records[record.execution_id] = self._stamp(record)
-                    self.store.save_record(self._records[record.execution_id])
-                    summary["preserved"] += 1
-                    continue
-            evidence = self._evidence_for(record.execution_id)
-            if evidence is not None and evidence.get("state") == "running":
-                # The action is not lost: it is happening, on the machine, right now,
-                # under this execution id. The previous process was watching it; this one
-                # takes over the watching -- the lease, the observers, and the duty to
-                # stop it if somebody asks. Nothing is re-dispatched to find out.
+            await self._reconcile_one(record, summary)
+        return summary
+
+    async def sweep_lapsed_leases(self) -> dict[str, int]:
+        """Reconcile runs whose owner's lease has run out, in a process that is up.
+
+        Startup reconciliation answers "what did the process before me leave behind?".
+        It cannot answer "what did the process *that was running alongside me* leave
+        behind when it died?", because the answer changes while this process lives: a
+        lease that was still valid at startup lapses a few seconds later.
+
+        This is the same decision as ``reconcile_interrupted``, reached at the moment
+        the evidence changes -- not a second set of rules.
+
+        A lease that has not lapsed yet is somebody else's claim, and two processes must
+        never observe one execution -- so the sweep waits. It does not wait blindly:
+        the run in flight renews its lease every quarter second, so a lease that stops
+        moving is a lease whose owner has gone, and it lapses on its own. Runs owned by
+        this process are never touched here.
+
+        Everything else is adopted, settled from the machine's own evidence, preserved
+        for a human, or honestly marked ``interrupted``. **Nothing is ever
+        re-dispatched.**
+        """
+        summary = {
+            "examined": 0,
+            "interrupted": 0,
+            "preserved": 0,
+            "owned_elsewhere": 0,
+            "adopted": 0,
+            "settled": 0,
+        }
+        if self.store is None:
+            return summary
+        now = _utcnow()
+        for record in self.store.list_non_terminal():
+            summary["examined"] += 1
+            if record.owner_id == self.owner_id:
+                # Ours, and this process is up and watching it. Note that ownership is
+                # the check, not presence in memory: every run this process owns has a
+                # fresh lease, and an owner that had lost track of its own run would
+                # still be the only process entitled to observe it.
+                continue
+            if record.lease_expires_at is not None and record.lease_expires_at > now:
+                # Somebody else is still saying they are watching it. A live owner
+                # renews before this lapses; a dead one lets it go, and then the state
+                # says what it always was. Neither is resolved here.
+                summary["owned_elsewhere"] += 1
+                continue
+            await self._reconcile_one(record, summary)
+        return summary
+
+    async def _reconcile_one(
+        self, record: ExecutionRecord, summary: dict[str, int]
+    ) -> None:
+        """The startup decision, applied to one record. Shared, not copied."""
+        if self.store is None:
+            return
+        if record.execution_id in self._reowned and not self._reowned[
+            record.execution_id
+        ].done():
+            return
+        if record.state is ActionState.WAITING_PERMISSION:
+            if self._pending.get(record.execution_id) is not None:
+                # Already restored by startup, and still genuinely parked: its
+                # approval has not been answered yet, so there is nothing to decide.
+                return
+            stored = self.store.load_body(record.execution_id) if self.store else None
+            if stored is not None:
+                graph = self._restored_graph(json.loads(stored[0]))
+                context = context_from_payload(json.loads(stored[1]))
+                self._pending[record.execution_id] = (graph, context)
                 self._records[record.execution_id] = self._stamp(record)
                 self.store.save_record(self._records[record.execution_id])
-                self._watch_reowned(record.execution_id)
-                summary["adopted"] += 1
-                self.metrics.increment("executions.adopted")
-                self.events.publish(
-                    MeshEvent(
-                        event_type="execution.reconciled",
-                        execution_id=record.execution_id,
-                        actor=record.actor_id or "system",
-                        payload={
-                            "state": record.state.value,
-                            "observed": "running",
-                            "owner_id": self.owner_id,
-                            "detail": str(evidence.get("detail", "")),
-                        },
-                    )
-                )
-                continue
-            if evidence is not None:
-                settled = await self._settle_from_evidence(record, evidence)
-                if settled is not None:
-                    summary["settled"] += 1
-                    continue
-            record.state = ActionState.INTERRUPTED
-            record.error = (
-                "the process that owned this execution is gone; the action had been "
-                "dispatched, so its effect is unknown and it was deliberately not "
-                "re-run"
-            )
-            self._records[record.execution_id] = self._stamp(record, terminal=True)
-            self.store.save_record(record)
-            summary["interrupted"] += 1
-            self.metrics.increment("executions.interrupted")
+                summary["preserved"] += 1
+                return
+        evidence = self._evidence_for(record.execution_id)
+        if evidence is not None and evidence.get("state") == "running":
+            self._records[record.execution_id] = self._stamp(record)
+            self.store.save_record(self._records[record.execution_id])
+            self._watch_reowned(record.execution_id)
+            summary["adopted"] += 1
+            self.metrics.increment("executions.adopted")
             self.events.publish(
                 MeshEvent(
-                    event_type="execution.interrupted",
+                    event_type="execution.reconciled",
                     execution_id=record.execution_id,
                     actor=record.actor_id or "system",
-                    payload={"state": record.state.value, "owner_id": record.owner_id},
+                    payload={
+                        "state": record.state.value,
+                        "observed": "running",
+                        "owner_id": self.owner_id,
+                        "detail": str(evidence.get("detail", "")),
+                    },
                 )
             )
-        return summary
+            return
+        if evidence is not None:
+            settled = await self._settle_from_evidence(record, evidence)
+            if settled is not None:
+                summary["settled"] += 1
+                return
+        await self._mark_interrupted(record)
+        summary["interrupted"] += 1
+
+    async def _mark_interrupted(self, record: ExecutionRecord) -> None:
+        """Say the only thing that is true: it was dispatched, and nobody watched it end."""
+        record.state = ActionState.INTERRUPTED
+        record.error = (
+            "the process that owned this execution is gone; the action had been "
+            "dispatched, so its effect is unknown and it was deliberately not "
+            "re-run"
+        )
+        record.finished_at = _utcnow()
+        self._records[record.execution_id] = self._stamp(record, terminal=True)
+        if self.store is not None:
+            self.store.save_record(self._records[record.execution_id])
+            self.store.drop_body(record.execution_id)
+        self.metrics.increment("executions.interrupted")
+        self.events.publish(
+            MeshEvent(
+                event_type="execution.interrupted",
+                execution_id=record.execution_id,
+                actor=record.actor_id or "system",
+                payload={"state": record.state.value, "owner_id": record.owner_id},
+            )
+        )
+
+    async def run_lease_sweeper(self, stop: asyncio.Event) -> None:
+        """Keep reconciling while this process is up. Started by the lifespan."""
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=LEASE_SWEEP_SECONDS)
+                return
+            except TimeoutError:
+                pass
+            try:
+                await self.sweep_lapsed_leases()
+            except Exception as exc:  # pragma: no cover - a sweep must not kill the server
+                # A store that is briefly locked or a provider that raises must not
+                # take the control plane down; the next sweep tries again. The failure
+                # is counted rather than swallowed silently, so a persistent fault is
+                # visible in metrics instead of only as runs that never settle.
+                self.metrics.increment("executions.sweep_failed")
+                self.last_sweep_error = f"{type(exc).__name__}: {exc}"
 
     def _evidence_for(self, execution_id: str) -> dict[str, Any] | None:
         """Ask whoever might be holding the real work what became of it.
@@ -634,7 +828,18 @@ class ExecutionEngine:
                 return
             evidence = self._evidence_for(execution_id)
             if evidence is None or evidence.get("state") != "running":
-                await self._settle_from_evidence(record, evidence or {"actions": []})
+                settled = await self._settle_from_evidence(
+                    record, evidence or {"actions": []}
+                )
+                if settled is None:
+                    # The evidence says the work is over, but does not cover the nodes
+                    # this run ordered -- the stored graph is gone, or it names an
+                    # action the ledger has never heard of. Reporting "still running"
+                    # here would be a lie that never expires; this process has taken
+                    # responsibility for the run, so it must also end it honestly.
+                    # ``interrupted`` is the state for exactly this: dispatched, effect
+                    # unknown, deliberately not re-run.
+                    await self._mark_interrupted(record)
                 return
             if ticks % 20 == 0:
                 # Keep the lease live while the watching is real, so a third process
@@ -714,6 +919,13 @@ class ExecutionEngine:
             if found is None or item.get("state") == "running":
                 continue
             node, action = found
+            if item.get("exit_code") is None:
+                # The action ended, but nothing watched it end. An agent that was
+                # killed mid-run can see that a pid is gone and cannot know why, so
+                # there is no code here to verify against -- and a node with no
+                # verdict is not a success and not a failure.
+                outcomes[node.node_id] = _unobserved_outcome(node, action)
+                continue
             outcomes[node.node_id] = await self._verify_from_evidence(action, item)
         if not outcomes:
             return None
@@ -729,7 +941,13 @@ class ExecutionEngine:
                 + "; those nodes were not re-run to find out"
             )
         ran = [o for o in outcomes.values() if o.state is ActionState.SUCCESS]
-        if unaccounted:
+        unknown = [
+            nid for nid, o in outcomes.items() if o.state is ActionState.INTERRUPTED
+        ]
+        if unaccounted or unknown:
+            # One node whose effect is unknown makes the whole run's outcome
+            # unknown. Saying ``failed`` here would claim the action did not
+            # happen, which is the one thing this evidence cannot establish.
             record.state = ActionState.INTERRUPTED
         elif len(ran) == len(outcomes):
             record.state = ActionState.SUCCESS
@@ -868,12 +1086,163 @@ class ExecutionEngine:
 
     # -- provider selection ----------------------------------------------
     def provider_for(self, action: Action) -> ActionProvider:
+        """The provider that may perform ``action`` for the run in progress.
+
+        Refuses, before any adapter is consulted, an action that belongs to another
+        computer. The local adapter is an adapter for *this machine*: handing it a graph
+        addressed elsewhere would perform the side effect on the wrong computer, which
+        is the one failure C36 says must never happen. "Do not route an execution to
+        another device just because the requested device is offline" has a second half
+        -- do not route it *here* either.
+        """
+        target = self._target
+        if target is not None and not self._serves_locally(target):
+            raise ProviderError(
+                f"action {action.type!r} is addressed to device {target.device_id!r}, "
+                "which is not this machine; it cannot be run by the local agent",
+                FailureKind.PERMANENT,
+            )
         for provider in self.providers:
             if provider.supports(action):
                 return provider
         raise ProviderError(
             f"no provider supports {action.type!r} (provider={action.provider!r})",
             FailureKind.PERMANENT,
+        )
+
+    # -- device routing (C36) ---------------------------------------------
+    def resolve_device(self, target_device_id: str) -> DeviceInfo | None:
+        """Resolve a graph's target device, or raise with a reason a user can read.
+
+        This is the registry resolution leg of the pipeline. It runs before the record
+        is written and before any node is dispatched, because an execution that names a
+        computer has to fail as a whole when that computer cannot take it -- not
+        per-node, and not by falling back to the machine we happen to be on.
+
+        Raises ``KeyError`` (with ``DeviceUnavailable`` for the offline case),
+        ``IdentityError`` for an unattributed device, and ``PermissionError`` for a
+        device that is present but may not run this. Empty means "the local machine",
+        which is what every run before C36 meant.
+        """
+        wanted = (target_device_id or "").strip()
+        if not wanted:
+            return None
+        if self.devices is None:
+            raise KeyError(
+                f"this execution is addressed to device {wanted!r}, but no device "
+                "registry is attached; a named target is never run locally instead"
+            )
+        device = self.devices.require(wanted)
+        # A phone is a control surface. Targeting one as an execution device is a
+        # category error, not a permission to grant -- the registry records the role,
+        # routing respects it.
+        if device.kind not in EXECUTION_KINDS:
+            raise PermissionError(
+                f"device {wanted!r} is a {device.kind.value} and cannot execute actions"
+            )
+        return device
+
+    def _serves_locally(self, device: DeviceInfo) -> bool:
+        """Is this the machine the in-process providers actually run on?
+
+        Only a declared device id counts -- the engine's own, or the one a real agent
+        adapter carries. A device record that merely *looks* like this host (same
+        platform, same kind, even the same name) is not proof, and guessing on
+        resemblance is how a command lands on the wrong computer. When nothing declared
+        itself, a named target is refused instead.
+        """
+        local = self.local_device_id or next(
+            (
+                str(getattr(provider, "device_id", "") or "")
+                for provider in self.providers
+                if getattr(provider, "device_id", "")
+            ),
+            "",
+        )
+        return bool(local) and device.device_id == local
+
+    def _device_admits_risk(self, device: DeviceInfo, risk: RiskLevel) -> None:
+        """Refuse a node whose risk is above the target's ceiling.
+
+        The device ceiling is the *target-side* limit and the credential ceiling is
+        the *actor-side* one; both are checked, and neither substitutes for the other.
+        """
+        if risk_rank(risk) > risk_rank(device.risk_ceiling):
+            raise PermissionError(
+                f"device {device.device_id!r} has risk ceiling "
+                f"{device.risk_ceiling.value}; this action is {risk.value}-risk"
+            )
+
+    def _refuse_device(
+        self,
+        execution_id: str,
+        graph: ActionGraph,
+        context: PolicyContext,
+        exc: BaseException,
+    ) -> ExecutionResult:
+        """Fail an execution whose named computer cannot take it.
+
+        Deliberately one answer for every reason -- unknown, offline, unattributed,
+        not allowed -- because the caller does not get to probe which computers exist
+        by reading different refusals. The *reason* still reaches the event stream and
+        the operator's own records, which is where an owner finds out why their run
+        did not happen.
+        """
+        wanted = graph.target_device_id
+        reason = _device_reason(wanted, exc)
+        actor = context.actor.id if context.actor else "system"
+        self.metrics.increment("executions.device_refused")
+        self.events.publish(
+            MeshEvent(
+                event_type="execution.device_refused",
+                execution_id=execution_id,
+                actor=actor,
+                payload={
+                    "target_device_id": wanted,
+                    "reason": reason,
+                    # Categorised so a dashboard can say "offline" without parsing a
+                    # sentence, and so a test can assert the condition, not the prose.
+                    "cause": (
+                        "offline"
+                        if isinstance(exc, DeviceUnavailable)
+                        else "unattributed"
+                        if isinstance(exc, IdentityError)
+                        else "not_permitted"
+                        if isinstance(exc, PermissionError)
+                        else "unknown"
+                    ),
+                },
+            )
+        )
+        self.events.publish(
+            MeshEvent(
+                event_type="execution.denied",
+                execution_id=execution_id,
+                actor=actor,
+                payload={"error": reason, "target_device_id": wanted},
+            )
+        )
+        # Named after the refusal the same way the denial path is, so a caller can
+        # look up why the run it asked for did not happen.
+        self._records[execution_id] = self._stamp(
+            ExecutionRecord(
+                execution_id=execution_id,
+                graph_id=graph.graph_id,
+                actor_id=context.actor.id if context.actor else "",
+                state=ActionState.DENIED,
+                error=reason,
+                device_id=wanted,
+                finished_at=_utcnow(),
+            ),
+            terminal=True,
+        )
+        if self.store is not None:
+            self.store.save_record(self._records[execution_id])
+        return ExecutionResult(
+            execution_id=execution_id,
+            state=ActionState.DENIED,
+            error=reason,
+            device_id=wanted,
         )
 
     async def _run_node(
@@ -914,6 +1283,39 @@ class ExecutionEngine:
         resolved = self.registry.resolve(node.action)
         outcome.action_type = resolved.definition.name
         outcome.action_id = resolved.action.action_id
+
+        # --- device admission at dispatch time ---------------------------
+        # The target was resolved for the whole execution, but the *risk* is per
+        # node: a graph may mix a read with a restart. A device whose owner set a
+        # LOW ceiling refuses the restart and still allows the read, and it refuses
+        # it here rather than after an approval prompt that cannot help.
+        if self._target is not None:
+            try:
+                self._device_admits_risk(self._target, resolved.effective_risk)
+            except PermissionError as exc:
+                outcome.state = ActionState.DENIED
+                outcome.error = str(exc)
+                outcome.failure_kind = FailureKind.AUTHORIZATION
+                self.events.publish(
+                    MeshEvent(
+                        event_type="authorization.decided",
+                        execution_id=execution_id,
+                        action_id=resolved.action.action_id,
+                        actor=self._actor.id if self._actor else "system",
+                        payload={
+                            "node_id": node.node_id,
+                            "action_type": resolved.action.type,
+                            "decision": "deny",
+                            "authorizes_execution": False,
+                            "requires_approval": False,
+                            "effective_risk": resolved.effective_risk.value,
+                            "device_id": self._target.device_id,
+                            "device_risk_ceiling": self._target.risk_ceiling.value,
+                            "reasons": [str(exc)],
+                        },
+                    )
+                )
+                return outcome
 
         # --- authorization re-check at dispatch time ---------------------
 
@@ -1036,6 +1438,10 @@ class ExecutionEngine:
             action_id=resolved.action.action_id,
             node_id=node.node_id,
             actor=self._actor.id if self._actor else "system",
+            # The machine this node was routed to, so a subscriber reading two
+            # computers' streams side by side can tell them apart without consulting
+            # the execution record. Empty means the local machine, as everywhere else.
+            device_id=getattr(self._target, "device_id", "") or "",
         )
         output_token = install_output(publisher)
         # ... and this node's execution id, for the same reason and by the same route.
@@ -1299,18 +1705,69 @@ class ExecutionEngine:
             )
 
     # -- graph execution --------------------------------------------------
+    async def prepare_execution(
+        self, graph: ActionGraph, context: PolicyContext
+    ) -> tuple[ActionGraph, PolicyContext]:
+        """Authorize, name, persist and announce a graph -- then stop.
+
+        ``execute`` used to do this and the dispatch in one unbroken await, so a
+        caller could not learn the execution id until the work it named was already
+        over. That is fine for a caller that only wants the answer, and fatal for a
+        caller that has to write the id down: a task session pointing at a run has to
+        record the run *before* it starts, because the crash that strands the session
+        is by definition the one that leaves nobody alive to record it afterwards.
+
+        Splitting it here does not weaken anything. Authorization still runs in full,
+        against the caller's own context, before anything is named; the record and its
+        body are still persisted before the first provider call; and ``run_execution``
+        authorizes again at dispatch, exactly as it did when the two halves were one
+        function.
+
+        The graph's ``graph_id`` is assigned here when the caller left it blank, so
+        naming a run and running it always refer to the same execution. A graph that
+        already carries an id keeps it -- a replay is the same execution, not a new one.
+        """
+        validate_graph_structure(graph)
+        try:
+            authorize_graph(graph, self.engine, self.registry, context)
+        except Exception as exc:
+            # A denial is a real outcome with a real id, and it is why this returns a
+            # graph rather than raising: a caller that names runs needs the name of
+            # the run that was refused just as much as the name of one that was
+            # allowed. ``execute`` turns it into a DENIED result.
+            if not graph.graph_id:
+                graph.graph_id = f"exec_denied_{abs(hash(str(exc))) & 0xFFFFFF:06x}"
+            return graph, context
+
+        if not graph.graph_id:
+            graph.graph_id = new_id("graph")
+        return graph, context
+
     async def execute(
         self, graph: ActionGraph, context: PolicyContext
     ) -> ExecutionResult:
         """Execute a graph, but only if the policy engine authorizes it."""
-        validate_graph_structure(graph)
+        graph, context = await self.prepare_execution(graph, context)
+        return await self.run_execution(graph, context)
+
+    async def run_execution(
+        self, graph: ActionGraph, context: PolicyContext
+    ) -> ExecutionResult:
+        """Dispatch a graph that ``prepare_execution`` has already named.
+
+        Authorization runs again here, from the same ``graph`` and ``context`` that
+        were authorized a moment ago. That is not redundant: the policy engine is the
+        only thing standing between a persisted name and a side effect, and a name is
+        not an authority. A graph that was refused is refused again -- and returns the
+        same denied result ``execute`` always returned, so callers cannot tell which
+        half refused them.
+        """
+        execution_id = graph.graph_id
         try:
-            authorization = authorize_graph(graph, self.engine, self.registry, context)
+            authorize_graph(graph, self.engine, self.registry, context)
         except Exception as exc:
-            execution_id = f"exec_denied_{abs(hash(str(exc))) & 0xFFFFFF:06x}"
-            # A denial is exactly the outcome an audit trail must never miss, so
-            # it is published like any other terminal event. Without this, the
-            # most security-relevant execution outcome left no trace at all.
+            # Same id the denial was named with in prepare_execution, so a caller
+            # holding that name can look up why the run it asked for did not happen.
             self.events.publish(
                 MeshEvent(
                     event_type="execution.denied",
@@ -1325,13 +1782,28 @@ class ExecutionEngine:
                 error=str(exc),
             )
 
-        execution_id = authorization.graph_id
         self._actor = context.actor
         self._grants = list(context.grants)
         self._policy = context.policy
         self._allow_high_risk = context.allow_high_risk
 
-        result = ExecutionResult(execution_id=execution_id, state=ActionState.EXECUTING)
+        # --- device resolution, before anything is named or dispatched ------
+        # C36: the graph names a computer, not a place to try. Resolution happens
+        # here rather than per node so an offline, unknown or unattributed target
+        # refuses the whole execution with one honest reason, and so a partially
+        # dispatched graph cannot exist for a machine that was never reachable.
+        target: DeviceInfo | None
+        try:
+            target = self.resolve_device(graph.target_device_id)
+        except (KeyError, PermissionError, IdentityError) as exc:
+            return self._refuse_device(execution_id, graph, context, exc)
+        self._target = target
+
+        result = ExecutionResult(
+            execution_id=execution_id,
+            state=ActionState.EXECUTING,
+            device_id=target.device_id if target is not None else "",
+        )
         self.metrics.increment("executions.started")
         self._records[execution_id] = self._stamp(
             ExecutionRecord(
@@ -1339,6 +1811,8 @@ class ExecutionEngine:
                 graph_id=graph.graph_id,
                 actor_id=context.actor.id if context.actor else "",
                 state=ActionState.EXECUTING,
+                device_id=target.device_id if target is not None else "",
+                device_name=target.name if target is not None else "",
             )
         )
         if self.store is not None:

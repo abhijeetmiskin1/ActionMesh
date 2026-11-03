@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import os
+import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,12 +26,16 @@ from actionmesh.agent.verification import register_device_strategies
 from actionmesh.core.audit import AuditLog, FileAuditAnchor, SqliteAuditBackend
 from actionmesh.core.config import AppConfig
 from actionmesh.core.credentials import Credential, CredentialError, CredentialStore
-from actionmesh.core.devices import DeviceRegistry
+from actionmesh.core.devices import DeviceRegistry, SQLiteDeviceRegistry
 from actionmesh.core.executor import ExecutionEngine
 from actionmesh.core.graph.errors import GraphError
 from actionmesh.core.graph.serialization import graph_from_dict
-from actionmesh.core.identity import IdentityError, IdentityStore
-from actionmesh.core.output import OUTPUT_EVENT_TYPE
+from actionmesh.core.identity import IdentityError, IdentityStore, SQLiteIdentityStore
+from actionmesh.core.output import (
+    MAX_DOCUMENT_BYTES,
+    OUTPUT_EVENT_TYPE,
+    WHOLE_DOCUMENT_STREAMS,
+)
 from actionmesh.core.pairing import PairingError, PairingService, format_code
 from actionmesh.core.permissions import Consent, ConsentStore, PolicyContext, PolicyEngine
 from actionmesh.core.planner import Planner, RuleBasedPlanner
@@ -70,9 +75,43 @@ from actionmesh.voiceos import (
     VoiceOsStore,
     load_templates,
 )
-from actionmesh.voiceos.llm import build_provider, llm_config_from_env
+from actionmesh.voiceos.automation_run import Runner, schedule_next
+from actionmesh.voiceos.automation_scheduler import Scheduler, summarize_run
+from actionmesh.voiceos.automation_store import AutomationStore
+from actionmesh.voiceos.diagnosis import unobserved
+from actionmesh.voiceos.workflow_draft import draft as workflow_draft
+from actionmesh.voiceos.workflow_draft import draft_to_body
+from actionmesh.voiceos.workflows import (
+    Workflow,
+    WorkflowError,
+    describe_workflow,
+    new_workflow_id,
+    validate_schedule,
+    validate_workflow,
+)
+from actionmesh.voiceos.diagnosis_flow import (
+    analysis_step,
+    analyze,
+    describe,
+    last_log_step,
+    log_excerpt,
+)
+from actionmesh.voiceos import model_bridge
+from actionmesh.voiceos.llm import (
+    BridgeError,
+    BridgeUnavailable,
+    build_analyst,
+    build_catalogue,
+    build_planner,
+    build_provider,
+    bridge_config_from_env,
+    llm_config_from_env,
+)
 from actionmesh.voiceos.models import Conversation
 from actionmesh.voiceos.reasoning import describe_session
+from actionmesh.voiceos.targeting import TargetChoice, default_target
+from actionmesh.voiceos.targeting import current as targeting_current
+from actionmesh.voiceos.targeting import resolve as resolve_target
 
 #: Loopback addresses, and nothing else. A deployment behind a relay sets
 #: ``ACTIONMESH_ALLOW_REMOTE_PAIRING`` deliberately rather than adding an address
@@ -206,11 +245,34 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.startup_reconciliation = await reconcile()
     stop = asyncio.Event()
     task = asyncio.create_task(agent.run(stop)) if agent is not None else None
+    # Startup reconciliation is a snapshot. A process killed hard leaves a lease that
+    # has not expired yet, so the replacement declines to touch its runs *now* -- and
+    # without a sweep nothing ever looks again, stranding them at ``executing`` for good.
+    sweeper = getattr(app.state.engine, "run_lease_sweeper", None)
+    sweep_task = asyncio.create_task(sweeper(stop)) if sweeper is not None else None
+    # C39: the automation ticker, and the startup reconciliation that must precede it.
+    # Both are no-ops until an automation exists, so the cost of wiring them
+    # unconditionally is one dictionary lookup per event and one wake-up every 30s.
+    scheduler_getter = getattr(app.state, "automation_scheduler", None)
+    scheduler = scheduler_getter() if callable(scheduler_getter) else None
+    if scheduler is not None:
+        # Before the ticker runs: an occurrence a previous process claimed and never
+        # started is recorded `missed`, and a stale `next_run_at` is re-armed. Doing
+        # this *after* starting the loop would let the first tick claim what the
+        # reconciliation was about to account for.
+        app.state.startup_automation_missed = scheduler.reconcile()
+        scheduler.start()
     try:
         yield
     finally:
+        stop.set()
+        # Stop the ticker before anything it could be writing to is closed. Its own
+        # lock guarantees it is not mid-`execute` when this returns.
+        if scheduler is not None:
+            await scheduler.stop()
+        if sweep_task is not None:
+            await asyncio.gather(sweep_task, return_exceptions=True)
         if task is not None:
-            stop.set()
             await task
         provider = next(
             (
@@ -231,9 +293,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         voiceos_store = getattr(app.state, "voiceos_store_instance", None)
         if voiceos_store is not None:
             voiceos_store.close()
+        automation_store = getattr(app.state, "automation_store_instance", None)
+        if automation_store is not None:
+            automation_store.close()
         execution_store = getattr(app.state, "execution_store", None)
         if execution_store is not None:
             execution_store.close()
+        # C36: durable device plane, closed only if this app opened it. An injected
+        # store is the caller's, and closing it here would be this process reaching
+        # into something it does not own.
+        if getattr(app.state, "devices_owned", False):
+            close_devices = getattr(app.state.devices, "close", None)
+            if close_devices is not None:
+                close_devices()
+        if getattr(app.state, "identities_owned", False):
+            close_identities = getattr(app.state.identities, "close", None)
+            if close_identities is not None:
+                close_identities()
+        # C37: the consent ledger is a SQLite connection when a durable location is
+        # configured. Releasing it here is what lets a replacement process open the
+        # same file immediately, instead of waiting for the dying process to be reaped.
+        if getattr(app.state, "consents_owned", False):
+            close_consents = getattr(app.state.consent_store, "close", None)
+            if close_consents is not None:
+                close_consents()
 
 
 def _device_view(registry: DeviceRegistry, device: DeviceInfo) -> dict[str, Any]:
@@ -252,9 +335,20 @@ def _device_view(registry: DeviceRegistry, device: DeviceInfo) -> dict[str, Any]
         "platform": device.platform,
         "os_version": device.os_version,
         "agent_version": device.agent_version,
+        "app_version": device.app_version,
+        "arch": device.arch,
         "capabilities": list(device.capabilities),
         "online": registry.is_online(device),
+        # C36: the heartbeat the dashboard reads as "last activity", and the
+        # connection time kept apart from it so "it came back" is visible.
         "last_seen": device.last_seen.isoformat() if device.last_seen else None,
+        "last_connected_at": (
+            device.last_connected_at.isoformat() if device.last_connected_at else None
+        ),
+        "registered_at": (
+            device.registered_at.isoformat() if device.registered_at else None
+        ),
+        "risk_ceiling": device.risk_ceiling.value,
         "enrolled": bool(device.identity_id),
     }
 
@@ -264,6 +358,12 @@ def _device_view(registry: DeviceRegistry, device: DeviceInfo) -> dict[str, Any]
 #: that forgets to bound itself -- a noisy actor must not be able to grow a phone's
 #: buffer or the socket it reads from.
 MAX_EVENT_BYTES = 16384
+
+#: Bounds for ``POST /voiceos/guide``. The route answers a question *about* the
+#: command list the page already shows, so it takes that list rather than keeping a
+#: second copy of it here: one list, one source, nothing to drift.
+GUIDE_MAX_PHRASES = 40
+GUIDE_MAX_PHRASE_CHARS = 200
 
 
 def _sse_frame(event: MeshEvent) -> str:
@@ -280,14 +380,48 @@ def _sse_frame(event: MeshEvent) -> str:
 
 
 def _event_json(event: MeshEvent) -> str:
-    """Serialize one event, replacing any payload that outran the size cap.
+    """Serialize one event, refusing rather than truncating what does not fit.
 
-    The identity fields survive so a client can still correlate the event; only the
-    payload is dropped, and it is dropped loudly rather than truncated mid-object.
+    Most events are small and the cap below is a bound on a hostile or runaway
+    payload. Whole-document output streams are the exception, and they are the reason
+    this is not a plain ``if len > MAX: replace``: an element list is one JSON array,
+    and a *cut* array does not parse, so a reader would draw an empty list beside a
+    non-zero count -- the panel saying the tree held nothing when the wire simply
+    chopped it. Those streams are delivered entire or replaced whole, exactly as
+    :mod:`actionmesh.core.output` frames them, under the document budget that module
+    owns. The two layers have to agree; a framing rule enforced at one layer only is
+    enforced nowhere.
+
+    The replacement keeps the identity fields and the stream name, so a client can
+    still correlate the event and say *which* observation was refused instead of
+    guessing from a payload-less event.
     """
     text = event.model_dump_json()
-    if len(text.encode("utf-8")) <= MAX_EVENT_BYTES:
+    stream = event.payload.get("stream") if isinstance(event.payload, dict) else None
+    framing = (
+        MAX_DOCUMENT_BYTES if stream in WHOLE_DOCUMENT_STREAMS else MAX_EVENT_BYTES
+    )
+    if len(text.encode("utf-8")) <= framing:
         return text
+    replacement: dict[str, Any] = {
+        "truncated": True,
+        "reason": "event exceeded the size limit",
+    }
+    if event.event_type == OUTPUT_EVENT_TYPE:
+        # Keep the shape ``execution.output`` consumers already expect, so the one
+        # rendered by the client is the whole-document refusal path and not a stray
+        # line in the program-output console.
+        replacement = {
+            "stream": stream,
+            "node_id": event.payload.get("node_id"),
+            "device_id": event.payload.get("device_id"),
+            "sequence": event.payload.get("sequence"),
+            "chunk": "",
+            "truncated": True,
+            "final": bool(stream in WHOLE_DOCUMENT_STREAMS),
+        }
+        if event.payload.get("reason"):
+            replacement["reason"] = event.payload["reason"]
     safe = MeshEvent(
         event_id=event.event_id,
         event_type=event.event_type,
@@ -295,9 +429,40 @@ def _event_json(event: MeshEvent) -> str:
         execution_id=event.execution_id,
         action_id=event.action_id,
         actor=event.actor,
-        payload={"truncated": True, "reason": "event exceeded the size limit"},
+        payload=replacement,
     )
     return safe.model_dump_json()
+
+
+def _build_consent_store() -> ConsentStore:
+    """The consent ledger this process is allowed to keep.
+
+    Consents are the user's standing decisions, and a decision that evaporates when
+    the app restarts is not a decision -- it is a question the product asks again
+    every launch with no way for the user to answer it. Where a durable VoiceOS store
+    is configured the ledger goes beside it; without one (tests, a bare development
+    process) it stays in memory, which is the honest default for a process that has
+    nowhere to write.
+    """
+    from pathlib import Path
+
+    from actionmesh.core.permissions import SQLiteConsentStore
+
+    voiceos_db = os.getenv("ACTIONMESH_VOICEOS_DB", "").strip()
+    if not voiceos_db:
+        audit_db = os.getenv("ACTIONMESH_AUDIT_DB", "").strip()
+        if audit_db:
+            voiceos_db = str(Path(audit_db).with_name("voiceos.db"))
+    if not voiceos_db:
+        return ConsentStore()
+    path = Path(voiceos_db).with_name("consents.db")
+    try:
+        return SQLiteConsentStore(path)
+    except (OSError, sqlite3.Error):
+        # An unwritable consent file must not turn into "every action is allowed"
+        # and must not stop the app from starting: fall back to the in-memory ledger,
+        # which fails closed exactly as before.
+        return ConsentStore()
 
 
 def create_app(
@@ -322,6 +487,7 @@ def create_app(
     # is missing durable storage, a key, or a durable signing secret does not start.
     app_config = AppConfig.from_env()
     owned_store: SQLiteStore | None = None
+    engine_was_injected = engine is not None
     if engine is None:
         registry = ActionRegistry.with_seeds()
         # Durable execution records only when the config names a file; development
@@ -382,7 +548,10 @@ def create_app(
     #: Created here when ACTIONMESH_AUDIT_DB is set, so a shutdown handler or a
     #: test can release it. Ownership stays with whoever created it.
     app.state.audit_backend = audit_backend
-    app.state.consent_store = consent_store if consent_store is not None else ConsentStore()
+    app.state.consent_store = consent_store if consent_store is not None else _build_consent_store()
+    #: Whether this app opened the consent ledger. An injected one belongs to the
+    #: caller, exactly like an injected engine, and is not closed here.
+    app.state.consents_owned = consent_store is None
     #: Intent -> untrusted candidate plan. The default planner is deterministic
     #: and offline, exactly like the default mock providers.
     app.state.planner = planner if planner is not None else RuleBasedPlanner()
@@ -405,37 +574,149 @@ def create_app(
             app.state.voiceos_store_instance = opened
         return opened
     app.state.voiceos_orchestrator = Orchestrator(engine=engine)
-    #: A configured-but-unreachable LLM provider is stated, never hidden.
-    app.state.voiceos_llm_note = build_provider(llm_config_from_env())[1]
-    app.state.voiceos_template_refusals = ()
+    #: C39 — automations. A sixth store family, beside the VoiceOS one and opened the
+    #: same lazy way: a process that never touches an automation should not be holding
+    #: a database handle. What it stores is *intent* (a name, a plan, a trigger) plus
+    #: the record of what each occurrence actually did. It carries no grants field, so
+    #: "an automation confers no permission" is a property of the shape, not a rule
+    #: someone has to remember.
+    automations_db = os.getenv("ACTIONMESH_AUTOMATIONS_DB", "").strip()
+    if not automations_db and app_config.audit_db:
+        automations_db = str(Path(str(app_config.audit_db)).with_name("automations.db"))
 
-    def _voiceos_reasoner() -> Reasoner:
-        # Templates are re-read per turn on purpose: an operator editing their own
-        # task file should see the next request use it, and a refused entry has to
-        # surface rather than sit in a stale cache.
-        source = load_templates(os.getenv("ACTIONMESH_VOICEOS_TASKS", "").strip() or None, engine.registry.has)
-        app.state.voiceos_template_refusals = source.refusals
-        return Reasoner(
-            planner=app.state.planner,
-            known_action=engine.registry.has,
-            templates=lambda: source.templates,
-            device_id=_voiceos_device_id(),
-        )
+    def _automation_store() -> AutomationStore:
+        opened = getattr(app.state, "automation_store_instance", None)
+        if opened is None:
+            try:
+                opened = AutomationStore(automations_db or ":memory:")
+            except sqlite3.Error as exc:
+                # An unwritable automation file must not stop the service. Refusing to
+                # start would take the whole product down over a feature nobody used
+                # yet; falling back to memory means automations do not survive a
+                # restart, which the store's own `mode` says out loud.
+                app.state.automation_store_note = (
+                    f"automations are not durable: {automations_db} could not be "
+                    f"opened ({exc}); this process keeps them in memory only"
+                )
+                opened = AutomationStore(":memory:")
+            else:
+                app.state.automation_store_note = (
+                    "" if automations_db else
+                    "automations are not durable: no database path is configured, "
+                    "so this process keeps them in memory only"
+                )
+            app.state.automation_store_instance = opened
+        return opened
 
-    app.state.voiceos_reasoner = _voiceos_reasoner
+    app.state.automation_store_note = ""
+
+    def _automation_runner() -> Runner:
+        runner = getattr(app.state, "automation_runner_instance", None)
+        if runner is None:
+            runner = Runner(
+                orchestrator=app.state.voiceos_orchestrator,
+                save_session=_voiceos_store().save_session,
+            )
+            app.state.automation_runner_instance = runner
+        return runner
+
+    def _automation_scheduler() -> Scheduler:
+        scheduler = getattr(app.state, "automation_scheduler_instance", None)
+        if scheduler is None:
+            scheduler = Scheduler(store=_automation_store(), runner=_automation_runner())
+            app.state.automation_scheduler_instance = scheduler
+        return scheduler
+
+    app.state.automation_scheduler = _automation_scheduler
+
+    def _automation_listener(event: object) -> None:
+        """Turn a published outcome into an automation trigger, if one is waiting.
+
+        Registered on the hub once, at startup. It runs inside whichever task called
+        ``publish`` -- the executor, usually -- so it must not block: the actual work
+        is a task of its own, and the event's own id is the run slot, so a redelivery
+        or a second listen cannot start the run twice.
+        """
+        from actionmesh.voiceos.automation_scheduler import TRIGGERABLE_EVENTS
+
+        event_type = str(getattr(event, "event_type", ""))
+        if event_type not in TRIGGERABLE_EVENTS:
+            return
+        payload = getattr(event, "payload", None)
+        state = str(payload.get("state", "")) if isinstance(payload, dict) else ""
+        actor = str(getattr(event, "actor", "") or "")
+        if not actor or actor == "system":
+            # An event nobody is attributed for cannot own a workflow. Without this the
+            # only workflows it could match are those of an actor literally named
+            # "system", which nobody registered.
+            return
+        loop = asyncio.get_running_loop()
+        event_id = str(getattr(event, "event_id", "") or "")
+        timestamp = getattr(event, "timestamp", None)
+        occurred_at = timestamp.isoformat() if hasattr(timestamp, "isoformat") else ""
+
+        async def _fire() -> None:
+            try:
+                await _automation_scheduler().on_event(
+                    event_type,
+                    event_id=event_id,
+                    actor=actor,
+                    state=state,
+                    occurred_at=occurred_at,
+                )
+            except Exception:  # noqa: BLE001 - a trigger must not break the publisher
+                pass
+
+        loop.create_task(_fire(), name=f"automation-event:{event_id}")
+
+    app.state.automation_listener = _automation_listener
+    hub = getattr(engine, "events", None)
+    add_listener = getattr(hub, "add_listener", None)
+    if callable(add_listener):
+        add_listener(_automation_listener)
     # C19 device plane. The identity store is the authority on *which machine* an
     # action ran on; the registry is presence. They are wired to the same store the
     # agent and pairing flows use, so an identity minted here is the one a credential
     # later binds to — not a second, disagreeing copy.
-    app.state.identities = identities if identities is not None else IdentityStore()
-    app.state.devices = (
-        devices
-        if devices is not None
-        else DeviceRegistry(
+    #
+    # C36: "identities survive restarts" is a property of the *deployment*, so the
+    # durable stores are opened here whenever the process has a durable root to put
+    # them beside, exactly as the VoiceOS store does. Development mode keeps the
+    # in-memory pair and pays nothing. A caller that injected either store keeps
+    # ownership of it — including the obligation to restore its own devices.
+    app.state.identities_owned = False
+    app.state.devices_owned = False
+    if identities is not None:
+        app.state.identities = identities
+    elif app_config.audit_db:
+        app.state.identities = SQLiteIdentityStore(
+            str(Path(str(app_config.audit_db)).with_name("identities.db"))
+        )
+        app.state.identities_owned = True
+    else:
+        app.state.identities = IdentityStore()
+        app.state.identities_owned = True
+    if devices is not None:
+        app.state.devices = devices
+    elif app_config.audit_db:
+        app.state.devices = SQLiteDeviceRegistry(
+            str(Path(str(app_config.audit_db)).with_name("devices.db")),
             identities=app.state.identities,
             known_capability=engine.registry.has,
         )
-    )
+        app.state.devices_owned = True
+    else:
+        app.state.devices = DeviceRegistry(
+            identities=app.state.identities,
+            known_capability=engine.registry.has,
+        )
+        app.state.devices_owned = True
+    # C36 — the engine routes through this registry, whether it was injected or built
+    # here. A graph addressed to a computer is only honour-able once the executor can
+    # resolve that computer, and attaching it after the fact would leave a window in
+    # which a named target was silently run locally.
+    if not engine_was_injected:
+        engine.devices = app.state.devices
     # C19 laptop agent: presence for this machine, enabled only when an operator
     # asks for it. A misconfigured boundary is a startup failure, not a quietly
     # reduced capability list — the difference between "this laptop has no
@@ -477,14 +758,116 @@ def create_app(
                     # C35: the same durable store the records live in, so a restarted server can
                     # ask this agent what its executions actually dispatched.
                     ledger=getattr(engine, "store", None),
+                    # C36: which registered computer this adapter *is*. Without this a
+                    # graph addressed to this machine cannot be told apart from one
+                    # addressed to a Windows box, and both would run here.
+                    device_id=agent.config.device_id,
                 ),
             )
             register_device_strategies(engine.verifier)
+        # The machine this process runs on, for the same reason: routing needs to know
+        # which resolved device the in-process providers serve.
+        if not engine_was_injected:
+            engine.local_device_id = agent.config.device_id
         agent.register()
         agent.heartbeat()
         app.state.agent = agent
     else:
         app.state.agent = None
+    # The rule-based planner proposes only what this deployment can actually carry
+    # out. A rule can name a phrasing whose action this build never registered, and
+    # nothing downstream would notice until dispatch -- long after the user pressed
+    # Run. The "what is my laptop running" rules are the ones that matters for: the
+    # device actions exist only while an agent advertises them, so on a service with
+    # no agent the sentence matches a capability nobody opened.
+    #
+    # The decline has to be *said*, though. A planner that silently drops the clause
+    # leaves an empty plan, and the user gets the generic "I could not map that" --
+    # which reads as a parsing failure when the real answer is "this machine has no
+    # agent, so it cannot see its own processes". So the filter reports what it
+    # dropped and why, and the reply layer can repeat it.
+    #
+    # It runs after the agent block on purpose: the registry is only final once
+    # ``register_device_actions`` has seen the advertised capabilities. Only the
+    # default planner is rebuilt; a caller that injected its own keeps whatever
+    # filter it chose, and the engine still checks its contract.
+    # Rebuilt rather than mutated so the filter is fixed at construction and nothing
+    # that captured the earlier instance is left holding an unfiltered one.
+    if planner is None:
+        app.state.planner = RuleBasedPlanner(known_action=engine.registry.has)
+
+    #: C37 — the reasoning provider, resolved once at startup.
+    #:
+    #: The provider *object* is kept, not just its reason for failing: before C37
+    #: only the note was retained, so even a correctly configured model was never
+    #: consulted. The second element is user-visible text and empty when the model
+    #: is live, so a note on someone's screen now means what it says.
+    #: C41 — the desktop bridge, when this service was started by the Electron shell.
+    #:
+    #: The shell holds the API key in the OS keyring and makes the outbound call; this
+    #: process gets a socket path and a per-launch token, and the token authorises
+    #: "talk to that socket" — never "act as that provider". A deployment started any
+    #: other way (the CLI, a test, a bare uvicorn) has neither variable set, so the
+    #: bridge config is `None` and the planner behaves exactly as it did before C41.
+    bridge_config = bridge_config_from_env()
+
+    voiceos_llm_config = llm_config_from_env()
+    voiceos_provider, app.state.voiceos_llm_note = build_provider(
+        voiceos_llm_config,
+        # Only a registered action's name and description cross the wire; see
+        # `build_catalogue`. The registry is static after startup, so describing it
+        # once is enough and keeps the per-request payload small.
+        catalog=build_catalogue(engine.registry.list()),
+        bridge=bridge_config,
+    )
+    # What `/voiceos/status` reports when it has no provider object to name.
+    app.state.voiceos_llm_config = voiceos_llm_config
+    app.state.voiceos_provider = voiceos_provider
+    # The socket the desktop planner calls. Kept on state so the status route can ask it
+    # what the shell actually has configured, rather than inferring from a construct.
+    app.state.voiceos_bridge = bridge_config
+    #: What the model may propose. A model-backed planner *wraps* the deterministic
+    #: one rather than replacing it: every failure path answers from the rules and
+    #: says so, so a request is never silently answered by a machine that stayed
+    #: quiet. A deployment with no provider gets the rules alone, unchanged.
+    voiceos_planner = build_planner(
+        voiceos_provider, app.state.planner, engine.registry.has
+    )
+    app.state.voiceos_planner = voiceos_planner
+    #: C36 — the analyst, the object that explains a log the system actually read.
+    #:
+    #: A separate provider from the planner on purpose: they share a transport and a
+    #: credential, but a plan is a *proposal* the pipeline validates and a diagnosis is
+    #: *prose about evidence*. Keeping them separable means a deployment can have one,
+    #: the other, or neither without either silently standing in for the other.
+    voiceos_analyst, app.state.voiceos_analyst_note = build_analyst(
+        llm_config_from_env(), bridge=bridge_config
+    )
+    app.state.voiceos_analyst = voiceos_analyst
+    app.state.voiceos_template_refusals = ()
+
+    def _voiceos_reasoner(device_id: str = "") -> Reasoner:
+        # Templates are re-read per turn on purpose: an operator editing their own
+        # task file should see the next request use it, and a refused entry has to
+        # surface rather than sit in a stale cache.
+        source = load_templates(os.getenv("ACTIONMESH_VOICEOS_TASKS", "").strip() or None, engine.registry.has)
+        app.state.voiceos_template_refusals = source.refusals
+        return Reasoner(
+            # C37: the model-backed planner when one is live, the rule-based planner
+            # otherwise. Either way the plan is a proposal; this argument changes who
+            # writes it, never what may be done with it.
+            planner=app.state.voiceos_planner,
+            known_action=engine.registry.has,
+            templates=lambda: source.templates,
+            # The selected computer is per-conversation, so it is passed in rather
+            # than captured: a reasoner built once at startup would keep aiming at
+            # whichever machine happened to be first.
+            device_id=device_id,
+            resolve=lambda name: resolve_target(app.state.devices, name, phrases=True),
+            local_device_id=_voiceos_local_device_id,
+        )
+
+    app.state.voiceos_reasoner = _voiceos_reasoner
     # C19b/c credentials and pairing. Key material decides whether a pairing
     # survives a restart, so the server keeps hold of it and reports the answer
     # instead of letting a phone discover it.
@@ -645,6 +1028,13 @@ def create_app(
                 "execution_ready": execution_ready,
                 "audit_ready": audit_ready,
                 "online_devices": online,
+                # Which machine this service serves, when one declared itself. The
+                # desktop shell addresses its screen requests by this id rather than
+                # guessing a hostname: an execution naming a device nobody enrolled is
+                # refused before policy runs, and a hardcoded id is wrong the moment an
+                # operator names their laptop something else. Empty on a control plane
+                # with no agent attached, which is an honest "I do not know".
+                "local_device_id": _voiceos_local_device_id(),
             },
         )
 
@@ -1164,6 +1554,35 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return record.model_dump()
 
+    @app.delete("/consents/{scope}")
+    def revoke_consent(request: Request, scope: str, actor_id: str | None = None) -> dict[str, Any]:
+        """Withdraw a standing consent.
+
+        Revoking is the *safe* direction, so it is deliberately not gated the way
+        granting is: there is no authority to gain by removing a permission. The
+        actor is still named -- a device withdraws only its own, and an operator
+        says whose -- so one client cannot strip another's ability to work.
+        """
+        caller = _record_scope(request)
+        if caller is None:
+            if not actor_id or not actor_id.strip():
+                raise HTTPException(status_code=400, detail="actor_id is required")
+            wanted = actor_id.strip()
+        else:
+            if actor_id and actor_id.strip() and actor_id.strip() != caller:
+                raise HTTPException(
+                    status_code=403, detail="a device may only revoke its own consent"
+                )
+            wanted = caller
+        store = app.state.consent_store
+        owned = [record for record in store.consents(scope) if record.granted_by == wanted]
+        if not owned:
+            raise HTTPException(status_code=404, detail="no such consent for that actor")
+        # The actor is named on the removal itself: a scope two actors happen to hold
+        # must not lose the other's grant when this one withdraws.
+        removed = store.revoke(scope, granted_by=wanted)
+        return {"scope": scope, "revoked": removed}
+
     @app.get("/consents")
     def consents(request: Request, actor_id: str | None = None) -> list[dict[str, Any]]:
         caller = _record_scope(request)
@@ -1250,15 +1669,45 @@ def create_app(
     # never carry more authority than the credential that pressed run, because it does
     # not carry any of its own.
 
-    def _voiceos_device_id() -> str:
-        registry: DeviceRegistry = app.state.devices
-        devices = registry.all_devices()
-        # Presence is the heartbeat's answer, not the device's own claim, so it
-        # is the only honest thing to name in a header.
-        for device in devices:
-            if registry.is_online(device):
-                return device.device_id
-        return devices[0].device_id if devices else ""
+    def _voiceos_local_device_id() -> str:
+        """The machine this control service actually serves.
+
+        Only a *declared* id counts — the engine's own, or the one a real agent
+        adapter carries. A device record that merely resembles this host is not
+        proof, so a service with no agent attached returns ``""`` and says so.
+        """
+        engine = app.state.engine
+        declared = str(getattr(engine, "local_device_id", "") or "")
+        if declared:
+            return declared
+        for provider in getattr(engine, "providers", ()):
+            device_id = str(getattr(provider, "device_id", "") or "")
+            if device_id:
+                return device_id
+        return ""
+
+    def _voiceos_default_target() -> TargetChoice:
+        return default_target(app.state.devices, _voiceos_local_device_id())
+
+    def _voiceos_selected_target(conversation: Conversation) -> TargetChoice:
+        """The conversation's selected computer, re-validated from the registry.
+
+        Re-validated, not remembered: a device revoked since it was selected must
+        not keep being named as the target of new work.
+        """
+        if not conversation.device_id:
+            return _voiceos_default_target()
+        choice = targeting_current(app.state.devices, conversation.device_id)
+        if choice.resolved:
+            return choice
+        # A stale selection is reported, not silently replaced by the default.
+        return TargetChoice(reason=choice.reason)
+
+    def _voiceos_remember_target(conversation: Conversation, target: str) -> None:
+        conversation.device_id = target
+        for step in (conversation.active_session.steps if conversation.active_session else ()):
+            if not step.device_id:
+                step.device_id = target
 
     def _voiceos_actor(request: Request, payload: dict[str, Any]) -> str:
         """Whose session this is — the same precedence the execution path uses.
@@ -1304,6 +1753,43 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found")
         return session
 
+    def _diagnosis_body(
+        result: Any, *, computer: str = "", step: Any = None
+    ) -> dict[str, Any]:
+        """The diagnosis response: the facts first, the prose second.
+
+        ``analysis`` is the machine-readable record (evidence, status, the model that
+        spoke and what was redacted); ``description`` is the one sentence a person
+        reads. A client that renders only the sentence still gets the evidence in it,
+        because :func:`describe` always leads with what was read.
+        """
+        out = result.to_dict()
+        out["description"] = describe(result, computer=computer)
+        out["computer"] = computer
+        # Which authorised read this came from — the useful half of "where did this
+        # come from?" — and never the log itself, which is not in this response or the
+        # store at all.
+        out["source"] = {
+            "step": step.index if step is not None else None,
+            "label": step.label if step is not None else "",
+            "execution_id": step.execution_id if step is not None else "",
+            "process_id": str((step.parameters or {}).get("process_id") or "")
+            if step is not None
+            else "",
+        }
+        # Why the answer is what it is when it was not a diagnosis: "no credential is
+        # configured" and "the model's answer was refused" are different problems, and
+        # a user fixing one must not be sent to look at the other.
+        if result.status == "diagnosed":
+            out["analyst"] = ""
+        else:
+            out["analyst"] = " ".join(
+                part
+                for part in (str(app.state.voiceos_analyst_note or ""), *result.notes)
+                if part
+            )
+        return out
+
     @app.post("/voiceos/messages")
     async def voiceos_message(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
         """One conversational turn. It understands and proposes; it never runs."""
@@ -1319,14 +1805,39 @@ def create_app(
             if conversation.active_session_id
             else None
         )
-        understanding = app.state.voiceos_reasoner().understand(text, conversation)
+        # C36: which computer this turn is about -- the conversation's own selection,
+        # or the default for a fresh one. The default is the machine this service
+        # serves or the single online computer; it is never a guess between several.
+        # A selection that no longer resolves keeps its own reason and is *not*
+        # replaced by the default: that substitution is the silent re-targeting the
+        # work order forbids, and the user can see the reason and pick again.
+        target = _voiceos_selected_target(conversation)
+        reasoner = app.state.voiceos_reasoner(target.device_id)
+        # C37: `understand` calls the planner, which may make one blocking HTTPS call
+        # to a model. On this event loop that would stall every other request in the
+        # process for up to the configured timeout, so the whole turn runs in a worker
+        # thread. `plan` refuses to dial on a loop thread and falls back with a note,
+        # which means this offload is the difference between a working model and a
+        # stated non-answer rather than a silent stall.
+        understanding = await asyncio.to_thread(reasoner.understand, text, conversation)
         reply = understanding.reply
         if understanding.kind == "clear":
             store.clear_conversation(actor)
-            conversation = Conversation(actor_id=actor, device_id=_voiceos_device_id())
+            # Clearing forgets the conversation, not the computer the user selected:
+            # a control surface that silently re-aimed itself would be a target change
+            # nobody asked for.
+            kept = conversation.device_id if target.resolved else ""
+            conversation = Conversation(actor_id=actor, device_id=kept)
         else:
             conversation.remember("user", text)
             conversation.remember("voiceos", reply)
+        if understanding.kind == "device" and understanding.target is not None:
+            # A switch is the one turn whose *own* result is the new selection, so the
+            # response reports it rather than what the turn was addressed to. The
+            # reasoner already resolved and validated this id; writing it here makes it
+            # the conversation's -- not a grant, just where future work is addressed.
+            _voiceos_remember_target(conversation, understanding.target.device_id)
+            target = understanding.target
         session_id = understanding.session.session_id if understanding.session else ""
         if understanding.session is not None:
             store.save_session(understanding.session)
@@ -1339,22 +1850,219 @@ def create_app(
         if app.state.voiceos_llm_note:
             notes.append(str(app.state.voiceos_llm_note))
         notes.extend(app.state.voiceos_template_refusals)
+        if understanding.kind == "task" and not target.resolved:
+            # Nothing is being aimed at a guessed machine. The plan exists, the run
+            # will refuse it, and the sentence says both.
+            notes.append(
+                target.reason or "no computer is selected; pick one before running this plan"
+            )
         return {
             "kind": understanding.kind,
             "reply": reply,
             "session_id": session_id,
             "notes": notes,
             "unresolved": list(understanding.unresolved),
+            "target_device": target.device_id,
+            "target_name": target.name,
+            "target_online": target.online,
             # Always false from this route. Running is a separate press on a session,
             # so a sentence — heard or typed — can never set a machine going.
             "ran": False,
+        }
+
+    @app.post("/voiceos/guide")
+    def voiceos_guide(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        """Which of the page's example phrasings this deployment would actually route.
+
+        The command guide used to carry a hand-written "supported" column, and it was
+        wrong: on a service with no laptop agent, half the listed phrases matched no
+        rule at all and the next turn came back "I could not map that". A label that
+        is typed in is a claim; this route makes it a *measurement*.
+
+        It runs each phrase through exactly the planner the conversation uses — the
+        same ``app.state.planner``, with the same registry filter — and reports what
+        happened to it. Nothing is proposed, nothing is authorized, nothing runs;
+        ``plan`` is a pure function of intent text and the live rule table.
+
+        The phrases come from the caller so there is one list in the product, not two
+        that drift. They are untrusted text like any other body: bounded in count and
+        length, and echoed back only as the same string that was sent.
+        """
+        _throttle("voiceos", _credential_key(request))
+        raw = payload.get("phrases")
+        if not isinstance(raw, list) or not raw:
+            raise HTTPException(status_code=400, detail="phrases must be a non-empty list")
+        if len(raw) > GUIDE_MAX_PHRASES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"phrases must contain at most {GUIDE_MAX_PHRASES} entries",
+            )
+        phrases: list[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item.strip():
+                raise HTTPException(status_code=400, detail="each phrase must be a non-empty string")
+            if len(item) > GUIDE_MAX_PHRASE_CHARS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"each phrase must be at most {GUIDE_MAX_PHRASE_CHARS} characters",
+                )
+            phrases.append(item)
+
+        results: list[dict[str, Any]] = []
+        for phrase in phrases:
+            plan = app.state.planner.plan(phrase)
+            results.append({
+                "phrase": phrase,
+                # What the rule table proposes, and what survived the registry filter.
+                # An empty list is the honest answer: no rule, or no capability.
+                "actions": [action.type for action in plan.actions],
+                "notes": list(plan.notes),
+            })
+        return {"phrases": results}
+
+    # The shell's `state` is the only field that separates *configured* from *usable*.
+    # A key the provider rejected still reads configured and implemented; without this
+    # set the route would claim a model that every turn then refuses to be. Unknown
+    # values are not errors: the shell has already folded unrecognised states into
+    # `provider_unavailable`, so anything here is something the shell deliberately said
+    # the call will still make.
+    _PROVIDER_STATE_REFUSES = frozenset({
+        "missing_key",
+        "invalid_credentials",
+        "rate_limited",
+        "timeout",
+        "provider_unavailable",
+        "malformed",
+    })
+
+    @app.get("/voiceos/status")
+    def voiceos_status(request: Request) -> dict[str, Any]:
+        """Whether the next turn is answered by a model or by the deterministic planner.
+
+        The distinction this route has to keep honest is *configured* versus *usable*.
+        Under the desktop app the planner is always a ``desktop`` provider, because the
+        Electron shell supplies a bridge whenever it can — but the user may have chosen
+        no provider at all, or one whose credential was never entered. Constructing a
+        provider object therefore proves nothing; the shell is asked, over the same
+        authenticated socket, what it actually has. A call that cannot be verified is
+        reported as the fallback, which is what the next turn will be.
+
+        Even a verified provider is a claim about *configuration*: the per-turn note in
+        ``/voiceos/messages`` is what proves a call went out and came back, and the UI
+        appends those notes verbatim.
+        """
+        # Authentication is the process-wide middleware's job (API key, or a device
+        # credential); this route adds nothing on top of it.
+        note = str(getattr(app.state, "voiceos_llm_note", "") or "")
+        provider = getattr(app.state, "voiceos_provider", None)
+        config = getattr(app.state, "voiceos_llm_config", None)
+        mode = "ai_model" if provider is not None else "deterministic"
+        provider_name = str(
+            getattr(provider, "name", "") or (config.provider if config else "")
+        )
+        model = str(getattr(provider, "model", "") or (config.model if config else ""))
+        reason = "" if provider is not None else note
+        # The shell's last verified connection state, when the shell is the provider.
+        # Empty elsewhere: no bridge, nothing to verify against.
+        provider_state = ""
+
+        # The desktop provider's usability lives in the shell, not in this process.
+        if provider is not None and provider_name == "desktop":
+            bridge = getattr(app.state, "voiceos_bridge", None)
+            verdict = {"usable": False, "detail": "the desktop model bridge did not answer"}
+            if bridge is not None and getattr(bridge, "configured", False):
+                try:
+                    reply = model_bridge.status(bridge)
+                except (BridgeError, BridgeUnavailable) as exc:
+                    # A bridge that cannot answer is a fallback, and the reason is the
+                    # one the client already wrote for a user to read.
+                    verdict = {"usable": False, "detail": str(exc)}
+                else:
+                    state = str(reply.get("state", ""))
+                    provider_state = state
+                    # `configured` and `implemented` say the wiring exists; `state` says
+                    # what the last contact with the provider produced. A key the
+                    # provider rejected is still configured and implemented — only the
+                    # state knows it will not answer.
+                    ready = (
+                        bool(reply.get("configured"))
+                        and bool(reply.get("implemented"))
+                        and state not in _PROVIDER_STATE_REFUSES
+                    )
+                    detail = "" if ready else (
+                        "the desktop app has no usable provider configured"
+                        if not reply.get("configured")
+                        else "the configured provider cannot generate in this build"
+                        if state in _PROVIDER_STATE_REFUSES
+                        else ""
+                    )
+                    if state in _PROVIDER_STATE_REFUSES and not ready:
+                        # The shell wrote this sentence for a user to read — it is the
+                        # same table the header bar uses — so prefer it over the generic
+                        # one above.
+                        detail = str(reply.get("detail", "")) or detail
+                    if ready and state not in ("ok", "connected"):
+                        # A call will still go out — the mode is honest — but the
+                        # connection has not been verified, and the chip's tooltip is
+                        # where that caveat belongs.
+                        detail = (
+                            "the provider is configured but has not been verified; "
+                            "press Test Connection in Settings"
+                        )
+                    verdict = {
+                        "usable": ready,
+                        "detail": detail,
+                        "provider": str(reply.get("provider", "")),
+                        "model": str(reply.get("model", "")),
+                        "state": state,
+                    }
+            if verdict.get("usable"):
+                provider_name = verdict.get("provider") or provider_name
+                model = verdict.get("model") or model
+            else:
+                mode = "deterministic"
+            # The detail is worth showing whether the mode changed or not: a refusing
+            # state explains the fallback, an unverified-but-active one carries the
+            # "press Test Connection" caveat into the chip's tooltip.
+            reason = verdict.get("detail") or reason
+
+        return {
+            "mode": mode,
+            "mode_label": "AI model active" if mode == "ai_model" else "Deterministic fallback",
+            "provider": provider_name,
+            "model": model,
+            # Only meaningful in deterministic mode: names what was asked for and why it
+            # could not be used. Empty when nothing was configured at all.
+            "reason": reason,
+            # The shell's last verified connection state for the chosen provider, when
+            # the shell is the provider. Safe metadata, not a credential.
+            "state": provider_state,
         }
 
     @app.get("/voiceos/conversation")
     def voiceos_conversation(request: Request) -> dict[str, Any]:
         actor = _voiceos_actor(request, {})
         # The operator view names its actor in the query; a credential does not need to.
-        return _voiceos_store().get_conversation(actor).to_dict()
+        conversation = _voiceos_store().get_conversation(actor)
+        out = conversation.to_dict()
+        # Return-only: the chip on the voice page reads this, and it is the same
+        # resolution the next turn will use. It is not persisted here -- selection
+        # is written by the turn that changes it.
+        target = _voiceos_selected_target(conversation)
+        out["target_device"] = target.device_id
+        out["target_name"] = target.name
+        out["target_online"] = target.online
+        out["target_candidates"] = [
+            {"device_id": device_id, "name": name} for device_id, name in target.candidates
+        ]
+        out["target_reason"] = target.reason
+        # The default, separately: "you have selected nothing" and "this service
+        # serves X" are different facts, and collapsing them would make a selected
+        # device look like a default or the reverse.
+        fallback = _voiceos_default_target()
+        out["default_target"] = fallback.device_id
+        out["default_target_name"] = fallback.name
+        return out
 
     @app.get("/voiceos/sessions")
     def voiceos_sessions(request: Request, limit: int = 20) -> list[dict[str, Any]]:
@@ -1400,9 +2108,14 @@ def create_app(
             credential=credential,
             credentials=app.state.credentials,
         )
-        outcome = await app.state.voiceos_orchestrator.advance(session, context)
-        updated: TaskSession = outcome["session"]
         store: VoiceOsStore = _voiceos_store()
+        # Write the name of each execution to the step *before* awaiting it. If this
+        # request dies mid-step, the session on disk still points at the run, and the
+        # next reader can ask the durable record what became of it instead of guessing.
+        outcome = await app.state.voiceos_orchestrator.advance(
+            session, context, checkpoint=store.save_session
+        )
+        updated: TaskSession = outcome["session"]
         store.save_session(updated)
         conversation = store.get_conversation(updated.actor_id)
         conversation.active_session_id = updated.session_id
@@ -1412,6 +2125,99 @@ def create_app(
         conversation.remember("voiceos", updated.summary or describe_session(updated))
         store.save_conversation(conversation)
         return updated.to_dict()
+
+    @app.post("/voiceos/sessions/{session_id}/diagnose")
+    async def voiceos_session_diagnose(
+        request: Request, session_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Explain a log this session already read, through an ordinary read's output.
+
+        Three things this route deliberately does **not** do:
+
+        * It does not read the log. The log body only ever exists on the transient,
+          process-local output channel of an authorised ``device.process.logs``
+          execution, which this route draws from by that execution's id. There is no
+          second path to a file here, and none is invented.
+        * It does not spend an ActionMesh approval. Explaining evidence is not an
+          action; there is nothing for the policy engine to authorise and nothing for
+          a human to approve. What it *does* spend is a model call, so it is explicit
+          and on its own route — the user pressing it is the consent to send the
+          bounded excerpt.
+        * It does not let the answer widen anything. The analysis is prose; the
+          validator refuses an answer that asserts a risk, a permission or an approval,
+          and nothing downstream treats the prose as a plan.
+        """
+        credential = getattr(request.state, "credential", None)
+        _throttle("voiceos", _credential_key(request))
+        # The execution's actor is the principal, computed exactly as the run route
+        # computes it: a credential pins it, and the local operator is only local.
+        # `_record_scope` would give `None` for the operator while the executions were
+        # stamped with the actor named in the run body, so the transcript is read with
+        # the two honest sources this route actually has.
+        scope = _record_scope(request)
+        session = _voiceos_load(session_id, scope)
+        # The actor the executions were stamped with. A credential pins it; the local
+        # operator is the session's own actor, not `None` — the transcript check in
+        # `log_excerpt` is exact, and "the operator" is not a value any execution
+        # carries.
+        actor = (
+            credential.actor_id
+            if credential is not None
+            else session.actor_id or "system"
+        )
+        step = last_log_step(session)
+        if step is None:
+            # Not an error: a session that has only proposed the work has nothing to
+            # explain yet, and saying so is better than explaining an empty string.
+            result = unobserved(
+                "this session has not finished reading a log yet, so there is nothing "
+                "to explain; run the plan first"
+            )
+            return _diagnosis_body(result, computer=session.device_id)
+        excerpt, reason = log_excerpt(
+            # The log body lives on the transient output channel, which `history()`
+            # deliberately does not retain: it was never audited, persisted or replayed,
+            # and asking for it by execution id draws only from the bounded in-memory
+            # copy of that one execution.
+            app.state.engine.events.transient(step.execution_id),
+            execution_id=step.execution_id,
+            actor=actor,
+            device_id=step.device_id or session.device_id,
+        )
+        if reason:
+            result = unobserved(reason)
+            return _diagnosis_body(result, computer=session.device_id, step=step)
+        # The question lives on the analysis step, not on the read: the read is just the
+        # evidence, and the explanation is the separate thing asked for.
+        asked = analysis_step(session)
+        meta = asked.analysis if asked is not None else {}
+        question = str(meta.get("question") or session.request or "").strip()
+        computer = str(meta.get("computer") or session.device_id or "")
+        # The analyst makes one blocking HTTPS call; this must not happen on the loop.
+        result = await asyncio.to_thread(
+            analyze,
+            question=question,
+            excerpt=excerpt,
+            analyst=app.state.voiceos_analyst,
+            analyst_note=str(app.state.voiceos_analyst_note or ""),
+            computer=computer,
+            source=step.label,
+        )
+        body = _diagnosis_body(result, computer=computer, step=step)
+        if asked is not None and result.status == "diagnosed":
+            # The analysis step counts as answered only when a *cause or fix* was
+            # actually produced. An "unavailable" answer is not an explanation, and
+            # recording it as one would make the session's status line claim a finding
+            # the system never made.
+            asked.analysis["result"] = str(body["description"])
+            session.touch()
+            _voiceos_store().save_session(session)
+        # The spoken sentence is the answer; the record of it is remembered so the next
+        # turn ("what was the error again?") is answered from what was said, not rerun.
+        conversation = _voiceos_store().get_conversation(session.actor_id)
+        conversation.remember("voiceos", body["description"])
+        _voiceos_store().save_conversation(conversation)
+        return body
 
     @app.post("/voiceos/sessions/{session_id}/cancel")
     def voiceos_session_cancel(request: Request, session_id: str) -> dict[str, Any]:
@@ -1427,6 +2233,297 @@ def create_app(
         # Requested, not confirmed. Whether it stopped is answered by the record on the
         # next read, exactly as the cancel route itself promises.
         return {"status": "requested", "execution_id": execution_id}
+
+    # -- automations (C39) -------------------------------------------------
+    #
+    # A saved automation is *intent*: a name, a plan, a trigger. Creating one grants
+    # nothing, editing one grants nothing, and scheduling one grants nothing — there is
+    # no field in the stored shape where a grant could live. Every run is a fresh
+    # session through the same orchestrator, so every step is authorised against
+    # whoever is running it, at the moment it runs.
+
+    def _automation_load(request: Request, workflow_id: str) -> Workflow:
+        """One workflow, scoped exactly like an execution record.
+
+        ``None`` from ``_record_scope`` is the machine's own operator and sees every
+        automation on it; a credential sees only the ones its actor owns. One answer
+        for "never existed" and "exists, not yours", as everywhere else.
+        """
+        workflow = _automation_store().get_workflow(workflow_id)
+        scope = _record_scope(request)
+        if workflow is None or (scope is not None and workflow.actor_id != scope):
+            raise HTTPException(status_code=404, detail="automation not found")
+        return workflow
+
+    def _automation_view(workflow: Workflow) -> dict[str, Any]:
+        out = workflow.to_dict()
+        # The description is prose *about* the stored plan, generated on read. It is
+        # not stored, so an edited plan cannot keep saying what it used to do.
+        try:
+            names = {
+                device.device_id: device.name
+                for device in app.state.devices.all_devices()
+            }
+        except Exception:  # noqa: BLE001 - a description must not fail a read
+            names = {}
+        out["description_text"] = describe_workflow(workflow, devices=names)
+        out["trigger_kind"] = workflow.trigger_kind()
+        return out
+
+    def _automation_save(workflow: Workflow) -> Workflow:
+        schedule_next(workflow, now=None)
+        workflow.touch()
+        _automation_store().save_workflow(workflow)
+        return workflow
+
+    @app.post("/automations/draft")
+    def automation_draft(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        """Read a sentence into a *draft*. **Nothing is stored and nothing runs.**
+
+        The steps can only come from an operator-authored template; a sentence with no
+        matching template gets a trigger and an empty plan, plus the reason. A model is
+        never asked to write a step here — see ``workflow_draft`` for why.
+        """
+        _throttle("voiceos", _credential_key(request))
+        sentence = payload.get("text")
+        if not isinstance(sentence, str):
+            raise HTTPException(status_code=400, detail="text must be a string")
+        actor = _voiceos_actor(request, payload)
+        source = load_templates(
+            os.getenv("ACTIONMESH_VOICEOS_TASKS", "").strip() or None,
+            app.state.engine.registry.has,
+        )
+        proposed = workflow_draft(sentence, templates=source.templates, actor_id=actor)
+        out = proposed.to_dict()
+        out["refused_templates"] = list(source.refusals)
+        # The exact body a save would accept, so the review screen shows what would be
+        # written rather than a summary that could differ from it.
+        out["proposal"] = draft_to_body(proposed)
+        return out
+
+    @app.get("/automations")
+    def automations_list(request: Request, limit: int = 100) -> dict[str, Any]:
+        """The library. Scoped to the caller, with the honest durability note."""
+        if limit < 1 or limit > 500:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+        scope = _record_scope(request)
+        workflows = _automation_store().list_workflows(scope, limit=limit)
+        scheduler = _automation_scheduler()
+        return {
+            "workflows": [_automation_view(workflow) for workflow in workflows],
+            # An in-memory store means these do not survive a restart, and saying so
+            # here is the only place the user would find out before it matters.
+            "note": str(getattr(app.state, "automation_store_note", "") or ""),
+            "scheduler": scheduler.status(),
+            "missed_at_startup": len(
+                getattr(app.state, "startup_automation_missed", ()) or ()
+            ),
+        }
+
+    @app.get("/automations/status")
+    def automations_status(request: Request) -> dict[str, Any]:
+        """Whether the local ticker is alive, and what can trigger a run."""
+        _record_scope(request)
+        out = _automation_scheduler().status()
+        out["note"] = str(getattr(app.state, "automation_store_note", "") or "")
+        out["missed_cutoff"] = _automation_scheduler().missed_cutoff()
+        return out
+
+    @app.get("/automations/runs")
+    def automations_runs(
+        request: Request, limit: int = 50, workflow_id: str = ""
+    ) -> dict[str, Any]:
+        """Run history: what actually happened, including what was missed."""
+        if limit < 1 or limit > 200:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+        scope = _record_scope(request)
+        runs = _automation_store().list_runs(
+            actor_id=scope, workflow_id=workflow_id or None, limit=limit
+        )
+        return {
+            "runs": [dict(run.to_dict(), summary=summarize_run(run)) for run in runs]
+        }
+
+    @app.post("/automations")
+    def automations_create(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        """Store a plan. It confers no permission and starts nothing."""
+        _throttle("voiceos", _credential_key(request))
+        actor = _voiceos_actor(request, payload)
+        if "grants" in payload or "permissions" in payload:
+            raise HTTPException(
+                status_code=400,
+                detail="an automation cannot carry permissions; consent is granted at /consents",
+            )
+        try:
+            workflow = validate_workflow(
+                payload,
+                actor_id=actor,
+                known_action=app.state.engine.registry.has,
+                workflow_id=new_workflow_id(),
+            )
+        except WorkflowError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _automation_save(workflow)
+        out = _automation_view(workflow)
+        out["runs_nothing"] = (
+            "saved. Nothing has run and no permission was granted; a run is "
+            "authorised when it happens."
+        )
+        return out
+
+    @app.get("/automations/{workflow_id}")
+    def automations_get(request: Request, workflow_id: str) -> dict[str, Any]:
+        _record_scope(request)
+        return _automation_view(_automation_load(request, workflow_id))
+
+    @app.put("/automations/{workflow_id}")
+    def automations_edit(
+        request: Request, workflow_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Replace a plan. The same validation a create goes through, no shortcuts."""
+        _throttle("voiceos", _credential_key(request))
+        existing = _automation_load(request, workflow_id)
+        if "grants" in payload or "permissions" in payload:
+            raise HTTPException(
+                status_code=400,
+                detail="an automation cannot carry permissions; consent is granted at /consents",
+            )
+        body = dict(payload)
+        # The owner is the stored one, never the body's. An edit cannot transfer an
+        # automation to another actor, which would be one actor arming another's run.
+        body.pop("actor_id", None)
+        body.pop("actor", None)
+        try:
+            workflow = validate_workflow(
+                body,
+                actor_id=existing.actor_id,
+                known_action=app.state.engine.registry.has,
+                workflow_id=workflow_id,
+            )
+        except WorkflowError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Creation time and the last run's outcome are facts about the past; an edit
+        # does not rewrite them.
+        workflow.created_at = existing.created_at
+        workflow.last_run_at = existing.last_run_at
+        workflow.last_run_id = existing.last_run_id
+        workflow.last_state = existing.last_state
+        _automation_save(workflow)
+        return _automation_view(workflow)
+
+    @app.post("/automations/{workflow_id}/enabled")
+    def automations_enabled(
+        request: Request, workflow_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Arm or disarm. Disarming stops *future* occurrences; a live run is not killed."""
+        _throttle("voiceos", _credential_key(request))
+        workflow = _automation_load(request, workflow_id)
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise HTTPException(status_code=400, detail="enabled must be true or false")
+        workflow.enabled = enabled
+        _automation_save(workflow)
+        out = _automation_view(workflow)
+        if not enabled:
+            out["detail"] = (
+                "disabled. No schedule or event will start it; a run already in "
+                "progress is not stopped by this."
+            )
+        return out
+
+    def _local_automation_target(request: Request, workflow: Workflow) -> str:
+        """The computer a press that named none should be aimed at, or ``""``.
+
+        The orchestrator refuses a step with no target once an execution device
+        exists, which is correct: an unaimed step must not silently become a local
+        one. But the operator pressing "run now" inside the desktop shell *is* on this
+        laptop, and a plan saved without a target would otherwise be unrunnable from
+        the one button that exists for running it.
+
+        So exactly one reading is offered, and only where it cannot mean something
+        else: a request that carries a credential came from a device, and a request on
+        loopback came from the machine's own operator. Either way the press is local.
+
+        The target itself is *not* re-derived here. It is the same
+        ``default_target`` a VoiceOS conversation with no selection gets: the declared
+        local device, else the single online execution device, else nothing — an
+        offline or ambiguous set is never chosen, it is left unanswered. An ambiguous
+        answer is reported in the run rather than resolved by picking one.
+
+        Anything else gets ``""`` — unchanged behaviour, so a press from elsewhere
+        with no target is still refused or reported rather than quietly aimed. A step
+        that names its own computer is never reached here (the orchestrator prefers
+        it), and a workflow that already names one is honoured as stored.
+        """
+        if workflow.device_id:
+            return workflow.device_id
+        credential = getattr(request.state, "credential", None)
+        if credential is None and not _is_local(request):
+            return ""
+        return _voiceos_default_target().device_id
+
+    @app.post("/automations/{workflow_id}/run")
+    async def automations_run(
+        request: Request, workflow_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Press run. This is a fresh session authorised against an actor, now.
+
+        A previous approval does not carry over: the run builds its context from the
+        credential (or the automation's owner) exactly as
+        ``/voiceos/sessions/{id}/run`` does, so every step is decided again, now.
+        """
+        credential = getattr(request.state, "credential", None)
+        _throttle("execute", _credential_key(request))
+        workflow = _automation_load(request, workflow_id)
+        # A bare press from the machine's own operator names nobody, and an execution
+        # with no actor identity is denied by the policy engine before its grants are
+        # even consulted -- every step would fail with "missing actor identity" and a
+        # correctly-granted operator could never run their own automation. So the local
+        # operator runs it *as the automation's owner*, which is the actor that owns
+        # whatever consent exists. The owner is read from the stored workflow, never
+        # from the body; a credential still pins the actor to itself, and a body that
+        # names someone else is still refused by ``_context``.
+        body = dict(payload)
+        if credential is None and body.get("actor") is None and workflow.actor_id:
+            body["actor"] = {"id": workflow.actor_id, "kind": "user"}
+        try:
+            context = _context(
+                body,
+                app.state.consent_store,
+                credential=credential,
+                credentials=app.state.credentials,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # The same reasoning one layer down: a plan whose steps name no computer has
+        # no target, and the orchestrator refuses an unselected step once an execution
+        # device exists -- which would make every saved plan unrunnable from this button.
+        # The machine's own operator pressing "run now" in the desktop shell *is* on
+        # the laptop, so "this laptop" is the honest reading of that press.
+        #
+        # That reading is only taken when it cannot mean something else: the request
+        # carries a credential (so it comes from a device, not a person elsewhere), or
+        # it arrives on loopback (so it is the local operator). A body that names a
+        # computer still wins, a step that names one is never rewritten, and an
+        # unselected press that is neither is left unselected -- it is then refused or
+        # refused-and-reported exactly as before, rather than quietly aimed somewhere.
+        default_target = _local_automation_target(request, workflow)
+        run = await _automation_scheduler().run_now(
+            workflow, context=context, default_device_id=default_target
+        )
+        return dict(run.to_dict(), summary=summarize_run(run))
+
+    @app.delete("/automations/{workflow_id}")
+    def automations_delete(request: Request, workflow_id: str) -> dict[str, Any]:
+        """Remove a plan. Its run history stays: it is a record, not a child."""
+        _throttle("voiceos", _credential_key(request))
+        _automation_load(request, workflow_id)
+        deleted = _automation_store().delete_workflow(workflow_id)
+        return {
+            "deleted": deleted,
+            "runs_kept": True,
+            "detail": "the plan is gone; what it did in the past is still in the history",
+        }
 
     return app
 

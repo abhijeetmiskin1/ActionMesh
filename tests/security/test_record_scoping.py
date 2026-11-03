@@ -353,6 +353,50 @@ class TestWriteScoping(_TwoDevices):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["granted_by"], "bob")
 
+    def test_a_device_may_withdraw_its_own_consent_without_naming_itself(self) -> None:
+        response = self.remote.delete(
+            "/consents/message.send", headers=self.bearer(self.token_b)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["revoked"], 1)
+        self.assertEqual(self.remote.get("/consents", headers=self.bearer(self.token_b)).json(), [])
+
+    def test_withdrawing_a_consent_does_not_strip_the_other_actors_grant(self) -> None:
+        # Both alice and bob hold message.send. Bob withdrawing his decision is not a
+        # decision on alice's behalf.
+        response = self.remote.delete(
+            "/consents/message.send", headers=self.bearer(self.token_b)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        alice = self.local.get("/consents", params={"actor_id": "alice"}).json()
+        self.assertIn("message.send", [record["scope"] for record in alice])
+
+    def test_a_device_cannot_withdraw_another_actors_consent(self) -> None:
+        response = self.remote.delete(
+            "/consents/message.send?actor_id=alice", headers=self.bearer(self.token_b)
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        alice = self.local.get("/consents", params={"actor_id": "alice"}).json()
+        self.assertIn("message.send", [record["scope"] for record in alice])
+
+    def test_the_operator_must_name_the_actor_whose_consent_it_withdraws(self) -> None:
+        response = self.local.delete("/consents/message.send")
+        self.assertEqual(response.status_code, 400, response.text)
+
+    def test_withdrawing_a_consent_that_actor_does_not_hold_is_not_found(self) -> None:
+        # A 200 here would tell the caller their decision was recorded when nothing
+        # changed. The scope exists (alice holds it) but bob does not.
+        response = self.remote.delete(
+            "/consents/file.read", headers=self.bearer(self.token_b)
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertIn(
+            "message.send",
+            [record["scope"] for record in self.remote.get(
+                "/consents", headers=self.bearer(self.token_b)
+            ).json()],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

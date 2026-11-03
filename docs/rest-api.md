@@ -15,11 +15,24 @@ simulated providers. Deployments and tests may inject an `ExecutionEngine`.
 | GET | `/manifest.webmanifest`, `/sw.js`, `/icon.svg` | Installable-app shell assets |
 | POST | `/plan` | **Propose** candidate actions from natural-language intent (C18) |
 | POST | `/voiceos/messages` | One VoiceOS turn: intent, conversational references and a proposed task session. It never runs anything — the answer carries `ran: false` always (C34) |
+| POST | `/voiceos/guide` | Which of a caller-supplied list of example phrasings this deployment's planner would actually route. A **measurement**, not a promise: each phrase runs through the same planner a real turn uses. Proposes nothing, authorizes nothing, runs nothing (C41) |
 | GET | `/voiceos/conversation` | This actor's conversation context: history, active session, and the observed items a later turn may refer to |
+| GET | `/voiceos/status` | Whether the next turn is answered by a model or by the deterministic planner: `mode` is `ai_model` or `deterministic`, with a `mode_label` for the UI chip and a `reason` when a configured provider could not be used. `state` is the shell's last verified connection state (empty when there is no bridge). **`configured` is not `usable`**: a provider whose key the provider rejected still reads configured and implemented, and a refusing `state` (`missing_key`, `invalid_credentials`, `rate_limited`, `timeout`, `provider_unavailable`, `malformed`) forces `mode: deterministic` with the shell's own sentence as the reason. A built provider is not a proven one — `/voiceos/messages` returns the per-turn note that says what actually happened (C41) |
 | GET | `/voiceos/sessions` | Recent task sessions — only the caller's own; `limit` is 1–100 |
 | GET | `/voiceos/sessions/{session_id}` | One session with its steps and what was observed. 404 for a session that is not yours |
 | POST | `/voiceos/sessions/{session_id}/run` | Advance the session one authorised step. Every step is an ordinary `/execute` under the caller's own credential, so a parked step stops here and asks |
 | POST | `/voiceos/sessions/{session_id}/cancel` | Ask ActionMesh to stop the live step. Answers `requested` (or `nothing_running`); the record confirms what actually stopped |
+| POST | `/voiceos/sessions/{session_id}/diagnose` | Explain the log this session's `device.process.logs` step actually read. Redacts and bounds the excerpt before anything leaves the machine, and answers `unavailable` — with the evidence, not a guess — when no analyst is configured |
+| POST | `/automations/draft` | Read a sentence into a **draft** for review (C39). Nothing is stored and nothing runs: `created` is always `false`, the steps can only come from an operator template, and an unmatched sentence gets a trigger plus the reason it has no steps |
+| GET | `/automations` | The library — **only the caller's own**, with the local ticker's status and a note when automations are in memory only and will not survive a restart |
+| POST | `/automations` | Save a plan. It grants nothing and starts nothing; a body carrying `grants` or `permissions` is refused. Every step is authorised again when it runs |
+| GET | `/automations/{workflow_id}` | One automation. 404 for one that is not yours |
+| PUT | `/automations/{workflow_id}` | Replace a plan, validated exactly as a create is. The stored owner is kept; an edit cannot transfer it or rewrite the last run's outcome |
+| DELETE | `/automations/{workflow_id}` | Remove a plan. Run history is kept — it is a record of what happened, not a child of the plan |
+| POST | `/automations/{workflow_id}/enabled` | Arm or disarm. Disabling stops future occurrences; it does not kill a run already in progress |
+| POST | `/automations/{workflow_id}/run` | Press run: one fresh session under the **caller's own** credential, so every step goes through consent, risk and the approval gate again. A previous approval does not carry over |
+| GET | `/automations/status` | Whether the in-process ticker is alive, its grace window, and the closed list of event types that can trigger a run |
+| GET | `/automations/runs` | Automation history — scheduled, event and manual runs, including `missed` occurrences that were recorded rather than run late. Optional `workflow_id` |
 | POST | `/execute` | Validate and execute a graph |
 | GET | `/executions` | Recent execution records — **only the caller's own**; `limit` is 1–100 |
 | GET | `/executions/{execution_id}` | One record. 404 for an execution that is not yours, so the answer cannot confirm which ids exist |
@@ -28,6 +41,7 @@ simulated providers. Deployments and tests may inject an `ExecutionEngine`.
 | GET | `/approvals` | Executions stopped for a human, with the action ids they await (C19) — **only the caller's own**, because an approval entry carries the action's parameters |
 | POST | `/consents` | Record a consent **server-side** — the only way to grant a permission. A paired device may omit `actor_id` and the server takes it from the credential; naming another actor is the operator's act |
 | GET | `/consents` | List consents. A device omits `actor_id` (or repeats its own); the operator must name the actor it means |
+| DELETE | `/consents/{scope}` | Withdraw a standing consent. Revoking is the safe direction, so it is not gated like granting — but the actor is still named: a device withdraws only its own, an operator says whose, and a scope two actors hold keeps the other's grant |
 | GET | `/capabilities` | Discover registered capabilities; optional `provider` filter |
 | GET | `/devices` | Registered devices, with presence derived from heartbeats (C19) |
 | GET | `/devices/{device_id}` | One device record; 404 when unknown |
@@ -61,6 +75,14 @@ Each action carries **only** `type` and `parameters`; a proposal has no field fo
 risk, permissions, dependencies or lifecycle state. Anything the planner could not
 map is reported in `notes` rather than silently dropped, and an empty or
 non-string intent is a 400. **Calling this route runs nothing.**
+
+`parameters` is checked against the resolved action's own `input_schema`, and the
+check is fail-closed: a required field that is missing, a value of the wrong type,
+and a parameter the action **does not declare** are all rejected. The last one is
+deliberate. A capability that declares `{"to", "message"}` must not accept
+`{"to", "message", "command": {...}}` — the extra value would still be bound into
+the call when the action dispatches. A caller that wants to pass more must register
+an action that declares it.
 
 `POST /execute` expects a JSON object containing `graph`. The optional `actor`,
 `policy`, and `allow_high_risk` fields become a typed policy context. Permission
@@ -365,3 +387,106 @@ The default wiring is in-memory. Realtime SSE and WebSocket are implemented (C9)
 not "later phases". Set `ACTIONMESH_AUDIT_DB` to persist the audit chain to SQLite,
 where it reopens **fail-closed**, and `ACTIONMESH_AUDIT_ANCHOR` to add truncation
 detection — see [`audit.md`](audit.md). No endpoint talks to a real provider.
+
+## Automations (C39)
+
+An automation is a **stored plan**, not a standing permission. `POST /automations`
+writes a workflow and starts nothing; the body has no field a grant could live in, and
+one that carries `grants` or `permissions` is refused outright. Every step is
+authorised afresh on every run — against the caller's credential for a manual press,
+and against **no grants at all** for a scheduled or event run, because nobody is
+present to consent. A workflow that needs a permission therefore fails at 09:00 with
+`missing permission(s): [...]` rather than inheriting yesterday's approval.
+
+### What the ticker does, and does not, do
+
+`GET /automations/status` reports the single in-process `asyncio` ticker. There is no
+cloud scheduler, no daemon and no queue: a laptop or desktop running this program is
+the whole scheduling infrastructure. Two durable mechanisms make an occurrence run **at
+most once**, including across a restart:
+
+- `next_run_at` is advanced as part of the same step that claims the occurrence, so a
+  workflow with a claimed run is no longer due.
+- The run row is unique on `(workflow_id, slot)`, where the slot is the due time. The
+  claim is an `INSERT OR IGNORE`; only the caller whose insert took effect proceeds.
+
+An occurrence claimed by a process that died before starting it is reconciled at
+startup as **`missed`** — one row, never re-run, with the reason recorded — because a
+replay would be a run at a time nobody chose. An occurrence more than `missed_after_s`
+late (default 15 minutes) is likewise recorded `missed` with the lateness stated. A
+laptop that slept through 09:00 and woke at 15:00 is told so; it is not handed the
+morning's job six hours late.
+
+`triggerable_events` in the status and list responses is a **closed list** of the event
+types that may start a workflow (`execution.completed`, `execution.denied`,
+`execution.device_refused`, `execution.cancelled`, `execution.interrupted`). A
+workflow may optionally narrow one of them by `state`, which is the executor's own
+verdict — "when the build fails" is `execution.completed` narrowed to `state: failed`,
+not a fabricated `execution.failed` event. Matching never reads an event payload: a
+provider's output cannot choose what runs next. An event starts a workflow only for
+that workflow's own owner.
+
+### Choosing a computer
+
+A step runs on the computer it names. Where the plan names none, the manual run route
+supplies **one** reading: the press came from this machine, so the target is the same
+declared-local-or-single-online device a VoiceOS conversation with no selection would
+use. That answer is never a guess — several online computers, or none, leaves the step
+unaimed and the orchestrator refuses it by name. A **scheduled** run supplies no
+default at all: a tick has no operator behind it, so an untargeted plan is refused and
+reported rather than aimed.
+
+If the named device is offline the step is reported unavailable and **the action is not
+sent to any other computer**. `default_device_id` is a fallback for a step that names
+nothing; it never overwrites one that names a device.
+
+### Drafts
+
+`POST /automations/draft` reads a sentence into a proposal for review. It always returns
+`created: false` and stores nothing. Its steps can come only from an operator-authored
+template (`ACTIONMESH_VOICEOS_TASKS`); with no matching template the draft has a
+recognised trigger, no steps, and a stated reason. A model is never asked to emit a step
+— only, at most, to recognise a schedule — so "create a workflow from this sentence"
+cannot introduce an action that the operator did not configure.
+
+## `POST /voiceos/guide` — what the guide measures
+
+The Voice screen lists example phrasings, and the right-hand column beside each one
+used to be a hand-typed "supported". It was wrong: on a service with no laptop agent,
+several listed phrases matched no rule at all, the page said supported, and pressing
+one answered "I could not safely map that". A label nobody measures is a claim.
+
+This route makes it a measurement. The caller sends its own list of phrases — the
+page sends the ones it is about to display, so there is one list in the product and
+not two that drift — and each is run through the **same** planner object a real turn
+uses (`app.state.planner`, with the same registry filter):
+
+```json
+{
+  "phrases": [
+    {"phrase": "tell mom I'll be late", "actions": ["message.send"], "notes": []},
+    {"phrase": "show my projects", "actions": [],
+     "notes": ["dropped unregistered action type 'device.project.list'"]},
+    {"phrase": "book me a table", "actions": [], "notes": ["no rule matched: 'book me a table'"]}
+  ]
+}
+```
+
+The three outcomes are distinct on purpose, because they call for different advice:
+
+- **`actions` non-empty** — the planner routes it, and these are the action types it
+  lands on. The page renders that list.
+- **`dropped unregistered action type …`** — the *wording* was understood; this build
+  does not register the capability that would carry it out. The user is told to enable
+  the laptop agent, not that their sentence was unparseable.
+- **`no rule matched …`** — no rule recognised this wording. When `/voiceos/status`
+  reports `mode: ai_model`, the page softens this to "no built-in rule; the configured
+  model may still interpret it", because a live model is a second proposal source —
+  and it is still honest, because the guide cannot ask the model without spending a
+  call.
+
+Phrases are untrusted body text like any other: bounded to `GUIDE_MAX_PHRASES` (40)
+entries of `GUIDE_MAX_PHRASE_CHARS` (200) characters, blank entries refused with a
+400, and each string echoed back only as the string that was sent. **The route
+proposes nothing, authorizes nothing and runs nothing** — it creates no session and
+no execution, which `tests/unit/test_command_guide.py` asserts directly.

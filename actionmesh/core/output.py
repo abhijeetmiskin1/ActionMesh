@@ -42,6 +42,20 @@ OUTPUT_EVENT_TYPE = "execution.output"
 MAX_CHUNK_BYTES = 4096
 #: Total output retained/streamed for one node before it is marked truncated.
 MAX_NODE_BYTES = 64 * 1024
+#: A single whole-document event carries at most this many bytes. See
+#: :data:`WHOLE_DOCUMENT_STREAMS` for why this channel is framed differently.
+#: Streams that carry one *whole* JSON document rather than a byte stream. A program's
+#: stdout is a sequence, so cutting it between two bytes and continuing is what a reader
+#: wants; an element list is a single document, and a fragment of it is not "less of the
+#: answer" -- it is unparseable, so the reader gets nothing at all. These streams are
+#: therefore delivered entire or refused, never cut.
+WHOLE_DOCUMENT_STREAMS = frozenset({"elements"})
+#: The node budget for a whole-document stream. An accessibility walk returns at most
+#: ``device_screen._MAX_ELEMENTS`` (200) elements, and one element measured on a real
+#: desktop is about 170 bytes of JSON, so the cap that fits the walk is roughly 35 KB.
+#: 256 KB leaves room for a tree of unusually talkative elements while still being a
+#: hard bound: the walk itself, not this channel, is what limits how many there are.
+MAX_DOCUMENT_BYTES = 256 * 1024
 
 
 class OutputPublisher:
@@ -58,6 +72,7 @@ class OutputPublisher:
         device_id: str = "",
         max_chunk_bytes: int = MAX_CHUNK_BYTES,
         max_node_bytes: int = MAX_NODE_BYTES,
+        max_document_bytes: int = MAX_DOCUMENT_BYTES,
     ) -> None:
         self._hub = hub
         self._execution_id = execution_id
@@ -67,6 +82,7 @@ class OutputPublisher:
         self._device_id = device_id
         self._max_chunk = max_chunk_bytes
         self._max_node = max_node_bytes
+        self._max_document = max_document_bytes
         self._sequence = 0
         self._retained = 0
         self.truncated = False
@@ -74,6 +90,9 @@ class OutputPublisher:
     def emit(self, stream: str, chunk: str) -> None:
         """Publish one output chunk; called by the runner as the process produces it."""
         if not chunk:
+            return
+        if stream in WHOLE_DOCUMENT_STREAMS:
+            self._emit_document(stream, chunk)
             return
         if self._retained >= self._max_node:
             # Budget spent: keep supervising the process, stop shipping bytes, and say
@@ -91,6 +110,29 @@ class OutputPublisher:
         text = data.decode("utf-8", errors="replace")
         self._retained += len(data)
         self._publish(stream=stream, text=text, final_truncation=False)
+
+    def _emit_document(self, stream: str, chunk: str) -> None:
+        """Publish a whole-document stream: entire, or not at all.
+
+        A reader that receives half a JSON array has no elements — not few elements —
+        because the document does not parse. Sending the working half would be worse
+        than sending nothing: the result view would show an empty list next to a
+        non-zero count, and the reader would be told the tree held nothing when what
+        happened is that this channel cut it.
+
+        So the document travels as one event, and its own budget caps it. A document that
+        does not fit is reported as truncated with an empty payload: the caller still has
+        the element *count* from the result, and the missing names are stated rather than
+        silently short.
+        """
+        data = chunk.encode("utf-8", errors="replace")
+        if len(data) > self._max_document:
+            if not self.truncated:
+                self.truncated = True
+                self._publish(stream=stream, text="", final_truncation=True)
+            return
+        self._retained += len(data)
+        self._publish(stream=stream, text=chunk, final_truncation=False)
 
     def _publish(self, *, stream: str, text: str, final_truncation: bool) -> None:
         self._sequence += 1
@@ -141,6 +183,7 @@ __all__ = [
     "MAX_CHUNK_BYTES",
     "MAX_NODE_BYTES",
     "OUTPUT_EVENT_TYPE",
+    "WHOLE_DOCUMENT_STREAMS",
     "OutputPublisher",
     "current_publisher",
     "install",

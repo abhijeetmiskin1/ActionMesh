@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from actionmesh.core.audit import AuditLog
 from actionmesh.protocol.models import MeshEvent
+
+#: How much transient output this hub keeps for one execution, in memory only.
+#: It exists so a request that arrives *after* a read finished can still explain what
+#: that read observed (the diagnosis flow draws from it). It does not change where a
+#: transient event does or does not go: never the audit chain, never the store, never
+#: the replay history and never ``history()``.
+MAX_TRANSIENT_BYTES = 1024 * 1024
+#: How many executions may hold captured transient output at once. When a new
+#: execution makes one too many, the least recently published is dropped whole.
+MAX_TRANSIENT_EXECUTIONS = 32
+
+
+@dataclass
+class _Capture:
+    """Bounded in-memory copy of one execution's transient output."""
+
+    events: deque[MeshEvent] = field(default_factory=deque)
+    size: int = 0
+
+
+def _chunk_bytes(event: MeshEvent) -> int:
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    chunk = payload.get("chunk")
+    if not isinstance(chunk, str):
+        return 0
+    return len(chunk.encode("utf-8", errors="replace"))
 
 
 class EventHub:
@@ -47,6 +74,18 @@ class EventHub:
         #: after this process is gone, not a queue to read from instead.
         self._store = store
         self._written = 0
+        #: C39: plain observers of published events, told after the event is durable
+        #: and fanned out. A listener runs *after* the publish, so it cannot change
+        #: what subscribers see, and it is called synchronously -- a listener that
+        #: wants to start work schedules it rather than doing it inline. Kept separate
+        #: from ``subscribe`` on purpose: a subscriber is a client's stream and may
+        #: stop reading; a listener is in-process wiring that must not be conflated
+        #: with one.
+        self._listeners: list[Callable[[MeshEvent], None]] = []
+        #: C36: a bounded, in-memory copy of recent transient output, keyed by execution.
+        #: Process-local and deliberately short-lived -- see :meth:`transient`. Ordered so
+        #: the least recently active execution is the one that is dropped.
+        self._transient: OrderedDict[str, _Capture] = OrderedDict()
 
     @property
     def audit(self) -> AuditLog | None:
@@ -71,6 +110,19 @@ class EventHub:
         """
         self._store = store
 
+    def add_listener(self, listener: Callable[[MeshEvent], None]) -> None:
+        """Observe every non-transient publish from now on. A startup wiring step.
+
+        Unlike :meth:`subscribe` this is not a consumer: it has no queue to fill and
+        cannot block a publisher. A listener that raises is removed from the list and
+        its error swallowed -- one broken observer must not turn "an execution
+        finished" into an exception inside the executor that published it. Listeners
+        are deliberately never given transient events: program output is not an
+        outcome, and nothing should be triggered by a line of stdout.
+        """
+        if listener not in self._listeners:
+            self._listeners.append(listener)
+
     def publish(self, event: MeshEvent, *, transient: bool = False) -> None:
         """Fan an event out to live subscribers.
 
@@ -79,6 +131,12 @@ class EventHub:
         the replay history. Audit is a record of decisions and outcomes, not a copy of a
         program's stdout, and a phone that reconnects should recover the authoritative
         execution state -- not be re-sent output that may have contained secrets.
+
+        A transient event is still copied into a small in-memory buffer for its own
+        execution (:meth:`transient`), so the request that arrives just after a read
+        finished can explain what it observed. That buffer is bounded, process-local and
+        never written anywhere: it is the same lifetime and the same audience the live
+        stream already had, just long enough to survive the end of the read.
         """
         if not transient:
             if self._audit is not None:
@@ -90,6 +148,8 @@ class EventHub:
                 if self._written % 64 == 0:
                     # Amortised, so retention does not cost an extra write per event.
                     self._store.trim_events()
+        else:
+            self._capture(event)
         for queue in tuple(self._subscribers):
             try:
                 queue.put_nowait(event)
@@ -100,6 +160,63 @@ class EventHub:
                 while not queue.empty():
                     queue.get_nowait()
                 queue.put_nowait(None)
+        if not transient and self._listeners:
+            # Last, and after the event is durable: a listener is told what happened,
+            # never allowed to influence it. See :meth:`add_listener`.
+            for listener in tuple(self._listeners):
+                try:
+                    listener(event)
+                except Exception:  # noqa: BLE001 - an observer must not stop a publish
+                    self._listeners.remove(listener)
+
+    def _capture(self, event: MeshEvent) -> None:
+        """Keep a bounded in-memory copy of one transient event for its execution.
+
+        The bound is on *content* bytes, which is what a hostile or chatty program can
+        push; an event whose content would overflow the cap is not kept, so the buffer
+        never grows past ``MAX_TRANSIENT_BYTES``. When the copy is full the *oldest*
+        events are dropped, leaving the tail -- which is what a caller reading a log is
+        after, and what "the latest error" means.
+        """
+        if not event.execution_id:
+            return
+        capture = self._transient.get(event.execution_id)
+        if capture is None:
+            capture = _Capture()
+            self._transient[event.execution_id] = capture
+            while len(self._transient) > MAX_TRANSIENT_EXECUTIONS:
+                self._transient.popitem(last=False)
+        else:
+            # Re-insert so the least recently *active* execution is the one evicted.
+            self._transient.move_to_end(event.execution_id)
+        size = _chunk_bytes(event)
+        if size > MAX_TRANSIENT_BYTES:
+            return
+        capture.events.append(event)
+        capture.size += size
+        while capture.size > MAX_TRANSIENT_BYTES and len(capture.events) > 1:
+            dropped = capture.events.popleft()
+            capture.size -= _chunk_bytes(dropped)
+
+    def transient(self, execution_id: str) -> list[MeshEvent]:
+        """What one execution published on the transient channel, if still held.
+
+        This is not ``history``: nothing here was audited, persisted, replayed or
+        delivered to a late subscriber, and an execution with no captured output returns
+        an empty list rather than an error -- "I no longer hold it" and "it printed
+        nothing" are both honest answers, and the caller says which it can tell.
+
+        The returned events carry their actor, so the caller still applies its own
+        authorization. This method deliberately does not: it reports what it holds, and
+        the code that knows who is asking decides what they may see.
+        """
+        if not execution_id:
+            return []
+        capture = self._transient.get(execution_id)
+        if capture is None:
+            return []
+        self._transient.move_to_end(execution_id)
+        return list(capture.events)
 
     def history(self, execution_id: str | None = None) -> list[MeshEvent]:
         events = list(self._history)
@@ -166,4 +283,4 @@ class EventHub:
             self._subscribers.discard(queue)
 
 
-__all__ = ["EventHub"]
+__all__ = ["MAX_TRANSIENT_BYTES", "MAX_TRANSIENT_EXECUTIONS", "EventHub"]

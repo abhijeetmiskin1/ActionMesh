@@ -88,6 +88,37 @@ SAFE_RESULT_KEYS = frozenset(
         "editors",
         "services",
         "entries",
+        # C38: the *shape* of a screen observation. "the OS declined the capture",
+        # "1920x1080", "the tree had 41 elements", "the walk hit its cap" are facts
+        # about the boundary, not about the screen. Element names, element bounds and
+        # image bytes are the screen's content and are deliberately absent from this
+        # list: they travel the transient channel to the one observer already allowed
+        # to watch the execution (see `actionmesh.core.output`), and a result payload
+        # that a paired phone could read never carries them.
+        "session",
+        "portal_code",
+        "retained",
+        "element_count",
+        "reason",
+        "width",
+        "height",
+        "format",
+        # C38 GUI actions. The same rule as the screen keys above: what a client needs
+        # to know is *whether the machine did the thing*, never what was on the screen.
+        # `role` and `name` identify the element that was targeted -- the same target
+        # the caller itself named in the request, so it discloses nothing it did not
+        # already hold. `detail` is the adapter's sentence, bounded by MAX_SCALAR_STRING
+        # like every other string here. Deliberately absent: `observed` (element state
+        # and geometry), `anchor_bounds` (geometry), `offset` (a nested dict, dropped by
+        # the projection, and is a scroll position not a fact about a client's work),
+        # and `text` -- which a type action must never inflict on a result that a
+        # different device could read.
+        "role",
+        "dispatched",
+        "typed",
+        "element_changed",
+        "moved",
+        "detail",
     }
 )
 

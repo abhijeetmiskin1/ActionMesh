@@ -41,9 +41,24 @@ class ConsentStore:
         bucket.append(consent)
         return consent
 
-    def revoke(self, scope: str) -> int:
-        """Remove every consent for a scope. Returns how many were removed."""
-        return len(self._consents.pop(scope, []))
+    def revoke(self, scope: str, *, granted_by: str | None = None) -> int:
+        """Remove consents for a scope. Returns how many were removed.
+
+        ``granted_by`` narrows the removal to one actor. Without it a scope that two
+        actors happen to hold would lose both grants, which is a permission being
+        taken from someone who did not ask for it -- a caller withdrawing its own
+        consent must say whose it is.
+        """
+        if granted_by is None:
+            return len(self._consents.pop(scope, []))
+        bucket = self._consents.get(scope, [])
+        kept = [c for c in bucket if c.granted_by != granted_by]
+        removed = len(bucket) - len(kept)
+        if kept:
+            self._consents[scope] = kept
+        else:
+            self._consents.pop(scope, None)
+        return removed
 
     def consents(self, scope: str | None = None) -> list[Consent]:
         if scope is not None:
@@ -118,17 +133,46 @@ class SQLiteConsentStore(ConsentStore):
                 f"refusing to grant non-concrete scope {consent.scope!r}; "
                 "wildcard consent is not permitted"
             )
+        # Re-granting a scope replaces that actor's grant instead of stacking a second
+        # one beside it, and it never touches another actor's row for the same scope.
+        # The old key (``granted_at + scope``) collided across actors, so rows written
+        # under it are cleared by payload match rather than by key.
+        self._delete_rows(consent.scope, consent.granted_by)
         self.connection.execute(
             "INSERT OR REPLACE INTO consents(consent_id, scope, payload) VALUES (?, ?, ?)",
-            (consent.granted_at.isoformat() + consent.scope, consent.scope, consent.model_dump_json()),
+            (
+                f"{consent.granted_at.isoformat()}|{consent.granted_by}|{consent.scope}",
+                consent.scope,
+                consent.model_dump_json(),
+            ),
         )
         self.connection.commit()
         return consent
 
-    def revoke(self, scope: str) -> int:
-        cursor = self.connection.execute("DELETE FROM consents WHERE scope = ?", (scope,))
+    def _delete_rows(self, scope: str, granted_by: str) -> int:
+        """Delete one actor's grants for a scope, whatever key they were written under."""
+        doomed = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT consent_id, payload FROM consents WHERE scope = ?", (scope,)
+            ).fetchall()
+            if json.loads(row[1]).get("granted_by") == granted_by
+        ]
+        if doomed:
+            self.connection.executemany(
+                "DELETE FROM consents WHERE consent_id = ?", [(cid,) for cid in doomed]
+            )
+        return len(doomed)
+
+    def revoke(self, scope: str, *, granted_by: str | None = None) -> int:
+        if granted_by is not None:
+            removed = self._delete_rows(scope, granted_by)
+        else:
+            removed = self.connection.execute(
+                "DELETE FROM consents WHERE scope = ?", (scope,)
+            ).rowcount
         self.connection.commit()
-        return cursor.rowcount
+        return removed
 
     def consents(self, scope: str | None = None) -> list[Consent]:
         query = "SELECT payload FROM consents"

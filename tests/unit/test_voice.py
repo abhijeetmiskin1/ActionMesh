@@ -86,11 +86,25 @@ class TestVoiceRoute(unittest.TestCase):
     def test_a_message_proposes_and_creates_no_execution(self) -> None:
         before = len(self.client.get("/executions").json())
         answer = self.client.post(
-            "/voiceos/messages", json={"text": "what is my laptop running"}
+            "/voiceos/messages", json={"text": "tell mom I'll be late"}
         ).json()
         self.assertTrue(answer["session_id"])
         self.assertFalse(answer["ran"])
         self.assertEqual(len(self.client.get("/executions").json()), before)
+
+    def test_a_device_phrase_without_an_agent_says_why(self) -> None:
+        # The registry does not hold the laptop's actions unless an agent advertised
+        # them, so this bare app cannot list its own processes. The reply has to say
+        # that, rather than report a parsing failure or propose a step that would be
+        # refused at dispatch.
+        answer = self.client.post(
+            "/voiceos/messages", json={"text": "what is my laptop running"}
+        ).json()
+        self.assertEqual(answer["kind"], "answer")
+        self.assertEqual(answer["session_id"], "")
+        self.assertIn("device.process.list", answer["reply"])
+        self.assertIn("laptop agent", answer["reply"])
+        self.assertFalse(answer["ran"])
 
 
 class TestTheRequestSurface(unittest.TestCase):

@@ -66,6 +66,26 @@ class TaskStep:
     verified: bool | None = None
     observed: dict[str, Any] = field(default_factory=dict)
     error: str = ""
+    #: C36 — the computer this step is addressed to, resolved when the plan was made.
+    #: Empty means "whatever the session's target is", which is how a continuation
+    #: follows the conversation's current selection rather than repeating an old one.
+    #: This is a *routing request*: the executor re-resolves it and refuses a device
+    #: that is unknown, offline, revoked or out of role. A step cannot widen authority
+    #: by naming a machine; it can only aim at one.
+    device_id: str = ""
+    #: A parameter whose value is an id an *earlier step observed*, e.g.
+    #: ``{"process_id": {"from_step": 0, "key": "servers"}}``. Set only by this package's
+    #: own decompositions, never by a model or a template author: the shape is narrow
+    #: (an index, a key and one field) so it cannot be used to compute a value. Without
+    #: it, a plan like "check the server, then read its logs" has no honest way to name
+    #: the process, and the alternative — inventing an id — is exactly the guess this
+    #: product refuses. The resolved value is copied into ``parameters`` when the step
+    #: runs, so the orchestrator and the graph see an ordinary concrete parameter.
+    bind: dict[str, Any] = field(default_factory=dict)
+    #: Read-only views of what earlier steps observed, stamped when the session is made.
+    #: A client never sees these: ``to_dict`` does not include them. They exist so the
+    #: diagnosis route can read one process's log without the log ever being persisted.
+    analysis: dict[str, Any] = field(default_factory=dict)
 
     @property
     def settled(self) -> bool:
@@ -80,6 +100,20 @@ class TaskStep:
         }
 
     def to_dict(self) -> dict[str, Any]:
+        """The client's view of a step.
+
+        ``bind`` and ``analysis`` are deliberately absent. ``bind`` describes how the
+        orchestrator will fill a parameter and is not something a client reads or
+        writes; ``analysis`` holds the question a diagnosis step was created to answer
+        and, after the fact, the sentence that answer was recorded as — neither is
+        part of the step's capability.
+
+        This is *not* the storage format. :meth:`to_storage` is, because a persisted
+        session has to come back as the same plan: dropping ``bind`` would turn "read
+        the log of the server you just found" into "read the log of nothing", and
+        dropping ``analysis`` would turn an explanation placeholder into a step some
+        later run would try to dispatch.
+        """
         return {
             "index": self.index,
             "label": self.label,
@@ -91,7 +125,21 @@ class TaskStep:
             "verified": self.verified,
             "observed": dict(self.observed),
             "error": self.error,
+            "device_id": self.device_id,
         }
+
+    def to_storage(self) -> dict[str, Any]:
+        """Everything needed to restore this step *as the same plan*, for the store.
+
+        Adds the two fields the client view omits. ``analysis`` never holds a log: it
+        holds the question, the computer it was asked about and the sentence the
+        explanation was recorded as, all of which the user has already been shown.
+        """
+        out = self.to_dict()
+        out["bind"] = {name: dict(spec) if isinstance(spec, dict) else spec
+                       for name, spec in self.bind.items()}
+        out["analysis"] = dict(self.analysis)
+        return out
 
     @staticmethod
     def from_dict(raw: dict[str, Any]) -> TaskStep:
@@ -106,6 +154,9 @@ class TaskStep:
             verified=raw.get("verified"),
             observed=dict(raw.get("observed") or {}),
             error=str(raw.get("error") or ""),
+            device_id=str(raw.get("device_id") or ""),
+            bind=dict(raw.get("bind") or {}),
+            analysis=dict(raw.get("analysis") or {}),
         )
 
 
@@ -127,8 +178,16 @@ class TaskSession:
         self.updated_at = _now()
 
     def pending_step(self) -> TaskStep | None:
-        """The next step that may be attempted, or ``None`` when the work is done."""
+        """The next step that may be attempted, or ``None`` when the work is done.
+
+        An ``analysis`` step is never returned: it is a place for an explanation the
+        diagnose route fills in, not a capability, and it carries no action type. The
+        skip lives here rather than at each call site so no future dispatcher can look
+        at the plan, see an unsettled step and try to run it.
+        """
         for step in self.steps:
+            if step.analysis:
+                continue
             if not step.settled:
                 return step
         return None
@@ -151,6 +210,18 @@ class TaskSession:
             "updated_at": self.updated_at,
             "steps": [step.to_dict() for step in self.steps],
         }
+
+    def to_storage(self) -> dict[str, Any]:
+        """The store's view: the client view plus everything restoration needs.
+
+        Kept as its own method so the difference between "what a client may see" and
+        "what makes the plan runnable again" is a named thing rather than an omission
+        somebody has to notice. A session written with :meth:`to_dict` still loads --
+        it just comes back without its binds, which is why only the store calls this.
+        """
+        out = self.to_dict()
+        out["steps"] = [step.to_storage() for step in self.steps]
+        return out
 
     @staticmethod
     def from_dict(raw: dict[str, Any]) -> TaskSession:

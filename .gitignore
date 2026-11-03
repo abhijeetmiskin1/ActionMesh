@@ -59,3 +59,16 @@ android-toolchain/
 *.keystore
 *.jks
 
+# Desktop shell dependencies and staged backend runtime — downloaded, regenerable.
+#   npm --prefix desktop ci
+#   python scripts/bundle_runtime.py
+desktop/node_modules/
+desktop/runtime/
+desktop/release/
+desktop/.stage/
+
+# Scratch working files from driving the API by hand. The outcomes worth keeping are
+# the tests under tests/; these are transcripts and local databases from a demo run.
+.demo/
+pytest-run.txt
+

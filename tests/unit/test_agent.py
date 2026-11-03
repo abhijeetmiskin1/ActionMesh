@@ -28,6 +28,7 @@ from actionmesh.agent.config import (
 from actionmesh.agent.definitions import (
     CAPABILITIES,
     IMPLEMENTED,
+    REQUIRING_DESKTOP,
     device_definitions,
     register_device_actions,
 )
@@ -38,7 +39,8 @@ from actionmesh.core.events import EventHub
 from actionmesh.core.identity import IdentityError, IdentityStore
 from actionmesh.core.permissions.catalog import is_concrete
 from actionmesh.core.registry import ActionRegistry
-from actionmesh.protocol.models import DeviceKind
+from actionmesh.core.permissions.risk import risk_rank
+from actionmesh.protocol.models import DeviceKind, RiskLevel
 
 
 class TestConfig(unittest.TestCase):
@@ -95,7 +97,13 @@ class TestConfig(unittest.TestCase):
         self.assertIn("device.server.start", advertised)
         with tempfile.TemporaryDirectory() as root:
             rooted = AgentConfig(device_id="laptop-1", workspace_root=root, allow_shell=True)
-        self.assertEqual(set(rooted.advertise()), set(IMPLEMENTED))
+        # Root + shell opens every capability that is gated on those two boundaries.
+        # The desktop capabilities are *not* opened by either: they need the third
+        # boundary (``allow_desktop``) and a reachable session, so they are excluded
+        # by name rather than by accident.
+        self.assertEqual(
+            set(rooted.advertise()), set(IMPLEMENTED) - set(REQUIRING_DESKTOP)
+        )
         self.assertIn("device.terminal.execute", rooted.advertise())
         self.assertIn("device.file.read", rooted.advertise())
 
@@ -105,9 +113,10 @@ class TestConfig(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             config = AgentConfig(device_id="laptop-1", workspace_root=root, allow_shell=True)
         advertised = set(config.advertise())
-        # Every capability the brief names is now both defined and implemented.
-        self.assertEqual(advertised, set(CAPABILITIES))
-        self.assertEqual(advertised, set(IMPLEMENTED))
+        # Every capability the brief names is defined; the desktop ones are defined
+        # but withheld until their own boundary is opened.
+        self.assertEqual(advertised, set(CAPABILITIES) - set(REQUIRING_DESKTOP))
+        self.assertEqual(advertised, set(IMPLEMENTED) - set(REQUIRING_DESKTOP))
         for capability in advertised:
             self.assertTrue(registry.has(capability), capability)
 
@@ -274,6 +283,37 @@ class TestPresence(unittest.TestCase):
         self.assertIn("device.file.read", device.capabilities)
         self.assertNotIn("device.terminal.execute", device.capabilities)
         self.assertFalse(device.online)
+
+    def test_the_enrolment_ceiling_matches_what_the_agent_advertises(self) -> None:
+        # A file root alone advertises writes and deletes too, which are HIGH. The
+        # ceiling has to admit the highest thing the agent advertises, or that
+        # capability is announced, approved, and then refused at dispatch -- the
+        # outcome the capability gates exist to prevent.
+        device = self._agent().register()
+        self.assertIs(device.risk_ceiling, RiskLevel.HIGH)
+        self.assertGreaterEqual(
+            risk_rank(device.risk_ceiling),
+            max(risk_rank(d.risk_level) for d in device_definitions()
+                if d.name in device.capabilities),
+        )
+
+    def test_a_machine_with_no_boundary_stays_at_the_fail_closed_floor(self) -> None:
+        self.config = AgentConfig(device_id="bare-1")
+        device = self._agent().register()
+        self.assertEqual(device.capabilities, [])
+        self.assertIs(device.risk_ceiling, RiskLevel.LOW)
+
+    def test_closing_a_boundary_lowers_the_ceiling_on_the_next_start(self) -> None:
+        # The ceiling is re-derived from configuration at every enrolment, so a
+        # boundary the operator closes takes effect on restart. Lowering needs no
+        # ceremony; raising is what `set_risk_ceiling` refuses.
+        self.config = AgentConfig(
+            device_id="laptop-1", workspace_root=self.root, allow_shell=True
+        )
+        held = self._agent().register()
+        self.assertIs(held.risk_ceiling, RiskLevel.CRITICAL)
+        self.config = AgentConfig(device_id="laptop-1", workspace_root=self.root)
+        self.assertIs(self._agent().register().risk_ceiling, RiskLevel.HIGH)
 
     def test_heartbeat_brings_the_device_into_presence(self) -> None:
         agent = self._agent()

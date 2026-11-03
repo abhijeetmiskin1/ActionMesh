@@ -59,6 +59,21 @@ _SCOPES: dict[str, Permission] = {
     "device.ide.open": Permission(
         "device.ide.open", "Open an IDE or editor on a project", RiskLevel.MEDIUM
     ),
+    # device screen + GUI (C38) — what a laptop-side agent may see and do on the
+    # desktop. Distinct from `device.control` (operating a *managed* device): these
+    # act on the local display and the local accessibility tree, and reading the
+    # screen is a separate, lower consent than driving a GUI, so they are two scopes,
+    # not one.
+    "device.screen.read": Permission(
+        "device.screen.read",
+        "Capture or inspect this laptop's screen and accessibility tree",
+        RiskLevel.MEDIUM,
+    ),
+    "device.screen.control": Permission(
+        "device.screen.control",
+        "Drive this laptop's GUI (click, type, scroll) via accessibility",
+        RiskLevel.HIGH,
+    ),
     # location
     "location.read": Permission("location.read", "Read device location", RiskLevel.HIGH),
     # payments

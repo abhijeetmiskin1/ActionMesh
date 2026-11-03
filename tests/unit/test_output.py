@@ -9,6 +9,7 @@ authorization decides who sees them.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -20,7 +21,15 @@ from actionmesh.agent.provider import LaptopProvider
 from actionmesh.agent.runner import CommandRunner
 from actionmesh.core.audit import AuditLog
 from actionmesh.core.events import EventHub
-from actionmesh.core.output import OutputPublisher, install, output_callback, uninstall
+from actionmesh.core.output import (
+    MAX_CHUNK_BYTES,
+    MAX_DOCUMENT_BYTES,
+    WHOLE_DOCUMENT_STREAMS,
+    OutputPublisher,
+    install,
+    output_callback,
+    uninstall,
+)
 from actionmesh.protocol.models import Action, MeshEvent
 
 
@@ -259,6 +268,86 @@ class TestOutputPublisher(unittest.TestCase):
         before = len(received)
         publisher.emit("stdout", "still more output")
         self.assertEqual(len(received), before)
+
+
+class TestWholeDocumentStreams(unittest.TestCase):
+    """An element list is one document, and a fragment of it parses to nothing.
+
+    The regression this pins down: a 200-element accessibility walk serialises to about
+    35 KB, and the byte-stream rule cut it at the 4 KB chunk ceiling. The UI received an
+    unparseable prefix, drew an empty list beside a non-zero element count, and told the
+    reader "the tree had no elements" -- contradicting the count printed next to it.
+    """
+
+    def _publisher(self, hub: EventHub, **kwargs: object) -> OutputPublisher:
+        return OutputPublisher(
+            hub, execution_id="e", action_id="a", node_id="n", actor="x", **kwargs  # type: ignore[arg-type]
+        )
+
+    def _emit_and_receive(
+        self, hub: EventHub, publisher: OutputPublisher, stream: str, chunk: str
+    ) -> list[MeshEvent]:
+        """Emit after the subscriber has registered, and collect what it saw."""
+        received: list[MeshEvent] = []
+
+        async def scenario() -> None:
+            subscription = hub.subscribe()
+            # subscribe() is an async generator: it registers on first advance, so the
+            # emit has to come after one turn of the loop.
+            task = asyncio.create_task(subscription.__anext__())
+            await asyncio.sleep(0)
+            publisher.emit(stream, chunk)
+            received.append(await asyncio.wait_for(task, timeout=1.0))
+            await subscription.aclose()
+
+        asyncio.run(scenario())
+        return received
+
+    def test_a_document_larger_than_the_chunk_ceiling_arrives_whole(self) -> None:
+        hub = EventHub()
+        # ~35 KB, the real shape of a full walk, and far past MAX_CHUNK_BYTES.
+        document = "[" + ",".join(['{"role":"push button"}'] * 1600) + "]"
+        self.assertGreater(len(document), MAX_CHUNK_BYTES)
+
+        got = self._emit_and_receive(hub, self._publisher(hub), "elements", document)
+
+        self.assertEqual(len(got), 1)  # one event, not nine chunks
+        self.assertEqual(got[0].payload["stream"], "elements")
+        self.assertFalse(got[0].payload["truncated"])
+        self.assertEqual(got[0].payload["chunk"], document)
+        # The claim under test: what the reader receives parses as a list.
+        self.assertEqual(len(json.loads(got[0].payload["chunk"])), 1600)
+
+    def test_a_document_over_its_ceiling_is_refused_rather_than_cut(self) -> None:
+        hub = EventHub()
+        publisher = self._publisher(hub, max_document_bytes=64)
+        got = self._emit_and_receive(hub, publisher, "elements", "[" + "1," * 200 + "1]")
+
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].payload["truncated"])
+        self.assertEqual(got[0].payload["chunk"], "")
+        # Never a fragment: an empty payload is honest, half a JSON array is not.
+        self.assertTrue(got[0].payload["final"])
+
+    def test_the_default_ceiling_is_the_document_constant(self) -> None:
+        # Guards the bound itself: a publisher with no override refuses at the constant.
+        hub = EventHub()
+        document = "[" + "0," * MAX_DOCUMENT_BYTES + "0]"
+        got = self._emit_and_receive(hub, self._publisher(hub), "elements", document)
+        self.assertTrue(got[0].payload["truncated"])
+        self.assertEqual(got[0].payload["chunk"], "")
+
+    def test_program_output_is_still_streamed_in_chunks(self) -> None:
+        # The whole-document rule must not turn a chatty program into one giant event.
+        hub = EventHub()
+        got = self._emit_and_receive(hub, self._publisher(hub), "stdout", "y" * 10000)
+        self.assertEqual(len(got[0].payload["chunk"]), MAX_CHUNK_BYTES)
+        self.assertTrue(got[0].payload["truncated"])
+
+    def test_only_the_element_stream_is_framed_as_a_document(self) -> None:
+        # The rule is a set, not a special case buried in a branch: this pins membership
+        # so adding a stream to it is a deliberate act with a test to match.
+        self.assertEqual(WHOLE_DOCUMENT_STREAMS, frozenset({"elements"}))
 
 
 class TestContextVarSeam(unittest.TestCase):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import UTC, datetime
 
 from actionmesh.core.graph import (
     GraphBuilder,
@@ -26,8 +27,10 @@ from actionmesh.core.graph import (
 from actionmesh.protocol.models import (
     Action,
     ActionGraph,
+    ActionState,
     GraphNode,
     NodeType,
+    RiskLevel,
 )
 from actionmesh.protocol.validate import ValidationError
 
@@ -366,6 +369,83 @@ class TestMalformedSerialization(unittest.TestCase):
         with self.assertRaises(GraphValidationError):
             graph_from_dict(payload)
         self.assertEqual(graph_from_dict(payload, validate=False).nodes, [])
+
+
+class TestActionDeserialization(unittest.TestCase):
+    """A restored action must be an action the engine can actually compare.
+
+    Wire data is JSON, so every enum arrives as a bare string and every timestamp
+    as text. Taking ``Action(**raw)`` would leave ``risk_level`` a ``str``; the
+    policy engine compares ``RiskLevel`` members, so the first symptom is a rule
+    that silently never matches rather than an exception.
+    """
+
+    def _wire_action(self) -> dict[str, object]:
+        return {
+            "type": "message.send",
+            "provider": "mock",
+            "parameters": {"message": "hello"},
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "action_id": "act_fixed",
+            "idempotency_key": "idem_fixed",
+            "state": "success",
+            "created_at": "2026-01-02T03:04:05+00:00",
+        }
+
+    def _round_trip(self, action: dict[str, object]) -> Action:
+        graph = graph_from_dict(
+            {
+                "nodes": [
+                    {"node_id": "a1", "node_type": "action", "action": action},
+                    {"node_id": "end", "node_type": "end"},
+                ]
+            }
+        )
+        node = next(n for n in graph.nodes if n.node_id == "a1")
+        assert node.action is not None
+        return node.action
+
+    def test_enums_become_enums(self) -> None:
+        action = self._round_trip(self._wire_action())
+        self.assertIs(action.risk_level, RiskLevel.HIGH)
+        self.assertIsInstance(action.risk_level, RiskLevel)
+
+    def test_identity_survives_serialization(self) -> None:
+        # ``validate_action`` refuses to take identity from untrusted input; the
+        # serializer is the exception, because dedupe depends on the same key coming
+        # back. Otherwise replaying a stored graph would run it a second time.
+        action = self._round_trip(self._wire_action())
+        self.assertEqual(action.action_id, "act_fixed")
+        self.assertEqual(action.idempotency_key, "idem_fixed")
+        self.assertEqual(action.created_at, datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC))
+
+    def test_untrusted_lifecycle_state_is_reset(self) -> None:
+        # A stored "success" describes how a previous run ended, not that this one
+        # has ended. Restoring it would present an unrun action as already done.
+        self.assertIs(self._round_trip(self._wire_action()).state, ActionState.CREATED)
+
+    def test_unparseable_timestamp_is_not_identity_worth_failing_over(self) -> None:
+        action = self._round_trip({**self._wire_action(), "created_at": "not a timestamp"})
+        self.assertEqual(action.action_id, "act_fixed")
+        self.assertIsInstance(action.created_at, datetime)
+
+    def test_malformed_action_is_rejected_as_a_graph_error(self) -> None:
+        for bad in (
+            {"type": "", "parameters": {}},
+            {"type": "message.send", "parameters": "nope"},
+            {"type": "message.send", "risk_level": "apocalyptic"},
+            {"parameters": {}},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(GraphValidationError):
+                graph_from_dict(
+                    {
+                        "nodes": [
+                            {"node_id": "a1", "node_type": "action", "action": bad},
+                            {"node_id": "end", "node_type": "end"},
+                        ]
+                    }
+                )
 
 
 class TestFailureClassification(unittest.TestCase):

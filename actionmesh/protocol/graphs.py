@@ -21,6 +21,22 @@ from actionmesh.protocol.validate import (
 )
 
 
+def _target_device(raw: dict[str, Any], path: str) -> str:
+    """Read an untrusted target device id, refusing a non-string.
+
+    An empty result means "the local machine". A *wrong* type is refused rather than
+    coerced: ``target_device_id: null`` from a planner that meant "no target" and
+    ``target_device_id: 7`` from one that meant a device must not both silently
+    become the local machine, because the local machine is a device too.
+    """
+    value = raw.get("target_device_id", "")
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise _fail("target_device_id must be a device id string", f"{path}.target_device_id", value)
+    return value.strip()
+
+
 def validate_graph(raw: Any, path: str = "graph") -> ActionGraph:
     """Validate an untrusted action graph: nodes, deps, no unknown references."""
     if isinstance(raw, ActionGraph):
@@ -62,7 +78,11 @@ def validate_graph(raw: Any, path: str = "graph") -> ActionGraph:
             if dep == node.node_id:
                 raise _fail("node cannot depend on itself", f"{path}.nodes", dep)
 
-    return ActionGraph(intent=str(raw.get("intent", "")), nodes=nodes)
+    return ActionGraph(
+        intent=str(raw.get("intent", "")),
+        nodes=nodes,
+        target_device_id=_target_device(raw, path),
+    )
 
 
 def validate_plan(raw: Any, path: str = "plan") -> ActionGraph:
@@ -84,7 +104,13 @@ def validate_plan(raw: Any, path: str = "plan") -> ActionGraph:
     ]
     for prev, cur in pairwise(nodes):
         cur.depends_on.append(prev.node_id)
-    return ActionGraph(intent=intent, nodes=nodes)
+    # A plan may *nominate* a target; it may not assert one. The value is carried
+    # through as a request and resolved against the device registry downstream, where
+    # ownership and online state are known. Dropping it here instead would make a
+    # "run it on my Mac" plan execute on whichever machine read the request.
+    return ActionGraph(
+        intent=intent, nodes=nodes, target_device_id=_target_device(raw, path)
+    )
 
 
 def classify_failure(reason: str) -> FailureKind:

@@ -711,6 +711,165 @@ class TestProcessesAndServers(_Fs):
             self.assertNotEqual(listed[0]["state"], "running", listed)
 
 
+class TestGuiEvidence(_Fs):
+    """C38: what a GUI action may and may not claim as evidence.
+
+    These do not need a desktop. The adapter is stubbed where a live tree would
+    otherwise be required, because the contract under test is the *provider's*: which
+    adapter outcomes are evidence and which are refusals that must not be counted as
+    one. The live round-trips are exercised separately when a desktop is present.
+    """
+
+    def _record(self, action_type: str, **recorded: object) -> Action:
+        # `direction` belongs to the request, not to the effect record; the echo
+        # below mirrors what the caller supplied, so it has to be in both places.
+        params = {"role": "button", "name": "Save", "window": "notes"}
+        if "direction" in recorded:
+            params["direction"] = str(recorded["direction"])
+        action = _action(action_type, **params)
+        self.provider._effects[action.action_id] = {
+            "action_type": action_type,
+            "idempotency_key": action.idempotency_key,
+            **recorded,
+        }
+        return action
+
+    def test_a_click_that_was_dispatchable_is_observable(self) -> None:
+        action = self._record("device.gui.click", status="dispatched", dispatched=True,
+                              role="button", name="Save", window="notes",
+                              state_changed=True)
+        observed = self.provider.observe(action)
+        self.assertIsNotNone(observed)
+        self.assertTrue(observed["state"]["dispatched"])
+        # The echo carries the target, so a click aimed somewhere else is refutable.
+        self.assertEqual(observed["parameters"]["role"], "button")
+        self.assertEqual(observed["parameters"]["name"], "Save")
+
+    def test_a_click_that_was_refused_observes_nothing(self) -> None:
+        for status in ("not_found", "ambiguous", "disabled", "not_actionable",
+                       "element_changed", "window_not_found"):
+            with self.subTest(status=status):
+                action = self._record("device.gui.click", status=status,
+                                      dispatched=False, role="button", name="Save")
+                self.assertIsNone(
+                    self.provider.observe(action),
+                    f"a {status!r} refusal must not be observable",
+                )
+
+    def test_a_typing_that_landed_observes_lengths_and_never_the_text(self) -> None:
+        action = self._record("device.gui.type", status="typed", typed=True,
+                              role="text", name="", inserted=19)
+        observed = self.provider.observe(action)
+        self.assertIsNotNone(observed)
+        self.assertEqual(observed["state"]["inserted"], 19)
+        # The text is not in the effect record, so it cannot leak through the
+        # observation into the journal or the dashboard.
+        self.assertNotIn("text", observed["parameters"])
+        self.assertNotIn("inserted", observed["parameters"])
+
+    def test_a_refused_typing_observes_nothing(self) -> None:
+        for status in ("not_editable", "disabled", "refused", "password", "invalid"):
+            with self.subTest(status=status):
+                action = self._record("device.gui.type", status=status, typed=False,
+                                      role="text", name="")
+                self.assertIsNone(self.provider.observe(action))
+
+    def test_a_scroll_that_moved_is_observed_as_moved(self) -> None:
+        action = self._record("device.gui.scroll", status="scrolled", moved=True,
+                              role="label", name="item 000", direction="bottom",
+                              offset_after=2114.0)
+        observed = self.provider.observe(action)
+        self.assertIsNotNone(observed)
+        self.assertTrue(observed["state"]["moved"])
+        self.assertEqual(observed["parameters"]["direction"], "bottom")
+
+    def test_an_offset_change_that_did_not_move_content_does_not_claim_motion(self) -> None:
+        action = self._record("device.gui.scroll", status="offset_changed", moved=False,
+                              role="label", name="item 000", direction="bottom",
+                              offset_after=900.0)
+        observed = self.provider.observe(action)
+        self.assertIsNotNone(observed)
+        self.assertFalse(
+            observed["state"]["moved"],
+            "the bar moved and the tree did not; claiming motion here would be a lie",
+        )
+        self.assertTrue(observed["state"]["bounds_unchanged"])
+
+    def test_a_scroll_that_could_not_scroll_observes_nothing(self) -> None:
+        for status in ("not_scrollable", "refused", "element_changed", "invalid"):
+            with self.subTest(status=status):
+                action = self._record("device.gui.scroll", status=status, moved=False,
+                                      role="label", name="item 000", direction="bottom")
+                self.assertIsNone(self.provider.observe(action))
+
+    def test_an_unknown_gui_status_observes_nothing(self) -> None:
+        action = self._record("device.gui.click", status="something_new")
+        self.assertIsNone(self.provider.observe(action))
+
+
+class TestScreen(_Fs):
+    """C38: the screen capabilities are real, and their evidence is honest.
+
+    These run against the actual desktop when there is one, and skip when there is
+    not — a test that invented a tree or a screenshot would be exactly the thing the
+    brief forbids. What is asserted is the *contract*: an inspection is witnessed by
+    its element count, and a capture the OS declined is never confirmable. A machine
+    where the portal grants the request exercises the other half of the second test.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        try:
+            from actionmesh.agent import device_screen
+        except Exception:  # pragma: no cover - import failure means no gi at all
+            self.skipTest("device_screen unavailable in this environment")
+        if not device_screen._gi_available() or not device_screen._atspi_available():
+            self.skipTest("no accessibility tree on this machine")
+        self.device_screen = device_screen
+
+    def test_an_inspection_is_witnessed_by_its_element_count(self) -> None:
+        action = _action("device.screen.inspect", max_elements=5)
+        result = asyncio.run(self.provider.execute(action))
+        self.assertTrue(result.ok)
+        self.assertFalse(result.simulated)
+        self.assertEqual(result.data.get("status"), "ok")
+        observed = self.provider.observe(action)
+        self.assertIsNotNone(observed, "an inspection that read a tree must be observable")
+        self.assertEqual(observed["state"]["elements"], result.data["element_count"])
+        self.assertLessEqual(observed["state"]["elements"], 5)
+
+    def test_a_declined_capture_is_never_confirmable(self) -> None:
+        action = _action("device.screen.capture")
+        result = asyncio.run(self.provider.execute(action))
+        status = result.data.get("status")
+        if status == "captured":
+            # The portal granted it on this machine. Then, and only then, is there
+            # something to witness: the frame's own dimensions.
+            observed = self.provider.observe(action)
+            self.assertIsNotNone(observed)
+            self.assertEqual(observed["state"]["width"], result.data["file"]["width"])
+        else:
+            # Declined or unreachable: reporting an observation here would let the
+            # verifier confirm a screen that was never read.
+            self.assertIn(status, {"cancelled", "unavailable"})
+            self.assertIsNone(
+                self.provider.observe(action),
+                f"a {status!r} capture must not be observable",
+            )
+
+    def test_an_inspection_of_no_tree_observes_nothing(self) -> None:
+        # Simulate the no-bus outcome the handler records, without pretending a tree
+        # was read: the observation must refuse to confirm it.
+        action = _action("device.screen.inspect")
+        self.provider._effects[action.action_id] = {
+            "action_type": "device.screen.inspect",
+            "status": "unavailable",
+            "window": "",
+            "count": None,
+        }
+        self.assertIsNone(self.provider.observe(action))
+
+
 class TestVerification(_Fs):
     """C6 must be able to check this provider's work without believing it."""
 

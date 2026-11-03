@@ -44,7 +44,9 @@ from actionmesh.agent.errors import (
 from actionmesh.agent.ides import KNOWN_IDES, EditorDiscovery, EditorNotFound
 from actionmesh.agent.paths import ResolvedPath, Workspace
 from actionmesh.agent.processes import (
+    EXITED,
     RUNNING,
+    STOPPED,
     MissingServerName,
     ProcessRecord,
     ProcessRegistry,
@@ -110,6 +112,11 @@ class LaptopProvider(ActionProvider):
             "device.project.list",
             "device.project.status",
             "device.project.open",
+            "device.screen.capture",
+            "device.screen.inspect",
+            "device.gui.click",
+            "device.gui.type",
+            "device.gui.scroll",
         }
     )
 
@@ -130,6 +137,16 @@ class LaptopProvider(ActionProvider):
             "device.app.close",
             "device.project.status",
             "device.project.open",
+            # C38: capture and inspect block on D-Bus / the accessibility bus, so they
+            # are awaited off the event loop like the socket probes above.
+            "device.screen.capture",
+            "device.screen.inspect",
+            # C38: the GUI actions walk and drive the accessibility tree over D-Bus.
+            # Every call is a blocking round-trip to another process, so they are
+            # awaited off the event loop for the same reason as the probes above.
+            "device.gui.click",
+            "device.gui.type",
+            "device.gui.scroll",
         }
     )
 
@@ -143,6 +160,7 @@ class LaptopProvider(ActionProvider):
         server_ready_s: float = SERVER_READY_S,
         log_dir: str = "",
         ledger: Any = None,
+        device_id: str = "",
     ) -> None:
         self.workspace = workspace
         #: The laptop's capability boundary. `None` means no program may be run at
@@ -170,6 +188,11 @@ class LaptopProvider(ActionProvider):
         #: as it was: nothing is journalled, and reconciliation then honestly reports
         #: that it has no evidence.
         self.ledger: Any = ledger
+        #: C36 — the registered computer this provider *is*. The executor refuses to
+        #: hand it a graph addressed to a different one; an empty value means "an
+        #: embedded provider that never declared itself", which is fine for a test and
+        #: is never enough to accept a named target.
+        self.device_id = device_id
         self.processes.journal = self._journal_child
 
     # -- dispatch ---------------------------------------------------------
@@ -235,6 +258,11 @@ class LaptopProvider(ActionProvider):
             "device.project.open": lambda: self._ide_open(action, project=True),
             "device.app.open": lambda: self._app_open(action),
             "device.app.close": lambda: self._app_close(action),
+            "device.screen.capture": lambda: self._screen_capture(action),
+            "device.screen.inspect": lambda: self._screen_inspect(action),
+            "device.gui.click": lambda: self._gui_click(action),
+            "device.gui.type": lambda: self._gui_type(action),
+            "device.gui.scroll": lambda: self._gui_scroll(action),
         }
         handler = handlers.get(action.type)
         if handler is None:
@@ -247,6 +275,11 @@ class LaptopProvider(ActionProvider):
             raise
         except AgentError as exc:
             raise ProviderError(str(exc), FailureKind.AUTHORIZATION) from exc
+        # Async handlers produce content too: an accessibility walk's element list is
+        # the whole point of `device.screen.inspect`, and it is stripped from the result
+        # payload by the safe view. Emitted after the handler returns, on the loop, for
+        # the same reason as the sync path.
+        self._stream_content(action, data)
         self._journal_effect(action)
         return ProviderResult(
             ok=True,
@@ -275,27 +308,47 @@ class LaptopProvider(ActionProvider):
         )
 
     def _stream_content(self, action: Action, data: dict[str, Any]) -> None:
-        """Send a file body to the observer that is already allowed to watch it.
+        """Send content to the observer that is already allowed to watch this execution.
 
-        The provider's own result keeps the content, because the verifier needs bytes to
-        compare against; the safe result view then strips it, because a result payload
-        reaches clients that never asked to read a file. That left a phone which
-        legitimately ran `device.file.read` looking at a size and nothing else. This is
-        the one channel built for content: transient, bounded, actor-scoped, never
-        audited and never replayed.
+        Two capabilities produce content: a file body, and the element list an
+        accessibility walk returns. The provider's own result keeps both, because the
+        verifier needs the real thing to check against; the safe result view then strips
+        them, because a result payload reaches clients that never asked for that content.
+        This is the one channel built for content: transient, bounded, actor-scoped,
+        never audited and never replayed.
+
+        Screen element *names* are content -- a window title, a document name, the text
+        of a label -- so they travel here and not in the result. The result keeps the
+        count and the refusal reason, which is what a caller needs to know that an
+        observation happened at all.
 
         Emitted here, on the event loop, and not from inside ``_perform``: the sync
         handlers run in a worker thread, and waking a queue belonging to another thread
         is not something ``asyncio.Queue`` survives.
         """
-        if action.type != "device.file.read" or data.get("binary"):
-            # A PNG into a <pre> is not a preview; it is a wall of replacement
-            # characters wearing someone's filename.
+        if action.type == "device.file.read":
+            if data.get("binary"):
+                # A PNG into a <pre> is not a preview; it is a wall of replacement
+                # characters wearing someone's filename.
+                return
+            emit = output_callback()
+            if emit is not None:
+                emit("content", str(data.get("content") or ""))
             return
-        emit = output_callback()
-        if emit is None:
-            return
-        emit("content", str(data.get("content") or ""))
+        if action.type == "device.screen.inspect" and data.get("status") == "ok":
+            emit = output_callback()
+            if emit is not None:
+                # One whole JSON array in one event. The `elements` stream is framed as a
+                # document, not as bytes: a reader given the first 4 KB of this array has
+                # nothing, and the count in the result would then sit beside an empty
+                # list the reader could only read as "the tree held nothing".
+                emit("elements", json.dumps(data.get("elements") or [], default=str))
+                if data.get("truncated"):
+                    # The walk itself hit its element or depth ceiling. The names that
+                    # did arrive are real; the ones past the ceiling were never read,
+                    # and the panel is told so rather than left to infer completeness.
+                    emit("elements.note", "the walk reached its element ceiling; "
+                         "elements past it are not listed")
 
     # -- files ------------------------------------------------------------
     def _list(self, action: Action, workspace: Workspace, params: dict[str, Any]) -> dict[str, Any]:
@@ -1116,6 +1169,177 @@ class LaptopProvider(ActionProvider):
         }
         return {"closed": records, "count": len(records)}
 
+    # -- screen + GUI (C38) -----------------------------------------------
+    async def _screen_capture(self, action: Action) -> dict[str, Any]:
+        """One screenshot, through the OS portal, never a retained image.
+
+        The blocking D-Bus round-trip runs in a worker thread so the server's event loop
+        is not held while the portal waits for a person to answer. The result is what the
+        portal said: ``captured`` with a transient file reference and its dimensions, or
+        ``cancelled`` / ``unavailable`` with the reason. There is no simulated image and
+        no "close enough" fallback — a screen that was not captured says so.
+        """
+        from actionmesh.agent import device_screen
+
+        data = await asyncio.to_thread(device_screen.capture_screenshot)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "status": data.get("status"),
+            # Only the shape is remembered, never the pixels and never the URI's
+            # lifetime-bounded path as anything more than a witness that a capture
+            # happened.
+            "width": (data.get("file") or {}).get("width"),
+            "height": (data.get("file") or {}).get("height"),
+        }
+        return data
+
+    async def _screen_inspect(self, action: Action) -> dict[str, Any]:
+        """Describe the accessibility tree, honestly and bounded."""
+        from actionmesh.agent import device_screen
+
+        params = action.parameters
+        window = params.get("window")
+        if window is not None and not isinstance(window, str):
+            raise ProviderError("window must be a string", FailureKind.INVALID_INPUT)
+        raw_max = params.get("max_elements")
+        if raw_max is not None:
+            if not isinstance(raw_max, int) or isinstance(raw_max, bool) or raw_max < 1:
+                raise ProviderError(
+                    "max_elements must be a positive integer", FailureKind.INVALID_INPUT
+                )
+            max_elements = min(raw_max, device_screen._MAX_ELEMENTS)
+        else:
+            max_elements = device_screen._MAX_ELEMENTS
+        data = await asyncio.to_thread(
+            device_screen.inspect_gui, window or "", max_elements
+        )
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "status": data.get("status"),
+            "window": (window or "").strip(),
+            "count": data.get("element_count"),
+        }
+        return data
+
+    # -- GUI actions (C38) -------------------------------------------------
+    # One shape for all three: validate the target parameters, call the adapter in a
+    # worker thread, and record only what the adapter *witnessed*. The adapter's
+    # return value distinguishes "the toolkit accepted the call" from "the effect is
+    # visible", and both halves are kept -- verification reads the recorded witness,
+    # while the caller reads `status`.
+    #
+    # None of these re-read the screen a second time from here. The adapter already
+    # read the state before and after the operation (a click's before/after states, a
+    # type's character counts, a scroll's offsets and anchor geometry), and that
+    # read-back is the independent observation. Doing it again against a tree that a
+    # real application may have changed in the meantime would produce a second, later
+    # answer and then present it as if it were the first.
+
+    def _gui_target(self, params: dict[str, Any]) -> tuple[str, str, str | None]:
+        role = params.get("role")
+        name = params.get("name")
+        window = params.get("window")
+        if not isinstance(role, str) or not role:
+            raise ProviderError("role must be a non-empty string", FailureKind.INVALID_INPUT)
+        if not isinstance(name, str):
+            raise ProviderError("name must be a string", FailureKind.INVALID_INPUT)
+        if window is not None and not isinstance(window, str):
+            raise ProviderError("window must be a string", FailureKind.INVALID_INPUT)
+        return role, name, (window or None)
+
+    def _record_gui(
+        self,
+        action: Action,
+        data: dict[str, Any],
+        *,
+        role: str,
+        name: str,
+        window: str | None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Remember the target and the witnessed outcome, never the payload.
+
+        The text a ``device.gui.type`` inserts is deliberately absent: it may be a
+        message body, a query, or a credential, and the effect record is read by the
+        verifier, journalled for restart recovery, and surfaced in the dashboard. What
+        survives is the length, which is enough to check the write landed.
+        """
+        record: dict[str, Any] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "status": data.get("status"),
+            "role": role,
+            "name": name,
+        }
+        if window:
+            record["window"] = window
+        if extra:
+            record.update(extra)
+        self._effects[action.action_id] = record
+
+    async def _gui_click(self, action: Action) -> dict[str, Any]:
+        from actionmesh.agent import device_screen
+
+        role, name, window = self._gui_target(action.parameters)
+        data = await asyncio.to_thread(
+            device_screen.click_element, role, name, window
+        )
+        observed = data.get("observed") or {}
+        self._record_gui(
+            action, data, role=role, name=name, window=window,
+            extra={
+                "dispatched": bool(data.get("dispatched")),
+                "state_changed": observed.get("state_changed"),
+            },
+        )
+        return data
+
+    async def _gui_type(self, action: Action) -> dict[str, Any]:
+        from actionmesh.agent import device_screen
+
+        role, name, window = self._gui_target(action.parameters)
+        text = action.parameters.get("text")
+        if not isinstance(text, str) or not text:
+            raise ProviderError("text must be a non-empty string", FailureKind.INVALID_INPUT)
+        data = await asyncio.to_thread(
+            device_screen.type_text, role, name, text, window
+        )
+        lengths = data.get("length") or {}
+        self._record_gui(
+            action, data, role=role, name=name, window=window,
+            # Lengths only. `inserted` is the adapter's own arithmetic over the
+            # character count it read back, not a count of characters it was handed.
+            extra={
+                "typed": bool(data.get("typed")),
+                "inserted": lengths.get("inserted"),
+            },
+        )
+        return data
+
+    async def _gui_scroll(self, action: Action) -> dict[str, Any]:
+        from actionmesh.agent import device_screen
+
+        role, name, window = self._gui_target(action.parameters)
+        direction = action.parameters.get("direction")
+        if not isinstance(direction, str) or not direction:
+            raise ProviderError(
+                "direction must be one of top/bottom/left/right", FailureKind.INVALID_INPUT
+            )
+        data = await asyncio.to_thread(
+            device_screen.scroll_element, role, name, direction, window
+        )
+        self._record_gui(
+            action, data, role=role, name=name, window=window,
+            extra={
+                "direction": direction,
+                "moved": bool(data.get("moved")),
+                "offset_after": (data.get("offset") or {}).get("after"),
+            },
+        )
+        return data
+
     # -- verification -----------------------------------------------------
     # -- dispatch ledger --------------------------------------------------
     def _save_row(self, action_id: str, **changes: Any) -> None:
@@ -1191,6 +1415,25 @@ class LaptopProvider(ActionProvider):
             action_id=row.get("action_id") or "",
         )
 
+    @staticmethod
+    def _observed_action_state(row: dict[str, Any], *, running: bool) -> str:
+        """What is true of this action now, read from the kernel rather than the row.
+
+        The ledger's ``state`` column is written when something *notices* a child
+        ending. When the process that would have noticed is killed -- which is exactly
+        the crash this evidence exists for -- the row keeps saying ``running`` about a
+        pid that no longer exists. Repeating that text to the control plane would make
+        a finished run permanently un-settleable, so a dead pid is reported as
+        ``exited`` with an exit code the machine never supplied: the effect happened,
+        and its outcome is unknown.
+        """
+        if running:
+            return RUNNING
+        recorded = row.get("state") or RUNNING
+        if recorded != RUNNING:
+            return str(recorded)
+        return EXITED if row.get("pid") else STOPPED
+
     def execution_evidence(self, execution_id: str) -> dict[str, Any] | None:
         """What became of the work this execution ordered, as the machine says now.
 
@@ -1221,17 +1464,31 @@ class LaptopProvider(ActionProvider):
                 handles.append(record.process_id or row["action_id"])
             if record.exit_code is not None:
                 last_exit = record.exit_code
+            observed = self._observed_action_state(row, running=running)
             actions.append(
                 {
                     "action_id": row["action_id"],
                     "process_id": record.process_id,
-                    "state": RUNNING if running else row["state"],
-                    "exit_code": record.exit_code,
+                    # What the machine says now, not what the ledger last wrote. A row
+                    # still says `running` when the process that started it died before
+                    # reaping, and forwarding that text would tell the control plane a
+                    # dead child is alive -- so it can never settle the run.
+                    "state": observed,
+                    # An exit code only exists if something reaped the child. A dead
+                    # pid found by reading /proc has *ended*, but nothing saw it end:
+                    # copying the last code this agent remembers from some other run
+                    # would attribute a verdict to a process that never reported one,
+                    # and verification would then confirm or refute the wrong claim.
+                    "exit_code": None if observed == EXITED else record.exit_code,
                 }
             )
         if live:
             state = "running"
-        elif any(row["exit_code"] is not None or row["state"] != RUNNING for row in rows):
+        elif any(
+            row["exit_code"] is not None
+            or self._observed_action_state(row, running=False) != RUNNING
+            for row in rows
+        ):
             # Nothing is alive and something finished: that is an answer, and the exit
             # code in it is the kernel's, not this process's memory of one.
             state = "exited"
@@ -1274,6 +1531,83 @@ class LaptopProvider(ActionProvider):
                 unconfirmed.append(handle)
         return {"stopped": stopped, "already_gone": already_gone, "unconfirmed": unconfirmed}
 
+    def _observe_gui(
+        self, action: Action, recorded: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """What the machine's own read-back showed, for one GUI action.
+
+        ``recorded`` holds only what the adapter witnessed. The parameter echo below
+        carries the *restricted* parameter set -- role, label and, when one was given,
+        the window -- and deliberately never the inserted text. ``_assess`` compares
+        every key the request supplied that also appears here, so a mismatch in the
+        echo is refuted; omitting a key skips the comparison rather than failing it.
+        """
+        params: dict[str, Any] = {
+            "role": recorded.get("role"),
+            "name": recorded.get("name"),
+        }
+        window = action.parameters.get("window")
+        if window:
+            params["window"] = window
+        direction = action.parameters.get("direction")
+        if direction:
+            params["direction"] = direction
+
+        status = recorded.get("status")
+        base = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "parameters": params,
+        }
+
+        if action.type == "device.gui.click":
+            # Only a toolkit call that was actually made is evidence. `refused` means
+            # `do_action` returned False; the rest are refusals in which no call was
+            # made at all.
+            if not recorded.get("dispatched"):
+                return None
+            return {
+                **base,
+                "state": {"dispatched": True,
+                          "state_changed": recorded.get("state_changed")},
+            }
+        if action.type == "device.gui.type":
+            if not recorded.get("typed"):
+                return None
+            # `inserted` is the difference between the character count read before the
+            # write and the one read after it, so it is the field's own answer to "did
+            # this land" -- not a count of what was handed over.
+            return {**base, "state": {"typed": True,
+                                      "inserted": recorded.get("inserted")}}
+        if action.type == "device.gui.scroll":
+            if status == "scrolled":
+                return {
+                    **base,
+                    "state": {"moved": bool(recorded.get("moved")),
+                              "offset": recorded.get("offset_after")},
+                }
+            if status == "offset_changed":
+                # The bar moved and the anchor's reported bounds did not. Saying so is
+                # the honest report; the accessibility tree cannot witness the content
+                # moving, and this does not claim it did.
+                return {
+                    **base,
+                    "state": {"moved": False, "offset": recorded.get("offset_after"),
+                              "bounds_unchanged": True},
+                }
+            if status == "already_at_edge":
+                # Nothing was dispatched because the region was already where the
+                # request asked it to be. That is the requested state, observed --
+                # confirmation here is a statement about the edge, never about motion.
+                return {
+                    **base,
+                    "state": {"moved": False,
+                              "offset": recorded.get("offset_after"),
+                              "already_at_edge": True},
+                }
+            return None
+        return None
+
     def observe(self, action: Action) -> dict[str, Any] | None:
         """Re-read the effect from the filesystem. Nothing here is remembered.
 
@@ -1305,10 +1639,59 @@ class LaptopProvider(ActionProvider):
             # time would build a description of a description -- and report an exit code
             # of None for a command that exited 0.
             return recovered
+        # -- screen capabilities, deliberately above the workspace guard ---------
+        # `observe()` below starts by refusing to answer without a workspace root,
+        # because most branch below rebuilds a path. Screen work has no path: it reads
+        # the accessibility tree and the OS portal, neither of which lives under the
+        # configured root. Answering these before the guard is what lets an agent with
+        # a desktop and no workspace (a perfectly ordinary configuration) still have
+        # its screen actions verified.
+        action_type = recorded.get("action_type")
+        if action_type == "device.screen.capture":
+            # A capture is evidenced by the portal having returned a frame, and by that
+            # frame's own dimensions -- never by the image, which is not retained. A
+            # capture the portal declined is *not* confirmable: returning a shape for it
+            # would let verification confirm a screen that was never read, which is the
+            # one thing this capability must never do.
+            if recorded.get("status") != "captured":
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {},
+                "state": {
+                    "width": recorded.get("width"),
+                    "height": recorded.get("height"),
+                },
+            }
+        if action_type == "device.screen.inspect":
+            # The observation is that a tree was walked and how many elements it held.
+            # An inspection that could not read the tree (no bus, no gi) was not an
+            # inspection, and observing nothing says exactly that.
+            if recorded.get("status") != "ok":
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"window": recorded.get("window", "")},
+                "state": {"elements": recorded.get("count")},
+            }
+        # -- GUI actions, same reason for sitting above the workspace guard ---------
+        # These read and drive the accessibility tree, which has no path under the
+        # configured root. The observation is the adapter's own read-back (the click's
+        # before/after states, the field's character counts, the scroll bar's offsets),
+        # narrowed to the keys the caller actually supplied.
+        #
+        # A refusal is *not* an observation. Every branch that reports "nothing was
+        # invoked" -- the target was missing, ambiguous, disabled, uneditable, or
+        # changed under us -- returns None here rather than returning its own name and
+        # letting the verifier count that as a match. `observe()` answering "yes" to a
+        # request that was refused is the exact shape of a false confirmation.
+        if action_type in {"device.gui.click", "device.gui.type", "device.gui.scroll"}:
+            return self._observe_gui(action, recorded)
         workspace = self.workspace
         if workspace is None:
             return None
-        action_type = recorded.get("action_type")
         if action_type in {"device.process.list", "device.project.list"}:
             return {
                 "action_type": action.type,

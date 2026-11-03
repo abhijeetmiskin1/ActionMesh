@@ -178,7 +178,19 @@ class PolicyEngine:
                 reasons.append("awaiting user approval")
 
         if not reasons:
-            reasons.append("policy allowed")
+            # A decision with no explanation is the one a reader most needs to
+            # understand, so it is never left blank -- but it must not be narrated as
+            # the decision it is not. Falling through to the policy default (DENY)
+            # arrives here with nothing appended, and calling that "policy allowed"
+            # would seal the opposite of what happened into the audit chain.
+            if decision is PolicyDecision.DENY:
+                reasons.append(
+                    "no policy rule allows this action; the default decision is deny"
+                )
+            elif decision is PolicyDecision.ASK:
+                reasons.append("awaiting user approval")
+            else:
+                reasons.append("policy allowed")
 
         return PolicyOutcome(
             decision=decision,

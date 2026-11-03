@@ -157,6 +157,18 @@ class TestConsentStore(unittest.TestCase):
         self.assertEqual(store.revoke("message.send"), 1)
         self.assertEqual(len(store), 0)
 
+    def test_revoke_named_actor_leaves_the_other_actors_grant(self) -> None:
+        # Two humans can hold the same scope. Withdrawing one grant must not strip
+        # the other's permission: removing consent is the safe direction, but only
+        # for the actor that asked.
+        store = ConsentStore()
+        store.grant(Consent(scope="message.send", granted_by="alice"))
+        store.grant(Consent(scope="message.send", granted_by="bob"))
+        self.assertEqual(store.revoke("message.send", granted_by="alice"), 1)
+        self.assertEqual([c.granted_by for c in store.consents("message.send")], ["bob"])
+        self.assertEqual(store.revoke("message.send", granted_by="alice"), 0)
+        self.assertEqual(len(store), 1)
+
     def test_grants_flattens_consents(self) -> None:
         store = ConsentStore()
         store.grant(Consent(scope="message.send", max_risk=RiskLevel.HIGH))

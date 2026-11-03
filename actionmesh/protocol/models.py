@@ -245,6 +245,13 @@ class ActionGraph(MeshModel):
     intent: str = ""
     nodes: list[GraphNode] = field(default_factory=list)
     created_at: datetime = field(default_factory=_utcnow)
+    #: C36 — which computer this graph is addressed to. This is a *routing
+    #: request*, not an authority: the executor resolves it through the device
+    #: registry and refuses to run if the device is unknown, offline, revoked, or
+    #: belongs to someone else. The planner may propose it; only the registry
+    #: decides whether it is a real target. Empty means "the local machine", which
+    #: is what every pre-C36 caller already meant.
+    target_device_id: str = ""
 
 
 @dataclass
@@ -335,6 +342,15 @@ class ExecutionRecord(MeshModel):
     #: Cancellation addressed at the execution rather than at whichever task happens
     #: to hold it: any request can record the request, the owner honours it.
     cancel_requested: bool = False
+    #: C36 — which computer this run was routed to, resolved before dispatch. Kept on
+    #: the record rather than only in the request so an offline target, a refusal, and
+    #: a completed run can all be attributed to a machine after the fact. Empty means
+    #: the local machine, which is what every pre-C36 record was.
+    device_id: str = ""
+    #: The device's human name as it stood when the run was admitted. Denormalised on
+    #: purpose: a record that has to re-open the registry to be readable would change
+    #: meaning when the device is renamed or forgotten.
+    device_name: str = ""
 
 
 @dataclass
@@ -401,3 +417,25 @@ class DeviceInfo(MeshModel):
     #: Opaque identity minted by :mod:`actionmesh.core.identity`. Empty until the
     #: device is enrolled; an unenrolled device can be *seen* but never authorized.
     identity_id: str = ""
+
+    # -- C36: what a multi-computer registry has to keep per machine ------------
+    #: CPU architecture, e.g. ``x86_64`` / ``arm64``. A capability list is not
+    #: enough to decide what will run: a build for the wrong arch is a failure
+    #: that happens after dispatch, which is exactly where it must not happen.
+    arch: str = ""
+    #: The desktop application version, kept apart from ``agent_version``: the UI
+    #: and the managed agent can be upgraded independently, and a dashboard that
+    #: conflates them cannot tell a stale app from a stale agent.
+    app_version: str = ""
+    #: The highest risk this device may be asked to perform. Chosen by its owner
+    #: when it is enrolled and never raised by pairing — see
+    #: :meth:`DeviceRegistry.set_risk_ceiling`. ``LOW`` is the fail-closed default.
+    risk_ceiling: RiskLevel = RiskLevel.LOW
+    #: When the device was admitted to this mesh. Registration is an event, not a
+    #: property of the current heartbeat, so a device that goes quiet keeps its age.
+    registered_at: datetime | None = None
+    #: The last moment a *connection* was established, as opposed to
+    #: ``last_seen`` (the last heartbeat). A device that reconnects after a long
+    #: absence has a recent connection time and a stale-until-now presence, and
+    #: the difference is what a human reads as "it came back".
+    last_connected_at: datetime | None = None

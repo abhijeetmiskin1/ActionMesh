@@ -163,6 +163,9 @@ footer { margin-top: 20px; font-size: 11.5px; color: var(--ink-faint); }
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--bad); margin-right: 6px; }
 .dot.live { background: var(--accent); }
 .chip { font-size: 12px; color: var(--ink-soft); border: 1px solid var(--card-edge); border-radius: 999px; padding: 3px 10px; }
+/* An offline target is the one state a person must not miss: the step will be refused. */
+.chip[data-online="false"] { color: var(--warn); border-color: rgba(255, 191, 107, 0.45); }
+.chip[data-online="unknown"] { color: var(--ink-faint); border-style: dashed; }
 .result-line { font-size: 13.5px; margin: 0 0 6px; }
 #resultLine, #execHead { font-size: 14px; }
 .result-line.verified { color: var(--accent); }
@@ -179,7 +182,7 @@ footer { margin-top: 20px; font-size: 11.5px; color: var(--ink-faint); }
     <div class="brand">VoiceOS<small>conversational task control over the ActionMesh pipeline</small></div>
     <p class="status-line"><span id="serviceDot" class="dot"></span><span id="service">Checking the service…</span></p>
     <p class="status-line" id="identity">Checking this session…</p>
-    <p class="status-line"><span class="chip" id="deviceChip">Checking the laptop…</span></p>
+    <p class="status-line"><span class="chip" id="deviceChip">Checking the target computer…</span></p>
   </div>
   <a class="nav" href="/dashboard">Control room</a>
 </header>
@@ -252,14 +255,14 @@ footer { margin-top: 20px; font-size: 11.5px; color: var(--ink-faint); }
 <section class="card">
   <h2>Where your voice goes</h2>
   <p class="privacy">Recognition is performed by <strong>your browser's own speech service</strong>. On desktop Chrome
-  that audio goes to the browser vendor, not to this laptop and not to us; on Android it is handled by Google's
+  that audio goes to the browser vendor, not to this service and not to us; on Android it is handled by Google's
   speech service, and in a WebView or a browser without recognition there is no microphone path at all — you type
   instead. <strong>ActionMesh receives text</strong>: the transcript, and nothing else. This page has no audio
-  capture, stores nothing on your device, and keeps no recording — the conversation lives on the laptop as task
-  state, never as audio.</p>
+  capture, stores nothing on your device, and keeps no recording — the conversation lives on the control service
+  as task state, never as audio.</p>
 </section>
 
-<footer id="capabilityCount">Loading the laptop's capability list…</footer>
+<footer id="capabilityCount">Loading the capability list…</footer>
 </main>
 
 <script>
@@ -325,7 +328,11 @@ const state = {
   sessionId: '', task: null, executionId: null, running: false, cancelRequested: false,
   output: '', nodes: {}, recognizer: null, listening: false,
   transcriptDirty: false, writing: false, speakEnabled: true,
-  reported: null, reattachedTo: ''
+  reported: null, reattachedTo: '',
+  // The computer the next step will be addressed to, as /voiceos/conversation resolved
+  // it. Held here only so the status lines can name it; the server resolves it again
+  // when the step runs, and that resolution is the one with authority.
+  target: { id: '', name: '', online: false }
 };
 // Which outcomes are actually over. `waiting_permission` is deliberately absent: a run
 // that parks publishes `execution.completed` because the *request* ended, not the
@@ -361,6 +368,15 @@ const syncTranscript = () => {
 
 // -- conversation --
 const renderConversation = conversation => {
+  // Every conversation read carries the target resolution, so the chip is refreshed
+  // from the same response the history is -- there is no second endpoint whose idea of
+  // the target could go stale first.
+  state.target = {
+    id: (conversation && conversation.target_device) || '',
+    name: (conversation && conversation.target_name) || '',
+    online: !!(conversation && conversation.target_online)
+  };
+  paintDevices(conversation);
   const list = el('convoList');
   list.replaceChildren();
   const history = (conversation && conversation.history) || [];
@@ -411,8 +427,8 @@ const sendMessage = async body => {
     return answer;
   } catch (error) {
     setMessage(error.message, true);
-    setPhase('error', 'The laptop could not answer.');
-    speak('I could not reach the laptop.');
+    setPhase('error', 'The service could not answer.');
+    speak('I could not reach the service.');
     return null;
   } finally {
     button.disabled = false;
@@ -539,7 +555,7 @@ const runTask = async () => {
   el('liveOutput').textContent = '';
   el('cancelStatus').textContent = '';
   el('execHead').textContent = 'Asking the executor to advance one step…';
-  setPhase('running', 'Working…');
+  setPhase('running', runningLine());
   // Subscribe before asking: output is transient and never replayed, so a page that
   // opens the stream after the response has already missed the run it reports.
   state.reported = null;
@@ -560,7 +576,7 @@ const runTask = async () => {
       await refreshApprovals();
     }
   } catch (error) {
-    el('execHead').textContent = 'The laptop refused the step.';
+    el('execHead').textContent = targetLine() + ' refused the step.';
     setMessage(error.message, true);
     setPhase('error', 'Refused.');
     speak('The step was refused.');
@@ -572,7 +588,7 @@ el('runTask').addEventListener('click', runTask);
 const cancelTask = async () => {
   if (!state.sessionId) return;
   state.cancelRequested = true;
-  el('cancelStatus').textContent = 'Cancellation requested — waiting for the laptop to confirm.';
+  el('cancelStatus').textContent = 'Cancellation requested — waiting for ' + targetLine() + ' to confirm.';
   setPhase('running', 'Cancelling…');
   try {
     const answer = await post('/voiceos/sessions/' + encodeURIComponent(state.sessionId) + '/cancel', {});
@@ -585,7 +601,7 @@ const cancelTask = async () => {
     speak('Cancellation requested.');
     loadTask();
   } catch (error) {
-    el('cancelStatus').textContent = 'The laptop refused the cancellation: ' + error.message;
+    el('cancelStatus').textContent = targetLine() + ' refused the cancellation: ' + error.message;
   }
 };
 el('cancelTask').addEventListener('click', cancelTask);
@@ -669,11 +685,21 @@ const STEPS = [
   ['planned', 'Plan prepared'],
   ['permission', 'Permission check'],
   ['approval', 'Waiting for your approval'],
-  ['running', 'Running on the laptop'],
+  ['running', 'Running'],
   ['output', 'Streaming output'],
   ['verifying', 'Verifying the result'],
   ['result', 'Result reported']
 ];
+//: The line beside the running step. It names the computer rather than saying "the
+//: laptop", because with more than one registered, "the laptop" is an assertion the
+//: page cannot make -- and naming the wrong one is exactly the failure this page is
+//: supposed to make impossible.
+const runningLine = () => state.target.id
+  ? 'Running on ' + (state.target.name || state.target.id) + '…'
+  : 'Running…';
+const targetLine = () => state.target.id
+  ? (state.target.name || state.target.id)
+  : 'the selected computer';
 const stepRows = new Map();
 const resetTimeline = () => {
   const list = el('timeline');
@@ -729,7 +755,7 @@ const bindStream = source => {
     if (!state.executionId || data.execution_id !== state.executionId) return;
     handler(data.payload || {}, data);
   });
-  on('node.started', () => { markStep('running', true); setPhase('running', 'Running on the laptop…'); });
+  on('node.started', () => { markStep('running', true); setPhase('running', runningLine()); });
   on('authorization.decided', () => markStep('permission', true));
   on('approval.required', () => {
     markStep('approval', 'pending');
@@ -891,14 +917,14 @@ const showResult = result => {
 const cancelRun = async () => {
   if (!state.executionId) return;
   el('cancelRun').disabled = true;
-  el('cancelStatus').textContent = 'Cancellation requested — waiting for the laptop to confirm.';
+  el('cancelStatus').textContent = 'Cancellation requested — waiting for ' + targetLine() + ' to confirm.';
   state.cancelRequested = true;
   setPhase('running', 'Cancelling…');
   try {
     await post('/executions/' + encodeURIComponent(state.executionId) + '/cancel', {});
     speak('Cancellation requested.');
   } catch (error) {
-    el('cancelStatus').textContent = 'The laptop refused the cancellation: ' + error.message;
+    el('cancelStatus').textContent = targetLine() + ' refused the cancellation: ' + error.message;
     el('cancelRun').disabled = false;
   }
 };
@@ -1024,7 +1050,7 @@ const wireRecognizer = recognizer => {
       return;
     }
     setTranscript(finalText);
-    // Understanding is inert: it asks what the laptop would propose. Running is a press.
+    // Understanding is inert: it asks what ActionMesh would propose. Running is a press.
     setPhase('running', 'Processing…');
     sendMessage({...identityBody(), text: finalText});
   };
@@ -1048,18 +1074,45 @@ const paintIdentity = () => {
     ? 'Paired device session — the server decides what this request may do.'
     : 'Local operator session — no pairing token in this tab.';
 };
-const paintDevices = list => {
+const paintDevices = conversation => {
+  // The chip reports the *target*, not a device list. Those were the same thing when
+  // one laptop was the only thing this server could serve; they are not the same thing
+  // now, and a chip naming "the first online laptop" would be naming a computer the
+  // next command does not necessarily run on.
   const chip = el('deviceChip');
-  const laptops = (list || []).filter(device => device.online);
-  if (!laptops.length) {
-    chip.textContent = 'No laptop online — actions will be refused';
+  const id = (conversation && conversation.target_device) || '';
+  const name = (conversation && conversation.target_name) || '';
+  if (id) {
+    const online = !!(conversation && conversation.target_online);
+    chip.textContent = 'Target computer: ' + (name || id) + ' · ' + (online ? 'online' : 'offline');
+    chip.dataset.online = online ? 'true' : 'false';
+    chip.title = online
+      ? 'Steps are addressed to ' + id + ' (' + (name || id) + ').'
+      : 'This computer is offline. A step addressed to it will be refused, not re-routed.';
     return;
   }
-  // One agent serves this server, so the chip names it truthfully rather than offering
-  // a picker that would change nothing about where the action runs.
-  const first = laptops[0];
-  chip.textContent = (first.name || first.device_id) + ' · online'
-    + (laptops.length > 1 ? ' · ' + laptops.length + ' registered, one agent per server' : '');
+  // Nothing chosen. Say which of the two reasons it is -- a tie needs an answer from
+  // the user, and an empty registry needs a computer registered -- rather than
+  // pretending a default exists.
+  const candidates = (conversation && conversation.target_candidates) || [];
+  const reason = (conversation && conversation.target_reason) || '';
+  const fallback = (conversation && conversation.default_target) || '';
+  const fallbackName = (conversation && conversation.default_target_name) || '';
+  if (candidates.length) {
+    chip.textContent = 'Target computer: not chosen — ' + candidates.length + ' match';
+    chip.title = 'Which computer: ' + candidates.map(item => item.name || item.device_id).join(', ')
+      + '. Say "switch to <name>" to choose one.';
+  } else if (fallback) {
+    // A default exists but has not been selected into the conversation yet. Naming it
+    // as the default (not as the target) keeps the difference visible.
+    chip.textContent = 'Target computer: none selected — default ' + (fallbackName || fallback);
+    chip.title = 'The next step will go to ' + (fallbackName || fallback)
+      + ' unless you choose another computer.';
+  } else {
+    chip.textContent = 'Target computer: none — ' + (reason || 'no computer is registered');
+    chip.title = reason || 'No computer is registered as an execution target.';
+  }
+  chip.dataset.online = 'unknown';
 };
 const ping = async () => {
   const dot = el('serviceDot');
@@ -1076,7 +1129,7 @@ const loadCapabilities = async () => {
   try {
     const list = await get('/capabilities');
     list.forEach(item => capabilitiesByType.set(item.action, item));
-    el('capabilityCount').textContent = list.length + ' action types registered on this laptop.';
+    el('capabilityCount').textContent = list.length + ' action types registered on this service.';
   } catch (error) {
     el('capabilityCount').textContent = 'Capability list unavailable — risk labels will say "not registered".';
   }
@@ -1086,10 +1139,16 @@ paintIdentity();
 if (!createRecognizer()) sayUnavailable();
 loadCapabilities();
 ping();
-get('/devices').then(paintDevices).catch(() => { el('deviceChip').textContent = 'Device list unavailable'; });
-get(conversationPath()).then(renderConversation).catch(() => {});
+// One poll of the conversation is what keeps the chip honest: presence is a heartbeat
+// on the server, so a computer that goes quiet after the page loads has to start being
+// reported offline without the user reloading.
+const refreshTarget = () => get(conversationPath())
+  .then(renderConversation)
+  .catch(() => { el('deviceChip').textContent = 'Target computer: unknown — the service did not answer'; });
+refreshTarget();
 resumeSession();
 window.setInterval(ping, 20000);
+window.setInterval(refreshTarget, 20000);
 </script>
 </body>
 </html>

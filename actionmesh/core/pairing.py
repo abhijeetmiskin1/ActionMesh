@@ -230,6 +230,17 @@ class PairingService:
         code = "".join(secrets.choice("0123456789") for _ in range(CODE_DIGITS))
         if not isinstance(max_risk, RiskLevel):
             raise PairingError(f"max_risk must be a RiskLevel, got {max_risk!r}")
+        # C36: the code's ceiling becomes the *phone's* ceiling on redemption, and
+        # `DeviceRegistry.set_risk_ceiling` is the only way to move a ceiling after
+        # that — it refuses every increase. So the value chosen here, by the person
+        # standing at the laptop, is the highest authority that phone will ever hold,
+        # and pairing itself cannot raise it afterwards.
+        #
+        # It is deliberately not capped by the laptop's own ceiling. They measure
+        # different things: the laptop's ceiling is what that machine may *execute*,
+        # the phone's is what it may *ask for* anywhere in the mesh. A locked-down
+        # workstation is a perfectly legitimate place to pair a controller for a
+        # separate server, and capping here would make that impossible.
         record = PairingCode(
             code_id=f"pair_{secrets.token_hex(8)}",
             laptop_device_id=device_id,
@@ -355,6 +366,12 @@ class PairingService:
                     # shows online without needing a second round trip.
                     online=True,
                     last_seen=moment,
+                    # C36: the code's ceiling is the owner's decision, made at the
+                    # laptop, and it becomes the *device's* ceiling here. Pairing
+                    # cannot raise one: `register` stores what it is given, and the
+                    # only writer that can move a ceiling afterwards is
+                    # `set_risk_ceiling`, which refuses increases.
+                    risk_ceiling=record.max_risk,
                 )
             )
         except Exception:

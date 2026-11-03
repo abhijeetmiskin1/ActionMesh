@@ -9,6 +9,61 @@ complete when its tests have actually been executed and passed.
 
 ## [Unreleased] — 2026-10-19
 
+## C41 — the real AI brain, wired into the VoiceOS pipeline
+
+- **The configured provider now plans a turn, not just passes a key test.** The
+  Electron shell exposes generation over an authenticated **Unix socket** (`status` and
+  `generate` frames, one JSON object per connection, ≤256 KiB, constant-time token
+  check). The Python backend asks it to plan, and the answer is validated through the
+  *same* two untrusted-input doors as anything else: `validate_proposal()` and the
+  registry's `check_params`. A model that invents a capability, an actor's identity, a
+  permission, or a risk level is refused by the existing policy, approval and executor
+  pipeline — **AI proposes, policy decides, the user controls, the executor acts, the
+  verifier confirms, the audit remembers.**
+- **The API key never leaves the shell.** It is read from the OS keyring in the main
+  process and sent only to the provider over HTTPS; it is never passed to the renderer,
+  the Python backend, an environment variable, or the bridge socket. A renderer
+  `providerTest()` with a typed-but-unsaved key takes the value from the IPC argument
+  into `providers.test()` and nowhere else. There is no key getter on the renderer
+  surface.
+- **Eight honest states, not a green dot.** The closed vocabulary is
+  `ok / missing_key / not_configured / provider_unavailable / invalid_credentials /
+  rate_limited / timeout / malformed`; a key on disk is `missing_key` until a call is
+  made, and an unknown provider state is folded into `provider_unavailable`. **Ollama
+  reports `implemented: false`** with a reason, and stays visibly unavailable until a
+  real probe and tests exist.
+- **A provider connection does not grant execution authority.** `tests/security/
+  test_model_authority.py` pins it: a provider can propose, but cannot grant itself a
+  permission, select another actor or another user's device, or invent a registered
+  capability. Model output, conversation history, screen contents and tool results are
+  all treated as untrusted input.
+- **Three honesty defects found by driving the packaged page, all fixed.** (1) The
+  command guide's right-hand column was a hand-typed "supported" — a label nobody
+  measures — and it was wrong: several listed phrases matched no rule while the page
+  said supported. `POST /voiceos/guide` now runs each phrase the *page* is about to show
+  through the *same* planner object a real turn uses, and the quick-command buttons are
+  measured too (they had the same delusion). The route proposes nothing and runs
+  nothing. (2) A sentence-verdict in a `nowrap` grid column rendered as overlapping
+  fragments — the row now stacks. (3) **The status chip claimed "AI model active" while
+  every turn fell back**: `/voiceos/status` read `configured` and `implemented` but
+  ignored `state`, so a key the provider rejected was still reported as a live model. A
+  refusing `state` now forces `mode: deterministic` with the shell's own sentence as the
+  reason, and an unverified-but-configured provider carries the "press Test Connection"
+  caveat into the chip's tooltip.
+- **No successful live generation was made, and none is claimed.** No valid provider
+  credential exists in this environment. Testing was mocked/adapter-level plus the
+  packaged app's real `missing_key` fallback and **one real outbound call with a
+  deliberately-invalid key that the provider correctly rejected** (`invalid_credentials`,
+  "The provider rejected the stored API key.") — a real network round trip and an honest
+  failure, verified end to end in the packed build. To test against a live provider:
+  Settings → Provider → enter a real key → **Test Connection** → confirm `connected`,
+  then send a sentence on the Voice screen and read the turn's note, which names the
+  call that actually went out.
+- **Gates.** Python `1462 passed, 3 skipped, 886 subtests`; desktop `64 pass`. C41
+  suites: `test_llm_generation.py` 16, `test_model_bridge.py` 14, `test_voiceos_status.py`
+  9, `test_model_authority.py` 11 (+19 subtests), `test_ai_voiceos_pipeline.py` 12,
+  `test_command_guide.py` 10.
+
 ## C34 — VoiceOS became conversational, and the task became the unit
 
 - **A new package carries the reasoning.** `actionmesh/voiceos/` now holds a reasoning

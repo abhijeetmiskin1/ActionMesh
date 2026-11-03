@@ -31,6 +31,7 @@ from actionmesh.agent.commands import DEFAULT_ALLOWED
 from actionmesh.agent.definitions import (
     CAPABILITIES,
     IMPLEMENTED,
+    REQUIRING_DESKTOP,
     REQUIRING_FILE_ROOT,
     REQUIRING_SHELL,
 )
@@ -40,6 +41,7 @@ ENV_DEVICE_ID = "ACTIONMESH_DEVICE_ID"
 ENV_DEVICE_NAME = "ACTIONMESH_DEVICE_NAME"
 ENV_WORKSPACE_ROOT = "ACTIONMESH_WORKSPACE_ROOT"
 ENV_ALLOW_SHELL = "ACTIONMESH_ALLOW_SHELL"
+ENV_ALLOW_DESKTOP = "ACTIONMESH_ALLOW_DESKTOP"
 ENV_HEARTBEAT_S = "ACTIONMESH_HEARTBEAT_S"
 ENV_ALLOWED_COMMANDS = "ACTIONMESH_ALLOWED_COMMANDS"
 ENV_DENIED_COMMANDS = "ACTIONMESH_DENIED_COMMANDS"
@@ -106,9 +108,22 @@ class AgentConfig:
     #: laptop runs whatever a phone sends it" is exactly this flag plus the command
     #: policy.
     allow_shell: bool = False
+    #: Screen capture and GUI inspection (C38). Off by default: "this laptop can be
+    #: asked what is on its screen" is a distinct boundary from "this laptop can be
+    #: told to run tests", and a machine that showed its screen because a stranger set
+    #: ACTIONMESH_ALLOW_SHELL would be a boundary that leaked. Even with this on, the
+    #: OS screenshot portal still gates every capture, and policy still gates the action.
+    allow_desktop: bool = False
     heartbeat_s: float = DEFAULT_HEARTBEAT_S
     agent_version: str = __version__
     platform: str = field(default_factory=lambda: os.uname().sysname.lower())
+    #: C36: the CPU architecture, so a control plane can refuse to send an x86 build
+    #: to an arm machine *before* dispatch instead of reporting a failure afterwards.
+    arch: str = field(default_factory=lambda: os.uname().machine)
+    #: The desktop application version, distinct from the agent's: the two are
+    #: upgraded independently and a dashboard that conflates them cannot say which
+    #: half of a machine is stale.
+    app_version: str = __version__
     os_version: str = field(
         default_factory=lambda: " ".join(
             part for part in (os.uname().sysname, os.uname().release) if part
@@ -208,6 +223,7 @@ class AgentConfig:
             name=get(ENV_DEVICE_NAME) or get(ENV_DEVICE_ID, "laptop-1"),
             workspace_root=os.path.abspath(root) if root else "",
             allow_shell=_truthy(get(ENV_ALLOW_SHELL)),
+            allow_desktop=_truthy(get(ENV_ALLOW_DESKTOP)),
             heartbeat_s=heartbeat,
             allowed_commands=listing(ENV_ALLOWED_COMMANDS),
             denied_commands=listing(ENV_DENIED_COMMANDS),
@@ -252,8 +268,44 @@ class AgentConfig:
                 continue
             if capability in REQUIRING_SHELL and not self.allow_shell:
                 continue
+            if capability in REQUIRING_DESKTOP:
+                # Two gates: the operator opened the boundary, *and* the machine can
+                # actually reach a desktop. Checking reachability lazily here (not at
+                # import) means an agent on a headless server advertises no screen
+                # capability at all, rather than advertising one that would authorize
+                # and then fail to capture.
+                if not self.allow_desktop or not self.desktop_reachable:
+                    continue
             out.append(capability)
         return tuple(out)
+
+    @property
+    def desktop_reachable(self) -> bool:
+        """Whether this process can realistically reach a graphical session.
+
+        Cheap and side-effect-free: it looks at the session environment, not at the
+        portal (probing the portal is the capture capability's job, and a heartbeat
+        should not be taking screenshots to decide what to advertise).
+        """
+        import os as _os
+
+        if not _os.environ.get("DISPLAY") and not _os.environ.get("WAYLAND_DISPLAY"):
+            return False
+        # The desktop APIs are reached through the system PyGObject. If this process
+        # cannot import gi, it cannot inspect or capture regardless of the display.
+        # Under a development venv the launcher hands over the system package
+        # directory; give the walker its chance to append it before deciding.
+        try:
+            from actionmesh.agent.device_screen import ensure_gi_importable
+
+            ensure_gi_importable()
+        except Exception:
+            pass
+        try:
+            import gi  # noqa: F401
+        except ImportError:
+            return False
+        return True
 
     def permits(self, capability: str) -> bool:
         return capability in self.advertise()

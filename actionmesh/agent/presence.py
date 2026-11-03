@@ -27,10 +27,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from actionmesh.agent.config import AgentConfig
-from actionmesh.agent.definitions import register_device_actions
+from actionmesh.agent.definitions import advertised_ceiling, register_device_actions
 from actionmesh.core.devices import DeviceRegistry
 from actionmesh.core.events import EventHub
-from actionmesh.core.identity import IdentityStore
+from actionmesh.core.identity import IdentityError, IdentityStore
 from actionmesh.protocol.models import DeviceInfo, DeviceKind, MeshEvent
 
 
@@ -77,13 +77,29 @@ class LaptopAgent:
         """
         now = self._clock()
         device_id = self.config.device_id
+        # Advertise once and use the same list for both the record and the ceiling
+        # derived from it: a ceiling computed from a *different* advertisement than
+        # the one published would describe a machine that does not exist.
+        device_capabilities = list(self.config.advertise())
         identities: IdentityStore | None = self.devices.identities
         existing = self.devices.devices.get(device_id)
+        # A restored identity record cannot be resolved while it is revoked: that is
+        # exactly what revoking means. So catch "not active" here and fall through to
+        # enrollment, which refuses a duplicate device id with a clear error, rather
+        # than letting a startup `resolve` raise an exception nobody maps to an action.
         if existing is not None and existing.identity_id:
             identity_id = existing.identity_id
         elif identities is not None:
             held = identities.for_device(device_id)
-            identity_id = identities.resolve(held.identity_id).identity_id if held else ""
+            identity_id = ""
+            if held is not None:
+                try:
+                    identity_id = identities.resolve(held.identity_id).identity_id
+                except IdentityError:
+                    # Revoked while this machine was down. Re-minting here would undo
+                    # the revocation; `enroll` below fails loudly instead, and the
+                    # operator un-revokes deliberately.
+                    identity_id = ""
         else:
             identity_id = ""
 
@@ -94,8 +110,18 @@ class LaptopAgent:
             platform=self.config.platform,
             os_version=self.config.os_version,
             agent_version=self.config.agent_version,
-            capabilities=list(self.config.advertise()),
+            capabilities=device_capabilities,
             identity_id=identity_id,
+            arch=self.config.arch,
+            app_version=self.config.app_version,
+            # The ceiling this machine enrols with, derived from the boundaries the
+            # operator configured for *this* process — never wider than what it
+            # advertises. `DeviceInfo` would otherwise take the fail-closed ``LOW``
+            # default, and a laptop honestly advertising a MEDIUM-risk capability
+            # would then refuse its own actions after every approval had been given.
+            # Lowering is free; raising is something only the device's own owner can
+            # do, which is exactly what re-enrolling from configuration is.
+            risk_ceiling=advertised_ceiling(device_capabilities),
         )
         if not identity_id and identities is not None:
             # Fresh machine: mint the identity through the store rather than
@@ -109,11 +135,17 @@ class LaptopAgent:
                 os_version=device.os_version,
                 agent_version=device.agent_version,
                 capabilities=device.capabilities,
+                risk_ceiling=device.risk_ceiling,
             )
             self._device = self.devices.devices[device_id]
             return self._device
         self._device = self.devices.register(device)
         self._device.last_seen = now
+        # Rebuilding this machine's own record at startup *is* a connection: the
+        # agent that owns the device is demonstrably alive. Saying so is what keeps
+        # "last connected" meaningful across a restart instead of silently reverting
+        # to the last heartbeat before it.
+        self.devices.mark_connected(device_id, now=now)
         return self._device
 
     def heartbeat(self) -> DeviceInfo:
