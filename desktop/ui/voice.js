@@ -44,7 +44,48 @@
     : null;
   const textToSpeechSupported = Boolean(Synthesis && synthesis);
 
-  const api = { supported, textToSpeechSupported, state: 'idle' };
+  /** Human-readable labels for screen-reader announcements. Text only. */
+  const STATE_LABELS = {
+    idle: 'Idle', listening: 'Listening', transcribing: 'Transcribing',
+    thinking: 'Thinking', planning: 'Planning', awaiting: 'Waiting for approval',
+    executing: 'Executing', speaking: 'Speaking', error: 'Error',
+  };
+
+  /**
+   * Execution status live region (P2-3 accessibility).
+   *
+   * voice.js owns no markup (index.html/app.js are lead-owned), so this helper
+   * finds the existing status element by id and, only if the page has none,
+   * creates a visually-hidden-by-class live region the app can reuse. It never
+   * sets inline styles or colours: styling stays in styles.css tokens.
+   * Returns the element, or null when no document is available.
+   */
+  function ensureLiveRegion(doc) {
+    const d = doc || (typeof document !== 'undefined' ? document : null);
+    if (!d || typeof d.getElementById !== 'function') return null;
+    const existing = d.getElementById('voiceState') || d.getElementById('commandStatus');
+    const node = existing || (() => {
+      const created = d.createElement('div');
+      created.setAttribute('id', 'voiceStatusLive');
+      created.setAttribute('class', 'voice-status-live');
+      created.setAttribute('role', 'status');
+      (d.body || d.documentElement || d).append(created);
+      return created;
+    })();
+    node.setAttribute('role', 'status');
+    node.setAttribute('aria-live', 'polite');
+    node.setAttribute('aria-atomic', 'true');
+    return node;
+  }
+
+  /** Announce a status change to assistive technology. Text only. */
+  function announce(doc, message) {
+    const node = ensureLiveRegion(doc);
+    if (node) node.textContent = String(message || '');
+    return node;
+  }
+
+  const api = { supported, textToSpeechSupported, state: 'idle', ensureLiveRegion, announce };
 
   // One handler per event, matching the app's single-controller usage; a non-function
   // detaches it. Kept module-level so a listener's own bug can never stop the mic.
@@ -66,6 +107,9 @@
 
   function emitState(state, detail) {
     api.state = state;
+    // Screen-reader status: announce every state transition (best-effort;
+    // announcement must never take the mic/speaker down).
+    quietly(() => announce(null, detail || STATE_LABELS[state] || state));
     call(onStateFn, state, detail);
   }
 

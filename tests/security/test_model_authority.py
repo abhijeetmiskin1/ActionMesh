@@ -198,9 +198,8 @@ class ModelAuthorityTest(unittest.TestCase):
     def test_validate_proposal_refuses_a_non_mapping_answer(self) -> None:
         registry = ActionRegistry.with_seeds()
         for answer in ("a string", 17, ["a", "list"]):
-            with self.subTest(answer=answer):
-                with self.assertRaises(LlmError):
-                    validate_proposal(answer, registry.has)
+            with self.subTest(answer=answer), self.assertRaises(LlmError):
+                validate_proposal(answer, registry.has)
 
     def test_validate_proposal_refuses_an_answer_without_an_actions_list(self) -> None:
         registry = ActionRegistry.with_seeds()

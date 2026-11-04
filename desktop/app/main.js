@@ -30,6 +30,9 @@ const { Backend, newLoopbackKey, os } = require('./backend');
 const { SettingsStore } = require('./settings');
 const providers = require('./providers');
 const { startBridge } = require('./provider_bridge');
+const browserWindow = require('./browser_window');
+const { registerBrowserIpc } = require('./browser_channel');
+const { startBridge: startBrowserBridge } = require('./browser_bridge');
 
 const APP_ID = 'com.actionmesh.voiceos';
 const PRODUCT = 'ActionMesh';
@@ -81,6 +84,11 @@ let lastProviderTest = null;
 // thing — permission to talk to this socket while this process lives.
 let providerBridge = null;
 let bridgeToken = '';
+// C42: the drive socket VoiceOS's BrowserEngine calls to reach the hardened
+// window. Its token authorises "speak the drive protocol" and nothing more —
+// no credential crosses it, and the window itself carries none.
+let browserBridge = null;
+let browserBridgeToken = '';
 let streamAbort = null;
 let streamGeneration = 0;
 const pendingNotifications = new Map();
@@ -466,22 +474,30 @@ function appState() {
     packaged: app.isPackaged,
     shortcutRegistered: globalShortcut.isRegistered(currentShortcut()),
     tray: Boolean(tray),
+    purposes: settings ? Object.fromEntries(PURPOSES.map(p => [p, purposeStatus(p)])) : null,
   };
 }
 
 /**
- * What the header's provider bar may know.
+ * What one purpose bar may know.
  *
  * `configured` means a provider and model are recorded. `state` is the *verified*
  * connection state: absent a test, it is `missing_key` or `not_configured`, never
  * `connected` — a key on disk is not a provider that answers.
  */
-function providerStatus() {
-  const provider = String((settings && settings.get('providerName')) || '');
-  const spec = providers.specFor(provider);
-  const model = String((settings && settings.get('providerModel')) || '') || (spec ? spec.defaultModel : '');
-  const hasKey = Boolean(settings && settings.hasSecret('providerApiKey'));
-  const last = lastProviderTest && lastProviderTest.provider === provider ? lastProviderTest : null;
+const PURPOSES = ['chat', 'reasoning', 'image', 'audio'];
+
+function purposeStatus(purpose) {
+  const purposeId = String(purpose || '');
+  if (!PURPOSES.includes(purposeId)) return null;
+  const fields = purposeFields(purposeId);
+  const secretKey = purposeSecretKey(purposeId);
+  const spec = providers.specFor(fields.provider, purposeId);
+  const model = fields.model || (spec ? spec.defaultModel : '');
+  const hasKey = Boolean(settings && settings.hasSecret(secretKey));
+  const last = lastProviderTest && lastProviderTest.provider === fields.provider
+    && lastProviderTest.purpose === purposeId ? lastProviderTest : null;
+  const legacy = fields.legacy;
 
   let state;
   let detail;
@@ -505,16 +521,72 @@ function providerStatus() {
   }
 
   return {
-    provider: provider || '',
+    purpose: purposeId,
+    provider: fields.provider || '',
     providerLabel: spec ? spec.label : '',
     model,
+    // The renderer needs these to pre-fill the modal. Without them, a Save that
+    // leaves the base URL blank would write '' over a stored custom endpoint.
+    endpoint: fields.endpoint || '',
+    timeout: fields.timeout,
     state,
     text: providers.STATE_TEXT[state] || state,
     detail,
     hasKey,
+    legacy,
     encryptionAvailable: Boolean(settings && settings.encryptionAvailable()),
     testedAt: last ? last.at : null,
   };
+}
+
+/**
+ * The legacy single bar. It reports the chat lane — the one purpose that has always
+ * had an implementation — and whether the configuration it shows is a stored chat
+ * setup or the preserved pre-C42 one. The old settings are never rewritten.
+ *
+ * The bridge also calls this with the lane it just resolved (`reasoning`, `chat`, or
+ * `legacy`); the shell answers for that lane so /voiceos/status cannot claim a state
+ * that belongs to a different card than the one the planner reads.
+ */
+function providerStatus(lane) {
+  const wanted = typeof lane === 'string' && PURPOSES.includes(lane) ? lane : 'chat';
+  const status = purposeStatus(wanted);
+  return status ? { ...status, purpose: wanted } : null;
+}
+
+/**
+ * Legacy names the chat purpose falls back to when its own has never been set. The
+ * Chat bar is where an existing single-provider setup keeps working: no migration
+ * script rewrites somebody's configuration behind their back, and nothing about the
+ * old keys is deleted, so rolling back is just this build pointed the other way.
+ */
+function purposeFields(purpose) {
+  const own = {
+    provider: String((settings && settings.get(`purpose_${purpose}_provider`)) || ''),
+    model: String((settings && settings.get(`purpose_${purpose}_model`)) || ''),
+    endpoint: String((settings && settings.get(`purpose_${purpose}_endpoint`)) || ''),
+    timeout: Number((settings && settings.get(`purpose_${purpose}_timeout`)) || 12),
+  };
+  if (purpose === 'chat'
+      && !own.provider && !own.model
+      && settings && String(settings.get('providerName') || '')) {
+    return {
+      provider: String(settings.get('providerName') || ''),
+      model: String(settings.get('providerModel') || ''),
+      endpoint: String(settings.get('providerEndpoint') || ''),
+      timeout: Number(settings.get('providerTimeout') || 12) || 12,
+      legacy: true,
+    };
+  }
+  return { ...own, legacy: false };
+}
+
+/** Where the key actually lives for this purpose: its own secret, else legacy chat. */
+function purposeSecretKey(purpose) {
+  if (purpose === 'chat' && !settings.hasSecret('chatApiKey') && settings.hasSecret('providerApiKey')) {
+    return 'providerApiKey';
+  }
+  return `${purpose}ApiKey`;
 }
 
 function currentShortcut() {
@@ -694,6 +766,133 @@ function registerIpc() {
   ipcMain.handle('provider:model', (_event, model) => {
     settings.update({ providerModel: String(model || '').slice(0, 120) });
     return { ok: true, status: providerStatus() };
+  });
+
+  // -- Per-purpose providers (C42) --------------------------------------
+  // chat | reasoning | image | audio, each with its own provider choice and its own
+  // keyring secret. Same discipline as the single-provider handlers above, plus one
+  // rule: `purpose` is validated against a closed list before it touches settings, so
+  // a renderer string can never name an arbitrary settings key or secret slot.
+  const validPurpose = (value) => {
+    const p = String(value || '');
+    return PURPOSES.includes(p) ? p : null;
+  };
+
+  ipcMain.handle('purpose:specs', (_event, purpose) => {
+    const p = validPurpose(purpose);
+    if (!p) return { ok: false, error: 'unknown purpose' };
+    return { ok: true, purpose: p, specs: providers.publicSpecs(p) };
+  });
+
+  ipcMain.handle('purpose:status', (_event, purpose) => {
+    const p = validPurpose(purpose);
+    if (!p) return { ok: false, error: 'unknown purpose' };
+    return { ok: true, status: purposeStatus(p) };
+  });
+
+  ipcMain.handle('purpose:configure', (_event, payload) => {
+    if (!payload || typeof payload !== 'object') return { ok: false, error: 'no configuration' };
+    const p = validPurpose(payload.purpose);
+    if (!p) return { ok: false, error: 'unknown purpose' };
+    const spec = providers.specFor(String(payload.provider || ''), p);
+    if (!spec) return { ok: false, error: 'unknown provider' };
+    if (!spec.implemented) return { ok: false, error: spec.unavailableReason || 'not implemented' };
+
+    const update = {
+      [`purpose_${p}_provider`]: spec.id,
+      [`purpose_${p}_model`]: String(payload.model || '').slice(0, 120),
+    };
+    // A save that omits `baseUrl` leaves the stored endpoint alone; an explicit empty
+    // string clears it. The renderer pre-fills the box, so the omission case is a
+    // caller that only meant to change the model — and silently erasing a custom
+    // endpoint there would make the very next request go to the wrong host.
+    if (payload.baseUrl !== undefined || !spec.requiresBaseUrl) {
+      update[`purpose_${p}_endpoint`] = spec.requiresBaseUrl ? String(payload.baseUrl || '').slice(0, 500) : '';
+    }
+    const timeout = Number(payload.timeoutSeconds);
+    if (Number.isFinite(timeout)) update[`purpose_${p}_timeout`] = Math.min(Math.max(Math.round(timeout), 1), 60);
+
+    // An empty box means "leave the stored key alone"; removal is its own call. The
+    // key is written only when the keyring can encrypt it — never as plain text.
+    const key = typeof payload.apiKey === 'string' ? payload.apiKey.trim() : '';
+    if (key) {
+      if (!settings.encryptionAvailable()) {
+        return { ok: false, error: 'The OS keyring is unavailable, so the key was not stored. Nothing was written in plain text.' };
+      }
+      update[`${p}ApiKey`] = key;
+    }
+    settings.update(update);
+    return { ok: true, purpose: p, settings: settings.public(), status: purposeStatus(p) };
+  });
+
+  ipcMain.handle('purpose:remove', (_event, payload) => {
+    const p = validPurpose(payload && payload.purpose);
+    if (!p) return { ok: false, error: 'unknown purpose' };
+    // Remove from the purpose's own slot, and from the legacy chat slot if that is
+    // where the chat key actually lives, so "Remove credentials" never leaves a
+    // second copy behind.
+    const update = { [`${p}ApiKey`]: '' };
+    if (p === 'chat') update.providerApiKey = '';
+    settings.update(update);
+    return { ok: true, purpose: p, settings: settings.public(), status: purposeStatus(p) };
+  });
+
+  ipcMain.handle('purpose:test', async (_event, payload) => {
+    if (!payload || typeof payload !== 'object') return { ok: false, error: 'no configuration' };
+    const p = validPurpose(payload.purpose);
+    if (!p) return { ok: false, error: 'unknown purpose' };
+    const fields = purposeFields(p);
+    const provider = String(payload.provider || fields.provider || '');
+    const spec = providers.specFor(provider, p);
+    if (!spec || !spec.implemented) {
+      // Nothing to call: report it without touching the network or the keyring.
+      return { ok: true, purpose: p, provider, ...providers.test({ provider, model: '' }) };
+    }
+    // A key typed but not saved is tested ephemerally; otherwise the stored key for
+    // this exact purpose is read here and passed straight into the adapter. It never
+    // goes to the renderer.
+    const typed = typeof payload.apiKey === 'string' ? payload.apiKey.trim() : '';
+    const apiKey = typed || settings.secret(purposeSecretKey(p));
+    const outcome = await providers.test({
+      provider: spec.id,
+      model: String(payload.model || fields.model || ''),
+      baseUrl: String(payload.baseUrl || fields.endpoint || ''),
+      apiKey,
+      timeoutSeconds: Number(payload.timeoutSeconds || fields.timeout || 12),
+      purpose: p,
+    });
+    lastProviderTest = { purpose: p, provider: spec.id, ...outcome, at: new Date().toISOString() };
+    return { ok: true, purpose: p, provider: spec.id, ...outcome };
+  });
+
+  ipcMain.handle('purpose:model', (_event, payload) => {
+    const p = validPurpose(payload && payload.purpose);
+    if (!p) return { ok: false, error: 'unknown purpose' };
+    settings.update({ [`purpose_${p}_model`]: String(payload.model || '').slice(0, 120) });
+    return { ok: true, purpose: p, status: purposeStatus(p) };
+  });
+
+  /**
+   * "Set as default" — a real setting, not a badge.
+   *
+   * There is one consumer that has a notion of a default: the planner. It resolves a
+   * lane from the reasoning settings, then chat, then the legacy keys. This flag is
+   * what makes the *chat* lane win that resolution when both are configured, so the
+   * button does something a person can observe. It grants nothing: the planner still
+   * goes through validate_proposal → registry → policy → approval.
+   *
+   * Only chat can be the default, because chat is the only lane whose purpose is
+   * generic conversation. A "default reasoning" would be a second name for the same
+   * setting and a way for the two to disagree.
+   */
+  ipcMain.handle('purpose:default', (_event, payload) => {
+    const p = validPurpose(payload && payload.purpose);
+    if (!p) return { ok: false, error: 'unknown purpose' };
+    if (p !== 'chat') return { ok: false, error: 'Only the chat lane can be the default.' };
+    const fields = purposeFields('chat');
+    if (!fields.provider) return { ok: false, error: 'Configure a chat provider first.' };
+    settings.update({ providerDefault: true });
+    return { ok: true, purpose: 'chat', status: purposeStatus('chat') };
   });
 
   ipcMain.handle('stream:stop', () => {
@@ -986,6 +1185,29 @@ app.whenReady().then(async () => {
     bridgeToken = '';
     console.error('model bridge did not start:', error && error.message);
   }
+  // C42: the drive bridge comes up *before* the backend, for the same reason:
+  // the backend's environment is built once at spawn and the socket it dials
+  // must already be under way. The bundle that VoiceOS dials (the Python
+  // BridgeDriver's `request` callable) is the backend-side counterpart; this
+  // socket is what it calls. A failure to listen is not fatal: the browser
+  // capability answers "unavailable" honestly and nothing is silently
+  // attempted. The socket lives in the profile directory; Backend.prepare()
+  // creates that directory before start(), so we create it eagerly here too —
+  // the drive bridge must exist when the backend's environment is built.
+  browserBridgeToken = crypto.randomBytes(32).toString('base64url');
+  const browserBridgeSocket = path.join(app.getPath('userData'), 'browser-bridge.sock');
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true });
+    browserBridge = await startBrowserBridge({
+      socketPath: browserBridgeSocket,
+      token: browserBridgeToken,
+      drive: browserWindow,
+    });
+  } catch (error) {
+    browserBridge = null;
+    browserBridgeToken = '';
+    console.error('browser bridge did not start:', error && error.message);
+  }
   backend = new Backend({
     dataDir: app.getPath('userData'),
     appRoot: app.isPackaged
@@ -996,9 +1218,16 @@ app.whenReady().then(async () => {
     settings: settings.values,
     key: newLoopbackKey(),
     bridge: bridgeToken ? { socketPath: bridgeSocket, token: bridgeToken } : null,
+    // Env only: socket path + per-launch token, never a credential. The backend
+    // hands them to the agent (ACTIONMESH_ALLOW_BROWSER gates the capability;
+    // the provider core never opens IPC itself).
+    browserBridge: browserBridgeToken ? { socketPath: browserBridgeSocket, token: browserBridgeToken } : null,
   });
   backend.prepare();
   registerIpc();
+  // The browser IPC surface is the renderer's drive path. Registering it here
+  // — after registerIpc() — keeps every ipcMain.handle in one lifecycle.
+  registerBrowserIpc(browserWindow, () => mainWindow);
   buildAppMenu();
   createMainWindow();
   createTray();
@@ -1042,6 +1271,14 @@ app.on('before-quit', async (event) => {
         /* already gone */
       }
       providerBridge = null;
+    }
+    if (browserBridge) {
+      try {
+        await browserBridge.close();
+      } catch {
+        /* already gone */
+      }
+      browserBridge = null;
     }
     globalShortcut.unregisterAll();
     app.quit();

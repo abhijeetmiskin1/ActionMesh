@@ -72,3 +72,8 @@ desktop/.stage/
 .demo/
 pytest-run.txt
 
+
+# Browser / editor safety — never commit machine-local state
+.claude/
+.serena/
+*.local

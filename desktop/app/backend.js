@@ -195,7 +195,7 @@ function clearClaim(dirs, pid) {
 }
 
 class Backend {
-  constructor({ dataDir, appRoot, isPackaged, resourcesPath, settings, key, bridge }) {
+  constructor({ dataDir, appRoot, isPackaged, resourcesPath, settings, key, bridge, browserBridge }) {
     this.dataDir = dataDir;
     this.appRoot = appRoot;
     this.isPackaged = isPackaged;
@@ -207,6 +207,9 @@ class Backend {
     // "talk to that socket", nothing more. The key stays in this process, which is the
     // one place the OS keyring can be opened.
     this.bridge = bridge || null;
+    // C42: the browser drive socket. Same shape as `bridge`, same honesty: a socket
+    // path and a per-launch token, never a credential — none crosses this channel.
+    this.browserBridge = browserBridge || null;
     this.child = null;
     this.port = 0;
     this.baseUrl = '';
@@ -302,6 +305,11 @@ class Backend {
       env.ACTIONMESH_ALLOW_SHELL = s.allowShell ? '1' : '0';
       // Not derived from allowShell: seeing the screen is its own boundary.
       env.ACTIONMESH_ALLOW_DESKTOP = s.allowDesktop ? '1' : '0';
+      // Browser and media are distinct boundaries too: a user may allow shell
+      // and not the controlled browser. Default off, so a legacy settings file
+      // without these keys reads as "no".
+      env.ACTIONMESH_ALLOW_BROWSER = s.allowBrowser ? '1' : '0';
+      env.ACTIONMESH_ALLOW_MEDIA = s.allowMedia ? '1' : '0';
       env.ACTIONMESH_ALLOWED_COMMANDS = (s.allowedCommands || []).join(',');
       env.ACTIONMESH_AGENT_LOG_DIR = path.join(this.dirs.logs, 'agent');
     }
@@ -323,6 +331,14 @@ class Backend {
       // key takes effect just as immediately. Whether the planner is actually a model is
       // then a fact reported by /voiceos/status, not an assumption baked into a spawn.
       env.ACTIONMESH_VOICEOS_LLM_PROVIDER = 'desktop';
+    }
+    // C42: the browser drive bridge. Env only, same channel as the model
+    // bridge: argv would leak in /proc/<pid>/cmdline, and a file would outlive
+    // the process that can honour it. No API key crosses: the token is per
+    // launch and the socket lives in the profile directory at mode 0600.
+    if (this.browserBridge && this.browserBridge.socketPath && this.browserBridge.token) {
+      env.ACTIONMESH_BROWSER_BRIDGE_SOCKET = this.browserBridge.socketPath;
+      env.ACTIONMESH_BROWSER_BRIDGE_TOKEN = this.browserBridge.token;
     }
     return env;
   }

@@ -23,6 +23,16 @@ from actionmesh.core.planner import Planner
 from actionmesh.voiceos.models import Conversation, TaskSession, TaskStep
 from actionmesh.voiceos.targeting import TargetChoice, describe_choice
 from actionmesh.voiceos.tasks import TaskTemplate, match_template
+from actionmesh.voiceos.website_workflows import (
+    BOOKING_SUBMIT_ACTION,
+    ORDER_PLACE_ACTION,
+    clarification_field,
+    clarification_prompt,
+    extract_website_fields,
+    match_website_intent,
+    resolve_template,
+    substitute,
+)
 
 #: How a remembered item is addressed, so "the second server" can find it.
 _REFERENCE_ORDINAL = re.compile(
@@ -450,6 +460,9 @@ class Reasoner:
                 session=session,
                 device_id=session.device_id,
             )
+        website = self._website_step(request, conversation)
+        if website is not None:
+            return website
         plan = self.planner.plan(request)
         if plan.actions:
             steps = [
@@ -502,6 +515,86 @@ class Reasoner:
                 "Ask me what is running, name the target, or add a task template for it."
             ),
             unresolved=missing,
+        )
+
+    def _website_step(self, request: str, conversation: Conversation) -> Understanding | None:
+        """A website workflow matched by NL intent, or ``None`` to fall through.
+
+        This branch runs *before* the generic planner. It only fires when the
+        capability's every action is registered here (``known_action``), so a
+        machine with the browser agent disabled gets the honest refusal below
+        rather than a plan it cannot run. When a required field is missing, the
+        answer is the field's prompt and there is no session — nothing is
+        proposed until the user supplied the detail.
+        """
+        name = match_website_intent(request)
+        if name is None:
+            return None
+        template = resolve_template(name)
+        if not all(self.known_action(str(step.get("action"))) for step in template.steps):
+            return Understanding(
+                kind="answer",
+                reply=(
+                    f"I understood that as asking for the {name} website workflow, but "
+                    "this control service does not offer the browser capabilities it "
+                    "needs, so there is nothing to propose. Enable the laptop agent "
+                    "and ask again. Nothing has run."
+                ),
+                unresolved=("browser capability not registered",),
+            )
+        fields = extract_website_fields(request, name)
+        # An inline answer to a previous clarification is still on the next
+        # turn's request: only auto-populate here.
+        missing_field = clarification_field(template, fields)
+        if missing_field is not None:
+            return Understanding(
+                kind="answer",
+                reply=f"{clarification_prompt(template, missing_field)} Nothing has run yet.",
+                unresolved=(missing_field,),
+            )
+        steps = [
+            TaskStep(
+                index=index,
+                label=str(spec.get("label")),
+                action_type=str(spec.get("action")),
+                parameters={
+                    key: substitute(value, fields) if isinstance(value, str) else value
+                    for key, value in dict(spec.get("parameters") or {}).items()
+                },
+                when=dict(spec.get("when") or {}),
+                bind=dict(spec.get("bind") or {}),
+            )
+            for index, spec in enumerate(template.steps)
+        ]
+        # Selection → submit binding (parity with build_workflow): a user-selected
+        # ref must reach the submit step's declared param without executing it.
+        _SELECTION_TO_SUBMIT: dict[str, dict[str, str]] = {
+            BOOKING_SUBMIT_ACTION: {"journey": "selected.train_ref"},
+            ORDER_PLACE_ACTION: {"items": "selected.restaurant_ref"},
+        }
+        for step in steps:
+            mapping = _SELECTION_TO_SUBMIT.get(step.action_type)
+            if not mapping:
+                continue
+            for target, source_field in mapping.items():
+                selected = fields.get(source_field)
+                if selected not in (None, ""):
+                    step.parameters[target] = str(selected)
+        session = self._session(request, steps, conversation)
+        listing = "; ".join(f"{step.index + 1}) {step.label}" for step in steps)
+        submit_note = (
+            " The final step submits and will park for your approval before anything is booked."
+            if template.submit_action is not None
+            else " This is read-only — nothing will be booked or ordered."
+        )
+        return Understanding(
+            kind="task",
+            reply=(
+                f"Here is the plan for {template.name}: {listing}.{submit_note} "
+                f"Target computer: {self._current_device(conversation)}. Nothing has run yet."
+            ),
+            session=session,
+            device_id=session.device_id,
         )
 
     def _session(self, request: str, steps: list[TaskStep], conversation: Conversation) -> TaskSession:

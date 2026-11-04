@@ -24,7 +24,6 @@ from __future__ import annotations
 import os
 import unittest
 from datetime import UTC, datetime, timedelta
-from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -323,9 +322,8 @@ class TestTheStoreRunsAnOccurrenceOnce(unittest.TestCase):
         # guard is what keeps that safe: only a small non-negative int gets through,
         # so no caller-controlled text can ever be formatted into the statement.
         for bad in (-1, 2**31, 2**63, True, 1.5, "3", "3; DROP TABLE automation_runs"):
-            with self.subTest(bad=bad):
-                with self.assertRaises(ValueError):
-                    self.store._set_user_version(bad)  # noqa: SLF001 - the guard is the subject
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.store._set_user_version(bad)
         self.assertEqual(self.store.schema_version(), self.store.schema_version())
 
     def test_a_claim_that_never_started_becomes_missed(self) -> None:
@@ -747,6 +745,16 @@ class _AutomationApp(unittest.TestCase):
                 store.close()
 
     def _pair(self, phone: str) -> str:
+        grant = self.local.post(
+            "/consents",
+            json={
+                "actor_id": phone,
+                "scope": "device.control",
+                "max_risk": "critical",
+                "reason": "fixture consent before pairing",
+            },
+        )
+        self.assertEqual(grant.status_code, 200, grant.text)
         code = self.local.post(
             "/pairing/code", json={"device_id": "laptop-1", "max_risk": "critical"}
         ).json()["code"]

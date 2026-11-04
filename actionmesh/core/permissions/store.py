@@ -16,6 +16,7 @@ from pathlib import Path
 
 from actionmesh.core.permissions.catalog import is_concrete
 from actionmesh.core.permissions.context import Consent, PermissionGrant
+from actionmesh.core.sqlite_guard import guarded, make_lock
 from actionmesh.protocol.models import RiskLevel
 
 
@@ -119,12 +120,14 @@ class SQLiteConsentStore(ConsentStore):
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        self._lock = make_lock()
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS consents "
             "(consent_id TEXT PRIMARY KEY, scope TEXT NOT NULL, payload TEXT NOT NULL)"
         )
         self.connection.commit()
 
+    @guarded
     def grant(self, consent: Consent) -> Consent:
         if not isinstance(consent, Consent):
             raise ConsentError("consent must be a Consent")
@@ -164,6 +167,7 @@ class SQLiteConsentStore(ConsentStore):
             )
         return len(doomed)
 
+    @guarded
     def revoke(self, scope: str, *, granted_by: str | None = None) -> int:
         if granted_by is not None:
             removed = self._delete_rows(scope, granted_by)
@@ -174,6 +178,7 @@ class SQLiteConsentStore(ConsentStore):
         self.connection.commit()
         return removed
 
+    @guarded
     def consents(self, scope: str | None = None) -> list[Consent]:
         query = "SELECT payload FROM consents"
         params: tuple[str, ...] = ()
@@ -198,6 +203,7 @@ class SQLiteConsentStore(ConsentStore):
             ),
         )
 
+    @guarded
     def close(self) -> None:
         self.connection.close()
 

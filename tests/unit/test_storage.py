@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -133,5 +135,60 @@ class TestReadiness(unittest.TestCase):
             self.assertFalse(store.healthy())
 
 
+
+class TestConcurrentUse(unittest.TestCase):
+    """One store is shared by FastAPI's threadpool: reads and writes must not race.
+
+    Regression for the live ``IndexError: tuple index out of range`` in
+    ``list_recent`` (and ``list_sessions``) when a write interleaved with a
+    read on the single shared connection: without serialisation the reader
+    saw ``()`` rows, torn payloads and ``InterfaceError``. With the store
+    lock, this hammering runs clean.
+    """
+
+    def test_concurrent_save_and_list_recent_never_raises(self) -> None:
+        errors: list[BaseException] = []
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteStore(Path(directory) / "race.db")
+            self.addCleanup(store.close)
+            stop = threading.Event()
+
+            def writer() -> None:
+                i = 0
+                while not stop.is_set():
+                    try:
+                        store.save_record(
+                            ExecutionRecord(
+                                execution_id=f"e{i % 10}",
+                                graph_id="g",
+                                state=ActionState.SUCCESS,
+                            )
+                        )
+                    except BaseException as exc:
+                        errors.append(exc)
+                    i += 1
+
+            def reader() -> None:
+                while not stop.is_set():
+                    try:
+                        for record in store.list_recent(limit=50):
+                            self.assertIn(record.execution_id, {f"e{i}" for i in range(10)})
+                    except BaseException as exc:
+                        errors.append(exc)
+
+            threads = [threading.Thread(target=writer, daemon=True) for _ in range(2)]
+            threads += [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            time.sleep(2)
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=5)
+        self.assertEqual(errors, [])
+
+
 if __name__ == "__main__":
+    unittest.main()
+
+
     unittest.main()

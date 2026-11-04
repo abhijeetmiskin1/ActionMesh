@@ -204,13 +204,16 @@ class TestGrantCeiling(unittest.TestCase):
 
     def test_no_consent_hook_means_no_grants(self) -> None:
         credentials = self._store_with([])
-        record, _ = credentials.issue(
-            identity_id=self.identity.identity_id,
-            actor_id="abhi",
-            max_risk=RiskLevel.HIGH,
-            now=PAST,
-        )
-        self.assertEqual(credentials.grants_for(record, now=PAST), [])
+        # Mint-time ceiling: with no consented scope the actor is at LOW, so a
+        # HIGH credential is refused at issuance rather than minted and then
+        # releasing nothing (grants_for() is the second wall, not the first).
+        with self.assertRaises(CredentialError):
+            credentials.issue(
+                identity_id=self.identity.identity_id,
+                actor_id="abhi",
+                max_risk=RiskLevel.HIGH,
+                now=PAST,
+            )
 
     def test_the_lower_ceiling_wins(self) -> None:
         # calendar.read is LOW risk in the catalog, so a LOW-ceiling credential can
@@ -295,13 +298,16 @@ class TestGrantCeiling(unittest.TestCase):
             PermissionGrant(scope="*", granted_by="abhi", max_risk=RiskLevel.CRITICAL, granted_at=PAST)
         ]
         credentials = self._store_with(grants)
-        record, _ = credentials.issue(
-            identity_id=self.identity.identity_id,
-            actor_id="abhi",
-            max_risk=RiskLevel.HIGH,
-            now=PAST,
-        )
-        self.assertEqual(credentials.grants_for(record, now=PAST), [])
+        # An inconcrete scope contributes no ceiling, so a HIGH mint is refused.
+        # grants_for() ignoring the scope is the second line of defense; the
+        # mint-time ceiling is the first.
+        with self.assertRaises(CredentialError):
+            credentials.issue(
+                identity_id=self.identity.identity_id,
+                actor_id="abhi",
+                max_risk=RiskLevel.HIGH,
+                now=PAST,
+            )
 
     def test_a_dead_credential_releases_nothing(self) -> None:
         credentials = self._store_with(
@@ -319,6 +325,8 @@ class TestGrantCeiling(unittest.TestCase):
         self.assertEqual(credentials.grants_for(record, now=PAST), [])
 
     def test_a_revoked_identity_releases_nothing(self) -> None:
+        # Default PermissionGrant.max_risk is HIGH, so this consent prices the
+        # actor at HIGH and the HIGH mint below stays within its ceiling.
         credentials = self._store_with(
             [PermissionGrant(scope="calendar.read", granted_by="abhi", granted_at=PAST)]
         )
@@ -329,8 +337,10 @@ class TestGrantCeiling(unittest.TestCase):
             now=PAST,
         )
         self.identities.revoke(self.identity.identity_id, now=PAST)
-        with self.assertRaises(IdentityError):
-            credentials.grants_for(record, now=PAST)
+        # grants_for() fails closed to [] on a revoked identity — it never
+        # raises here, and it never leaks the consent. The repair assert is
+        # the point of this test: nothing is released.
+        self.assertEqual(credentials.grants_for(record, now=PAST), [])
 
 
 class TestPublicView(unittest.TestCase):

@@ -212,7 +212,7 @@ class Runner:
                 self._context_for(workflow, context),
                 checkpoint=checkpoint,
             )
-        except Exception as exc:  # noqa: BLE001 - a run must record its own failure
+        except Exception as exc:
             # An exception the orchestrator did not expect is still an outcome, and the
             # history has to say so. Swallowing it into "succeeded" would be the one
             # unrecoverable lie; re-raising it would leave the run row stuck at

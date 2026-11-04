@@ -1,122 +1,172 @@
-# ActionMesh
+# ActionMesh + VoiceOS
 
 > **One intent. Every action.**
-> The execution layer for AI.
+> The trusted execution layer for AI.
 
 ActionMesh is a **permission-aware, verifiable, cross-application execution
-platform**. It turns natural-language intent into a dependency-aware action
-graph, authorizes every node through a central policy engine, requires explicit
-user approval for anything risky, executes through provider adapters, verifies
-the result independently, and records an audit trail.
-
-It is **not** a chatbot with a tool-calling demo attached.
-
-```text
-USER INTENT
-    ↓  intent / planner  (C18 — LLM output is UNTRUSTED, proposes only)
-STRUCTURED PLAN
-    ↓  schema validation
-ACTION REGISTRY
-    ↓  resolve + describe (C2)
-ACTION GRAPH
-    ↓  structure, cycles, ordering (C4)
-PERMISSION + POLICY ENGINE
-    ↓  ALLOW / DENY / ASK (C3)
-APPROVAL  (when the decision is ASK)
-    ↓
-EXECUTOR            (C5 — implemented)
-    ↓
-APPLICATION PROVIDER (C7 — simulated domain providers)
-    ↓
-VERIFICATION         (C6 — implemented)
-    ↓
-AUDIT / MEMORY       (C9/C10/C15 foundations)
-```
-
-Core principle, and it is never reversed:
+platform**. VoiceOS is a **voice interaction layer on top of it** — a client,
+not a second engine. Nothing the AI says authorizes anything; the pipeline
+decides.
 
 ```text
 AI proposes.  Policy decides.  User controls.
 Executor acts.  Verifier confirms.  Audit remembers.
 ```
 
+One execution pipeline, always:
+
+```text
+intent → plan (untrusted) → validate → registry → graph →
+PolicyEngine (ALLOW/DENY/ASK) → approval → ExecutionEngine →
+LaptopProvider → verification → audit
+```
+
+Real OS access exists only in `actionmesh/agent/`. The policy engine is the
+only producer of authorization decisions. No second engine, second browser,
+or second approval system is permitted.
+
 ---
 
-## Status
+## Verified state (2026-11-04, Phase 4 P0-4 documentation refresh)
 
-| Phase | Scope | State |
-|-------|-------|-------|
-| C0 | Repository foundation | Implemented (reconstructed) |
-| C1 | AMP/1.0 protocol | Implemented (reconstructed) |
-| C2 | Action Registry | **Tested — 37 tests** |
-| C3 | Permission + Policy Engine | **Tested — 61 tests** |
-| C4 | Action Graph + security invariants | **Tested — 50 tests** |
-| C5 | Execution Engine | **Tested — 40 tests** |
-| C6 | Verification + Recovery | **Tested — 24 tests** |
-| C7 | Mock Providers | Implemented |
-| C8 | REST API | Initial slice implemented |
-| C9 | Realtime events | Initial slice implemented |
-| C10 | Memory + entity resolution | Initial slice implemented |
-| C11 | Device mesh | Initial slice implemented |
-| C12 | Developer SDK | Implemented |
-| C13 | Real integrations | Deferred |
-| C14 | Security hardening | Threat-model pass complete; API-key boundary and AST primitive guard implemented |
-| C15 | Release foundations | Dashboard, CLI, SQLite, observability, packaging, PWA, and signed Android APK implemented |
-| C17 | Android APK | **Built — signed (v2+v3) — 16 tests** |
-| C18 | Intent → plan (planner) | **Implemented — proposes only — 32 tests** |
+Every number below was checked against source on this date. "Verified"
+means read from the file / runtime, not copied from an older doc.
 
-**Current test status:** `python -m unittest discover -s tests` → **425 tests,
-OK** (0 failures, 0 errors).
+| Claim | Verified value | How checked |
+|---|---|---|
+| Implemented laptop ops | **60** (`IMPLEMENTED` in `actionmesh/agent/definitions.py`) | `.venv/bin/python -c "from actionmesh.agent.definitions import IMPLEMENTED; print(len(IMPLEMENTED))"` → `60` |
+| `SUPPORTED == IMPLEMENTED` | **True** (invariant, test-asserted) | `.venv/bin/python` importing `LaptopProvider.SUPPORTED` vs `IMPLEMENTED` |
+| HTTP routes | **49** `@app.get/post/put/delete/websocket` in `actionmesh/api.py` (excl. `@app.middleware`) | `grep -c` + manual count of the 49 decorator lines |
+| Renderer CSP | **Present** — `desktop/ui/index.html:5` | `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'` |
+| Python AI providers | **2**: `anthropic`, `desktop` | `actionmesh/voiceos/llm.py:115` — `AVAILABLE_PROVIDERS = frozenset({"anthropic", "desktop"})` |
+| Desktop JS providers | **5 listed, 4 `implemented: true`** (`anthropic`, `openai`, `gemini`, `openai_compatible`; `ollama` is `implemented: false`) | `desktop/app/providers.js:49-91`. Mismatch is intentional: JS implements 4 transports, Python only exposes `anthropic` + the `desktop` bridge back to JS |
+| Linux package | **150 MB** `desktop/release/ActionMesh-0.1.0-amd64.deb` (built 2026-11-04) | `ls -lh desktop/release/` |
+| `booking.submit` / `order.place` | **Fail-closed** — raise `PERMANENT` "this build has no payment backend…" (`provider.py:_submit`, ~1941) | Read handler; no fabricated reference, no retry (`max_attempts=1`) |
+| MPRIS live verification | **NOT live-verified** | `actionmesh/agent/media.py:326-328` — "NOT exercised against a live player" |
+| Live acceptance gate | **Opt-in only** — `ACTIONMESH_LIVE_ACCEPTANCE=1` | `tests/e2e/test_phase2_live_acceptance.py:4,32`; `test_phase3_live_acceptance.py:42`. Without it, tests skip as BLOCKED |
+| Focused test check | `tests/unit/test_voiceos.py` — **40 passed** (1.41 s) | `.venv/bin/python -m pytest tests/unit/test_voiceos.py -q` |
 
-### Run it
+Historical counts (C42: 1,758 passed / 3 skipped / 888 subtests; desktop
+106) are **historical**, recorded in
+[`docs/project/TESTING_AND_ACCEPTANCE.md`](docs/project/TESTING_AND_ACCEPTANCE.md).
+They are not a claim about the current tree. The full suite was not rerun
+for this documentation pass.
 
-```powershell
-.\.venv\Scripts\python.exe -m actionmesh.cli serve    # http://127.0.0.1:8000
-```
+---
 
-### On a phone
+## What is NOT done / BLOCKED
 
-Two ways to run the control room as an app:
+Do not mistake the table above for live verification.
 
-1. **PWA — no toolchain.** Start the server, open `/dashboard` in Chrome on the
-   phone and choose **Add to home screen**. The control room is a PWA —
-   `manifest.webmanifest`, a service worker, and a maskable SVG icon — so it
-   installs to the home screen and launches full-screen with no browser chrome.
-   No APK, no app store, no signing key.
-2. **Android APK — sideload.** See below.
+- **MPRIS media is not live-verified.** `MprisMediaDriver` (`media.py:326`)
+  was written against the MPRIS 2.0 spec and tested only with
+  `FakeMediaDriver`. Driving it against a real player (VLC/Elisa/mpv) on a
+  Linux desktop with a session bus is P0-1.
+- **Browser is fixture-tested only.** Real-site navigation/search/click
+  acceptance is P0-2; the e2e live slice is opt-in
+  (`ACTIONMESH_LIVE_ACCEPTANCE=1`) and reports BLOCKED without a bridge.
+- **Real booking / ordering does not exist.** `booking.submit` and
+  `order.place` are CRITICAL-gated definitions whose handler deliberately
+  refuses: no payment backend, no fabricated confirmation. A real vendor
+  integration (C13) is intentionally external — boundary only.
+- **OpenAI / Gemini / generic Python providers are NOT IMPLEMENTED.**
+  Python exposes only `anthropic` and `desktop`. The desktop JS layer
+  implements `openai`/`gemini`/`openai_compatible` transports, but they are
+  reachable from Python only via the desktop bridge, and no second real
+  provider is selectable end-to-end (P1-3).
+- **No live device pairing, live provider calls, or fresh multi-format
+  packaging run** (AppImage/NSIS/dmg/APK install) is recorded in this
+  pass. The 150 MB `.deb` above is the one artifact verified present.
+- **Dark theme** is explicitly out of scope (light theme only).
 
-#### Android, end to end
+Labels used across these docs: **LIVE** (exercised against a real
+device/player/site/provider in a recorded run), **INTEGRATED**
+(wired end-to-end, tested with fakes/fixtures), **BLOCKED**
+(requires an external prerequisite — credentials, player, network, device),
+**NOT IMPLEMENTED** (no source). Live-verified, fixture-tested, integrated,
+and not-implemented are never merged.
 
-The APK is a native `WebView` shell around the same `/dashboard` — no AndroidX,
-no Gradle. It needs the ActionMesh server to be reachable, so three steps:
+---
+
+## How to run
 
 ```bash
-# 1. Serve on all interfaces, not just localhost
-python -m actionmesh.cli serve --host 0.0.0.0 --port 8080
+# Python suite (full — don't rerun casually)
+.venv/bin/python -m pytest tests -q
 
-# 2. Find this machine's address on the network (phone must share the Wi-Fi)
-hostname -I                       # e.g. 172.20.10.4
+# Security invariants only
+.venv/bin/python -m pytest tests/security -q
 
-# 3. Build an APK pointed at it, so it works with no setup on the device
-python scripts/build_apk.py --url http://172.20.10.4:8080 \
-                            --version-name 0.1.0-lan
-adb install -r dist/actionmesh-0.1.0-lan.apk
+# One file
+.venv/bin/python -m pytest tests/unit/test_voiceos.py -q
+
+# Lint / types
+.venv/bin/python -m ruff check actionmesh tests scripts
+.venv/bin/python -m mypy actionmesh
+
+# Desktop
+cd desktop && npm test          # node --test
+cd desktop && npm run dist:linux   # electron-builder --linux deb --x64
 ```
 
-`dist/actionmesh-0.1.0.apk` (no `--url`) defaults to `http://10.0.2.2:8000`, the
-host machine as seen from an Android **emulator**. If the server address changes,
-the app never needs rebuilding: open the overflow menu → **Server…** and type the
-new base URL, which is remembered on the device.
+Serve the control room:
 
-The app requests only `INTERNET` and declares `usesCleartextTraffic`, because a
-LAN ActionMesh server is normally plain HTTP. Put the server behind TLS for
-anything beyond a trusted network. Details in
-[`android/README.md`](android/README.md).
+```bash
+.venv/bin/python -m actionmesh.cli serve    # http://127.0.0.1:8000
+```
 
-The service worker caches **only the app shell**. It deliberately never caches
-`/audit`, `/executions`, or `/capabilities`: a stale execution record or audit
-chain would be a lie in a system built to report what actually happened.
+Live acceptance (browser/e2e only; everything else skips honestly):
 
+```bash
+ACTIONMESH_LIVE_ACCEPTANCE=1 .venv/bin/python -m pytest tests/e2e/test_phase2_live_acceptance.py tests/e2e/test_phase3_live_acceptance.py -q
+```
+
+Without that env var these tests report BLOCKED (skipped with a reason),
+which is the honest result when no real bridge/player/network is present.
+Do not claim live verification from a skipped run.
+
+---
+
+## Architecture in one screen
+
+| Layer | Location | Job |
+|---|---|---|
+| Protocol | `actionmesh/protocol/` | `Action`, `GraphNode`, envelopes, risk enums |
+| Registry | `actionmesh/core/registry/` | Describes capabilities; never executes, never authorizes |
+| Permissions | `actionmesh/core/permissions/` | Closed catalog; `PolicyEngine` alone decides ALLOW/DENY/ASK |
+| Graph | `actionmesh/core/graph/` | Compose, cycle-detect, order, pre-flight authorize |
+| Planner | `actionmesh/core/planner.py` | Proposes `{type, parameters}` only; output is untrusted |
+| Executor | `actionmesh/core/executor/engine.py` | Runs approved graphs; does not certify its own work |
+| Verification | `actionmesh/core/verification/` | Independent re-read of the world; `verify()` stays `verified=False` until observed |
+| Audit | `actionmesh/core/audit/` | Hash-chained, tamper-evident record |
+| Laptop agent | `actionmesh/agent/` | **Only** place with real OS access (60 ops) |
+| VoiceOS | `actionmesh/voiceos/` | Voice client through `/plan` → `/execute` → approval; cannot reach the consent surface |
+| Desktop | `desktop/` | Electron shell; single `contextBridge` in `preload.js`; `sandbox`/`contextIsolation` on, `nodeIntegration` off; renderer CSP above |
+
+Security invariants (never weakened): a client cannot define its own
+authority (no `grants` in bodies); risk = `max(action, definition)`; CRITICAL
+needs explicit per-`action_id` approval; unverified is never success; content
+never crosses the result boundary; workspace paths are confined; fail closed;
+no model-generated freeform code execution. Full list in
+[`AGENTS.md`](AGENTS.md) and [`docs/project/SECURITY_MODEL.md`](docs/project/SECURITY_MODEL.md).
+
+---
+
+## Documentation
+
+Start at [`docs/project/AI_HANDOFF.md`](docs/project/AI_HANDOFF.md) for
+agents, or [`PROJECT.md`](PROJECT.md) for the whole picture.
+
+- [`docs/project/CURRENT_STATUS.md`](docs/project/CURRENT_STATUS.md) — evidence-based inventory (LIVE / INTEGRATED / BLOCKED / NOT IMPLEMENTED)
+- [`docs/project/ROADMAP.md`](docs/project/ROADMAP.md) — P0–P3 remaining work
+- [`docs/project/TESTING_AND_ACCEPTANCE.md`](docs/project/TESTING_AND_ACCEPTANCE.md) — suite map; historical counts labeled as such
+- [`docs/project/SYSTEM_ARCHITECTURE.md`](docs/project/SYSTEM_ARCHITECTURE.md) — components and diagrams
+- [`docs/project/SECURITY_MODEL.md`](docs/project/SECURITY_MODEL.md) — controls and invariants
+- [`docs/project/API_REFERENCE.md`](docs/project/API_REFERENCE.md) — the 49 routes
+- [`docs/c42-execution-contract.md`](docs/c42-execution-contract.md) — binding capability contract (code wins on disagreement)
+- [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/permissions.md`](docs/permissions.md), [`docs/registry.md`](docs/registry.md), [`docs/action-graph.md`](docs/action-graph.md), [`docs/providers.md`](docs/providers.md), [`docs/provider-contract.md`](docs/provider-contract.md), [`docs/voiceos.md`](docs/voiceos.md), [`docs/audit.md`](docs/audit.md), [`docs/rest-api.md`](docs/rest-api.md), [`docs/deployment.md`](docs/deployment.md)
+- [`HANDOFF.md`](HANDOFF.md) — short continuation state
+- [`android/README.md`](android/README.md) — Android APK shell
 
 > ### ⚠️ This repository is a reconstruction
 >
@@ -126,140 +176,9 @@ chain would be a lie in a system built to report what actually happened.
 > treat the code as a fresh implementation and re-verify before relying on it.
 >
 > **The first commit was made after the reconstruction, not during it.** This
-> history therefore starts from a verified state — real diffs, real rollback and
-> real blame from that commit onward, and no history before it.
-> `scripts/snapshot.py` is kept as an independent zip backup; it is belt and
-> braces, not the primary safety net.
-
-### What is real vs. simulated
-
-The registry, policy engine, graph layer and **execution engine** are real
-logic. The *providers* are not: all 16 seeded actions use `provider="mock"`,
-and `MockProvider` keeps state in memory. Every execution result therefore
-carries `simulated: true`, and no real message, file or payment has ever been
-sent.
-
-The API, realtime transport, dashboard, and SQLite execution, consent, and
-idempotency stores exist. The default application wiring remains in memory, and
-there is no real vendor integration.
-
-
----
-
-## Requirements
-
-```text
-Python 3.11+   (verified on 3.12.10)
-Runtime: FastAPI; SQLite uses the Python standard library.
-```
-
-
-Explore the platform interactively:
-
-```python
-from actionmesh.core.graph import GraphBuilder, execution_order
-from actionmesh.core.permissions import (
-    PolicyEngine, PermissionGrant, build_context, default_policy,
-)
-from actionmesh.core.registry import ActionRegistry
-from actionmesh.protocol.models import Identity, RiskLevel
-
-registry = ActionRegistry.with_seeds()          # 16 MOCK capabilities
-engine = PolicyEngine()
-
-builder = GraphBuilder("tell mom I'll be late")
-builder.action({"type": "message.send", "parameters": {"message": "I'll be late"}}, node_id="a1")
-builder.action({"type": "reminder.create", "parameters": {"text": "call mom", "time": "8pm"}},
-               node_id="a2", depends_on=["a1"])
-builder.end(depends_on=["a2"])
-graph = builder.build()
-
-print(execution_order(graph))                    # ['a1', 'a2', 'end']
-
-resolved = registry.resolve(graph.nodes[0].action)
-outcome = engine.evaluate(build_context(
-    resolved.action, resolved.definition, Identity(id="user_1"),
-    policy=default_policy(),
-    grants=[PermissionGrant(scope="message.send", max_risk=RiskLevel.HIGH)],
-))
-print(outcome.decision, outcome.requires_approval)   # PolicyDecision.ASK True
-```
-
-The release CLI is available through the project entry point:
-
-```powershell
-actionmesh capabilities --provider mock
-actionmesh dashboard
-actionmesh serve  # requires: pip install "actionmesh[server]"
-```
-
-The last line is the whole point: **the AI cannot send that message on its own.**
-
----
-
-## Architecture
-
-Strictly layered, dependencies pointing one way only:
-
-```text
-intent → graph → registry → permissions → executor → providers
-```
-
-| Package | Phase | Responsibility |
-|---------|-------|----------------|
-| `actionmesh/protocol/` | C1 | `Action`, `GraphNode`, `ActionGraph`, `Permission`, `Policy`, `ApprovalRequest`, `VerificationResult`, enums, fail-closed validation, version negotiation |
-| `actionmesh/core/registry/` | C2 | Register / discover / resolve / version. Describes actions; never executes them, never authorizes. |
-| `actionmesh/core/permissions/` | C3 | Closed permission catalog, exact grant matching, risk model, `PolicyEngine`, `ConsentStore`. The trusted authorization boundary. |
-| `actionmesh/core/graph/` | C4 | Build, validate, cycle-detect, order deterministically, serialize, and pre-flight authorize. |
-| `actionmesh/providers/` | C7 | Simulated domain providers and the real-provider safety boundary. |
-| `actionmesh/core/planner.py` | C18 | Intent → an untrusted candidate plan. Emits `{type, parameters}` only — it can never set risk, permissions, dependencies or state, and it never authorizes or executes. |
-
-### Layer rules (enforced by tests)
-
-- The **registry** never executes, never calls a provider, never decides policy.
-- The **policy engine** is the only thing that produces an authorization decision.
-- The **graph** layer composes the registry and the engine; it re-implements neither.
-- The **planner** only proposes. Its output is untrusted until `plan_to_graph`
-  re-validates it, and anything it could not map is recorded rather than dropped.
-- **LLM output is untrusted data.** It cannot grant itself a permission, lower
-  its own risk, or set a lifecycle state — see `tests/security/`.
-- **VoiceOS presses; it does not decide.** `GET /voice` runs through the same
-  `/plan` → `/execute` → approval → executor path as the control room, and every
-  privileged step is its own press: running is a click on a previewed plan, approving
-  is a click naming one `action_id`, and the consent surface is unreachable from it.
-  There is no audio-capture path — the microphone's text is the only thing it can send.
-  See [`docs/voiceos.md`](docs/voiceos.md).
-
-## Documentation
-
-- [`PROJECT.md`](PROJECT.md) — the whole picture: what it does, what is verified, what remains, where it is going
-- [`docs/architecture.md`](docs/architecture.md) — layering and trust boundaries
-- [`docs/voiceos.md`](docs/voiceos.md) — the voice surface: its boundary, the browser-speech privacy evaluation, and what is not built
-- [`docs/permissions.md`](docs/permissions.md) — permission & policy model, precedence
-- [`docs/registry.md`](docs/registry.md) — action definition contract
-- [`docs/action-graph.md`](docs/action-graph.md) — node types, cycles, ordering
-- [`docs/providers.md`](docs/providers.md) — simulated providers and boundaries
-- [`docs/provider-contract.md`](docs/provider-contract.md) — provider-neutral adapter contract
-- [`docs/provider-requirements.md`](docs/provider-requirements.md) — selection requirements
-- [`docs/provider-evidence.md`](docs/provider-evidence.md) — official documentation evidence
-- [`docs/provider-decision-readiness.md`](docs/provider-decision-readiness.md) — post-selection gate
-- [`docs/security.md`](docs/security.md) — threat model and invariants
-- [`TASK_BOARD.md`](TASK_BOARD.md) — phase-by-phase status
-- [`HANDOFF.md`](HANDOFF.md) — continuation notes and known risks
-- [`android/README.md`](android/README.md) — the Android APK shell and how to build it
+> history therefore starts from a verified state — real diffs, real rollback
+> and real blame from that commit onward, and no history before it.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-
-Optional dev tools: `pip install -e ".[dev]"` for `pytest`, `ruff`, `mypy`.
-
-## Quick start
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-python -m unittest discover -s tests -v     # 144 tests
-```

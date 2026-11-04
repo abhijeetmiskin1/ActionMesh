@@ -47,6 +47,16 @@ class _Fixture(unittest.TestCase):
         )
 
     def pair(self, actor: str = "abhi", phone: str = "phone-1") -> str:
+        grant = self.local.post(
+            "/consents",
+            json={
+                "actor_id": actor,
+                "scope": "device.control",
+                "max_risk": "critical",
+                "reason": "fixture consent before pairing",
+            },
+        )
+        self.assertEqual(grant.status_code, 200, grant.text)
         code = self.local.post(
             "/pairing/code", json={"device_id": "laptop-1", "max_risk": "high"}
         ).json()["code"]

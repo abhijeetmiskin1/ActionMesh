@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from actionmesh.core.sqlite_guard import guarded, make_lock
 from actionmesh.protocol.models import DeviceKind, MeshModel
 
 
@@ -76,6 +77,10 @@ class DeviceIdentity(MeshModel):
     label: str = ""
     created_at: datetime = field(default_factory=_utcnow)
     revoked_at: datetime | None = None
+    #: Optional expiry. When set, the identity stops resolving at this moment —
+    #: fail closed like a revocation, but without needing a revoke call. An
+    #: identity with no expiry keeps today's behaviour (revocation only).
+    expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.device_id, str) or not self.device_id.strip():
@@ -89,6 +94,15 @@ class DeviceIdentity(MeshModel):
     def revoked(self) -> bool:
         return self.revoked_at is not None
 
+    def is_expired(self, now: datetime | None = None) -> bool:
+        if self.expires_at is None:
+            return False
+        return (now or _utcnow()) >= self.expires_at
+
+    def is_active(self, now: datetime | None = None) -> bool:
+        moment = now or _utcnow()
+        return not self.revoked and not self.is_expired(moment)
+
 
 class IdentityStore:
     """In-memory identity ledger. ``SQLiteIdentityStore`` is the durable form."""
@@ -98,6 +112,7 @@ class IdentityStore:
         self._by_device: dict[str, str] = {}
 
     # -- enrollment -------------------------------------------------------
+    @guarded
     def enroll(
         self,
         device_id: str,
@@ -105,6 +120,7 @@ class IdentityStore:
         *,
         label: str = "",
         now: datetime | None = None,
+        expires_at: datetime | None = None,
     ) -> DeviceIdentity:
         """Mint the identity for ``device_id``.
 
@@ -134,10 +150,12 @@ class IdentityStore:
             kind=kind,
             label=label.strip(),
             created_at=now or _utcnow(),
+            expires_at=expires_at,
         )
         self._write(identity)
         return identity
 
+    @guarded
     def revoke(
         self, identity_id: str, *, now: datetime | None = None
     ) -> DeviceIdentity:
@@ -154,9 +172,37 @@ class IdentityStore:
             label=identity.label,
             created_at=identity.created_at,
             revoked_at=now or _utcnow(),
+            expires_at=identity.expires_at,
         )
         self._write(renewed)
         return renewed
+
+    def unbind(self, device_id: str) -> bool:
+        """Release ``device_id`` so a revoked/expired identity can be replaced.
+
+        This is the second half of the "revoke-then-enroll is deliberately two
+        steps" rule: an identity record is never deleted (the audit trail
+        written under it must stay attributable), but the device_id -> identity_id
+        binding is what blocks re-enrollment, and dropping that binding after a
+        revocation lets a *new* identity — with a new audit trail of its own —
+        take the device_id. The old identity keeps its record and still fails
+        :meth:`resolve`.
+
+        Returns False when the device had no binding. Raises rather than
+        unbinding a live identity: unbinding an active identity would leave a
+        device whose credentials still authenticate against an identity no
+        binding points at.
+        """
+        identity = self.for_device(device_id)
+        if identity is None:
+            return False
+        if identity.is_active():
+            raise IdentityError(
+                f"refusing to unbind live identity {identity.identity_id!r}; "
+                "revoke the identity before replacing it"
+            )
+        self._by_device.pop(device_id, None)
+        return True
 
     # -- resolution -------------------------------------------------------
     def get(self, identity_id: str) -> DeviceIdentity | None:
@@ -166,7 +212,9 @@ class IdentityStore:
         key = self._by_device.get(device_id)
         return self._by_identity[key] if key is not None else None
 
-    def resolve(self, identity_id: str) -> DeviceIdentity:
+    def resolve(
+        self, identity_id: str, *, now: datetime | None = None
+    ) -> DeviceIdentity:
         """Resolve an identity, refusing anything not active.
 
         This is the only entry point a security decision should use. A record
@@ -179,6 +227,8 @@ class IdentityStore:
             raise IdentityError(f"unknown identity {identity_id!r}")
         if identity.revoked:
             raise IdentityError(f"identity {identity_id!r} is revoked")
+        if identity.is_expired(now):
+            raise IdentityError(f"identity {identity_id!r} has expired")
         return identity
 
     def active_for_device(self, device_id: str) -> DeviceIdentity:
@@ -216,6 +266,11 @@ def _decode(payload: str) -> DeviceIdentity:
             if raw.get("revoked_at")
             else None
         ),
+        expires_at=(
+            datetime.fromisoformat(str(raw["expires_at"]))
+            if raw.get("expires_at")
+            else None
+        ),
     )
 
 
@@ -230,29 +285,98 @@ class SQLiteIdentityStore(IdentityStore):
     def __init__(self, path: str | Path = ":memory:") -> None:
         super().__init__()
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        self._lock = make_lock()
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS device_identities "
             "(identity_id TEXT PRIMARY KEY, device_id TEXT NOT NULL UNIQUE, "
             "payload TEXT NOT NULL)"
         )
         self.connection.commit()
+        #: Identity ids whose bindings were durably released via :meth:`unbind`.
+        #: Kept so a later :meth:`_write` (e.g. a revoke of an already-dead
+        #: identity) cannot resurrect the binding from its ``device_id`` field.
+        self._unbound: set[str] = set()
         for row in self.connection.execute(
             "SELECT payload FROM device_identities"
         ).fetchall():
             identity = _decode(row[0])
-            super()._write(identity)
+            if json.loads(row[0]).get("unbound"):
+                # Record only — no device_id -> identity_id binding restored.
+                self._by_identity[identity.identity_id] = identity
+                self._unbound.add(identity.identity_id)
+            else:
+                super()._write(identity)
 
     def _write(self, identity: DeviceIdentity) -> None:
+        payload = json.loads(identity.model_dump_json())
+        if identity.identity_id in self._unbound:
+            payload["unbound"] = True
         self.connection.execute(
             "INSERT OR REPLACE INTO device_identities"
             "(identity_id, device_id, payload) VALUES (?, ?, ?)",
-            (identity.identity_id, identity.device_id, identity.model_dump_json()),
+            (
+                identity.identity_id,
+                (
+                    f"__unbound:{identity.identity_id}"
+                    if identity.identity_id in self._unbound
+                    else identity.device_id
+                ),
+                json.dumps(payload),
+            ),
         )
         self.connection.commit()
-        super()._write(identity)
+        self._by_identity[identity.identity_id] = identity
+        if identity.identity_id not in self._unbound:
+            self._by_device[identity.device_id] = identity.identity_id
 
+    @guarded
     def close(self) -> None:
         self.connection.close()
+
+    @guarded
+    def unbind(self, device_id: str) -> bool:
+        """Durable form of the device -> identity binding drop.
+
+        The in-memory base only pops ``self._by_device``; the row in
+        ``device_identities`` keeps the (still-bound) payload so a restart
+        would replay it and resurrect the very binding :meth:`unbind` dropped.
+        That resurrection is the Phase-4 gap this override closes: after a
+        restart the device would again read as "already enrolled as <revoked
+        identity>" and the operator's re-enrollment after revoke+unbind would
+        be refused forever.
+
+        The binding is released durably: the row's payload gains
+        ``unbound: true`` (the replay records the identity for audit
+        attribution but does not restore ``_by_device``), and the SQL
+        ``device_id`` column is renamed to a dead-namespace sentinel so a
+        later write of the dead identity — a revoke, say — cannot collide
+        with the replacement's row under the table's ``UNIQUE(device_id)``. The record itself is preserved and
+        :meth:`resolve` still refuses it.
+        """
+        identity = self.for_device(device_id)
+        if identity is None:
+            return False
+        if identity.is_active():
+            raise IdentityError(
+                f"refusing to unbind live identity {identity.identity_id!r}; "
+                "revoke the identity before replacing it"
+            )
+        stored = self.connection.execute(
+            "SELECT payload FROM device_identities WHERE identity_id = ?",
+            (identity.identity_id,),
+        ).fetchone()
+        if stored is None or not json.loads(stored[0]).get("unbound"):
+            payload = json.loads(stored[0]) if stored else identity.model_dump()
+        payload["unbound"] = True
+        self.connection.execute(
+            "UPDATE device_identities SET payload = ?, device_id = ? "
+            "WHERE identity_id = ?",
+            (json.dumps(payload), f"__unbound:{identity.identity_id}", identity.identity_id),
+        )
+        self.connection.commit()
+        self._by_device.pop(device_id, None)
+        self._unbound.add(identity.identity_id)
+        return True
 
 
 __all__ = [

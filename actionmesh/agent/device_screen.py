@@ -30,7 +30,6 @@ tree that has no actionable element in the asked-for window is an empty list, no
 
 from __future__ import annotations
 
-import asyncio
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -1212,8 +1211,8 @@ def _element_payload(
 
 __all__ = [
     "capture_screenshot",
-    "inspect_gui",
     "click_element",
-    "type_text",
+    "inspect_gui",
     "scroll_element",
+    "type_text",
 ]

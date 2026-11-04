@@ -28,7 +28,10 @@ from actionmesh.agent.config import (
 from actionmesh.agent.definitions import (
     CAPABILITIES,
     IMPLEMENTED,
+    REQUIRING_BROWSER,
     REQUIRING_DESKTOP,
+    REQUIRING_MEDIA,
+    REQUIRING_PAYMENT,
     device_definitions,
     register_device_actions,
 )
@@ -38,8 +41,8 @@ from actionmesh.core.devices import DEFAULT_STALE_AFTER_S, DeviceRegistry
 from actionmesh.core.events import EventHub
 from actionmesh.core.identity import IdentityError, IdentityStore
 from actionmesh.core.permissions.catalog import is_concrete
-from actionmesh.core.registry import ActionRegistry
 from actionmesh.core.permissions.risk import risk_rank
+from actionmesh.core.registry import ActionRegistry
 from actionmesh.protocol.models import DeviceKind, RiskLevel
 
 
@@ -97,12 +100,17 @@ class TestConfig(unittest.TestCase):
         self.assertIn("device.server.start", advertised)
         with tempfile.TemporaryDirectory() as root:
             rooted = AgentConfig(device_id="laptop-1", workspace_root=root, allow_shell=True)
-        # Root + shell opens every capability that is gated on those two boundaries.
-        # The desktop capabilities are *not* opened by either: they need the third
-        # boundary (``allow_desktop``) and a reachable session, so they are excluded
-        # by name rather than by accident.
+        # Root + shell opens every capability gated on those two boundaries, but NOT
+        # the payment-gated submits (own boundary, closed by default), NOT the
+        # desktop ones (third boundary), and NOT the browser/media ones (own
+        # boundaries, closed by default). All gated sets are excluded by name.
         self.assertEqual(
-            set(rooted.advertise()), set(IMPLEMENTED) - set(REQUIRING_DESKTOP)
+            set(rooted.advertise()),
+            set(IMPLEMENTED)
+            - set(REQUIRING_DESKTOP)
+            - set(REQUIRING_PAYMENT)
+            - set(REQUIRING_BROWSER)
+            - set(REQUIRING_MEDIA),
         )
         self.assertIn("device.terminal.execute", rooted.advertise())
         self.assertIn("device.file.read", rooted.advertise())
@@ -113,10 +121,19 @@ class TestConfig(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             config = AgentConfig(device_id="laptop-1", workspace_root=root, allow_shell=True)
         advertised = set(config.advertise())
-        # Every capability the brief names is defined; the desktop ones are defined
-        # but withheld until their own boundary is opened.
-        self.assertEqual(advertised, set(CAPABILITIES) - set(REQUIRING_DESKTOP))
-        self.assertEqual(advertised, set(IMPLEMENTED) - set(REQUIRING_DESKTOP))
+        # Every capability the brief names is defined; the desktop, payment-gated
+        # and browser/media-gated ones are defined but withheld until their own
+        # boundaries are opened.
+        self.assertEqual(
+            advertised,
+            set(CAPABILITIES) - set(REQUIRING_DESKTOP) - set(REQUIRING_PAYMENT)
+            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA),
+        )
+        self.assertEqual(
+            advertised,
+            set(IMPLEMENTED) - set(REQUIRING_DESKTOP) - set(REQUIRING_PAYMENT)
+            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA),
+        )
         for capability in advertised:
             self.assertTrue(registry.has(capability), capability)
 
@@ -510,8 +527,10 @@ class TestAgentInTheService(unittest.TestCase):
         offered = client.get("/capabilities", params={"provider": "laptop"}).json()
         names = [item["action"] for item in offered]
         # File and project capabilities only: this app was configured with a
-        # workspace root and no shell flag.
-        self.assertEqual(len(offered), 7)
+        # workspace root and no shell flag. The C42 file verbs (11) are part of
+        # the workspace-root boundary too, so the count is 7 + 11 = 18; the
+        # browser/media ones stay behind their own flags (none set here).
+        self.assertEqual(len(offered), 18)
         self.assertIn("device.project.list", names)
         self.assertNotIn("device.terminal.execute", names)
         self.assertNotIn("device.ide.open", names)

@@ -94,6 +94,16 @@ class TestPhoneControlsLaptop(unittest.TestCase):
     # -- ceremony ---------------------------------------------------------
     def pair(self, max_risk: str = "medium") -> str:
         """The ceremony: the laptop chooses the ceiling, the phone spends the code."""
+        grant = self.laptop.post(
+            "/consents",
+            json={
+                "actor_id": ACTOR,
+                "scope": "device.control",
+                "max_risk": "critical",
+                "reason": "fixture consent before pairing",
+            },
+        )
+        self.assertEqual(grant.status_code, 200, grant.text)
         code = self.laptop.post(
             "/pairing/code", json={"device_id": "laptop-1", "max_risk": max_risk}
         ).json()["code"]

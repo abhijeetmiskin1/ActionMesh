@@ -16,6 +16,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+from actionmesh.core.sqlite_guard import guarded, make_lock
 from actionmesh.protocol.models import AuditRecord
 
 _COLUMNS = (
@@ -30,6 +31,7 @@ class SqliteAuditBackend:
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._lock = make_lock()
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS audit_records ("
             "seq INTEGER PRIMARY KEY, "
@@ -47,6 +49,7 @@ class SqliteAuditBackend:
         )
         self.connection.commit()
 
+    @guarded
     def write(self, record: AuditRecord) -> None:
         """Append one record. Fails loudly if ``seq`` already exists."""
         dumped = record.model_dump()
@@ -70,6 +73,7 @@ class SqliteAuditBackend:
         )
         self.connection.commit()
 
+    @guarded
     def read_all(self) -> list[AuditRecord]:
         """Every record, in chain order."""
         rows = self.connection.execute(
@@ -77,6 +81,7 @@ class SqliteAuditBackend:
         ).fetchall()
         return [self._to_record(row) for row in rows]
 
+    @guarded
     def count(self) -> int:
         row = self.connection.execute(
             "SELECT COUNT(*) FROM audit_records"
@@ -102,6 +107,7 @@ class SqliteAuditBackend:
             record_hash=row[11],
         )
 
+    @guarded
     def close(self) -> None:
         self.connection.close()
 

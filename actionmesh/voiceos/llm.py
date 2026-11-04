@@ -21,7 +21,9 @@ Two providers, both real:
   no credential at all: the Electron main process keeps the key in the OS keyring and
   makes the call, and VoiceOS asks it over a private Unix socket authorised by a
   per-launch token. What comes back is the model's answer and nothing else — the token
-  authorises "talk to this socket", not "use this key".
+  authorises "talk to this socket", not "use this key". That bridge is the only route
+  to the desktop app's ``openai``, ``gemini`` and ``openai_compatible`` providers;
+  they have no direct Python transport, and :data:`AVAILABLE_PROVIDERS` says so.
 
 What crosses the wire is deliberately small and stated to the user:
 
@@ -94,12 +96,22 @@ DEFAULT_MODEL = "claude-sonnet-5-5"
 #: hundreds of actions should summarise them rather than mail the whole registry.
 MAX_CATALOG_ACTIONS = 60
 
-#: Providers that this build can actually reach, given a credential.
+#: Provider names that :func:`build_provider` accepts.
 #:
-#: ``"anthropic"`` reaches the official endpoint from this process, with a key from the
-#: environment. ``"desktop"`` (C41) reaches nothing from here: the Electron main process
-#: holds the key and makes the call, and this process talks to it over a private Unix
-#: socket. Both are genuinely wired; neither is a placeholder.
+#: ``"anthropic"`` reaches the official Messages endpoint from this process,
+#: with a key from the environment. ``"openai"``, ``"gemini"`` and
+#: ``"openai_compatible"`` have **no direct Python transport**: their calls,
+#: when they exist, are made by the Electron main process in
+#: ``desktop/app/providers.js`` (where all three are ``implemented: true``),
+#: and this process reaches them only over the C41 desktop bridge. Naming
+#: them here would claim a direct API that the closed transport
+#: (``OFFICIAL_ENDPOINTS``) does not carry, so they are deliberately **not**
+#: added until an endpoint review approves them. ``"desktop"`` is the one
+#: bridge-routed name: the provider the bridge picks comes from the desktop
+#: app's own settings and may be OpenAI, Gemini or an OpenAI-compatible
+#: endpoint, but this process never sees the key or the provider name.
+#: The names below are therefore the Python facts; the desktop capability
+#: table lives in ``providers.js``.
 AVAILABLE_PROVIDERS: frozenset[str] = frozenset({"anthropic", "desktop"})
 
 

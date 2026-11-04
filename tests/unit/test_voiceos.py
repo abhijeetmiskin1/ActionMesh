@@ -99,6 +99,21 @@ class _PairedApp(unittest.TestCase):
         self.app.state.engine.local_device_id = "laptop-1"
         self.actor_a = "phone-a"
         self.actor_b = "phone-b"
+        # CredentialStore.issue() refuses minting above the actor's consented
+        # ceiling. The operator (this laptop) grants the phone actors a
+        # critical consent explicitly before pairing, so no credential is
+        # minted above what the operator actually consented to.
+        for actor in (self.actor_a, self.actor_b):
+            grant = self.local.post(
+                "/consents",
+                json={
+                    "actor_id": actor,
+                    "scope": "device.control",
+                    "max_risk": "critical",
+                    "reason": "fixture consent before pairing",
+                },
+            )
+            self.assertEqual(grant.status_code, 200, grant.text)
         self.token_a = self._pair("phone-a", self.actor_a)
         self.token_b = self._pair("phone-b", self.actor_b)
         # The store opens on the first VoiceOS turn and is closed by the lifespan;

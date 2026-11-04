@@ -34,6 +34,9 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
+from actionmesh.agent.browser import BridgeDriver, BrowserEngine
+from actionmesh.agent.browser_bridge import BrowserBridgeConfig
+from actionmesh.agent.browser_bridge import make_request as _make_browser_request
 from actionmesh.agent.commands import CommandDecision, CommandPolicy
 from actionmesh.agent.definitions import PROVIDER
 from actionmesh.agent.errors import (
@@ -41,7 +44,9 @@ from actionmesh.agent.errors import (
     PathNotFound,
     ProcessError,
 )
+from actionmesh.agent.files import FilesEngine
 from actionmesh.agent.ides import KNOWN_IDES, EditorDiscovery, EditorNotFound
+from actionmesh.agent.media import MediaEngine, MprisMediaDriver
 from actionmesh.agent.paths import ResolvedPath, Workspace
 from actionmesh.agent.processes import (
     EXITED,
@@ -117,6 +122,49 @@ class LaptopProvider(ActionProvider):
             "device.gui.click",
             "device.gui.type",
             "device.gui.scroll",
+            # C42: the consequential web submits. Claimed here because a handler exists
+            # for them — one that refuses with ``PERMANENT`` when no payment backend is
+            # configured. ``SUPPORTED == definitions.IMPLEMENTED`` is asserted by a test,
+            # and the alternative to claiming them is a capability the agent can be
+            # asked for and has no answer for at all.
+            "booking.submit",
+            "order.place",
+            # C42: the controlled browser and its thirteen named operations.
+            "browser.open",
+            "browser.navigate",
+            "browser.search",
+            "browser.inspect",
+            "browser.snapshot",
+            "browser.click",
+            "browser.type",
+            "browser.select",
+            "browser.scroll",
+            "browser.back",
+            "browser.forward",
+            "browser.refresh",
+            "browser.wait",
+            "browser.stop",
+            # C42: the richer confined file verbs.
+            "device.files.list",
+            "device.files.search",
+            "device.files.read",
+            "device.files.open",
+            "device.files.info",
+            "device.files.create",
+            "device.files.rename",
+            "device.files.move",
+            "device.files.copy",
+            "device.files.edit",
+            "device.files.trash",
+            # C42: local playback through the MPRIS adapter (read-back verified).
+            "media.status",
+            "media.play",
+            "media.pause",
+            "media.next",
+            "media.previous",
+            "media.volume",
+            "media.open_file",
+            "media.open_url",
         }
     )
 
@@ -147,6 +195,50 @@ class LaptopProvider(ActionProvider):
             "device.gui.click",
             "device.gui.type",
             "device.gui.scroll",
+            # C42: a submit blocks on a remote checkout, so it is awaited. It is in
+            # ``ASYNC_ACTIONS`` for the same reason the socket probes are — off the event
+            # loop — and, incidentally, that is also the path that has no workspace
+            # guard, which is correct: a submit drives a website, not a path.
+            "booking.submit",
+            "order.place",
+            # C42: browser operations block on IPC to another process (the
+            # desktop window), so they are awaited off the event loop.
+            "browser.open",
+            "browser.navigate",
+            "browser.search",
+            "browser.inspect",
+            "browser.snapshot",
+            "browser.click",
+            "browser.type",
+            "browser.select",
+            "browser.scroll",
+            "browser.back",
+            "browser.forward",
+            "browser.refresh",
+            "browser.wait",
+            "browser.stop",
+            # C42: file verbs walk directories and copy/edit/trash, which block
+            # on I/O and D-Bus: awaited off the event loop.
+            "device.files.list",
+            "device.files.search",
+            "device.files.read",
+            "device.files.open",
+            "device.files.info",
+            "device.files.create",
+            "device.files.rename",
+            "device.files.move",
+            "device.files.copy",
+            "device.files.edit",
+            "device.files.trash",
+            # C42: media operations round-trip to the player over D-Bus.
+            "media.status",
+            "media.play",
+            "media.pause",
+            "media.next",
+            "media.previous",
+            "media.volume",
+            "media.open_file",
+            "media.open_url",
         }
     )
 
@@ -161,6 +253,7 @@ class LaptopProvider(ActionProvider):
         log_dir: str = "",
         ledger: Any = None,
         device_id: str = "",
+        browser_bridge: BrowserBridgeConfig | None = None,
     ) -> None:
         self.workspace = workspace
         #: The laptop's capability boundary. `None` means no program may be run at
@@ -194,6 +287,51 @@ class LaptopProvider(ActionProvider):
         #: is never enough to accept a named target.
         self.device_id = device_id
         self.processes.journal = self._journal_child
+        #: C42 — the controlled browser session, driven only by the named
+        #: operations. The driver is chosen by the host's *configuration*, never
+        #: by the request: when a bridge config is present the engine drives the
+        #: hardened window over the drive socket; otherwise it is a ``FakeDriver``
+        #: whose verbs answer ``unavailable`` honestly rather than claiming a
+        #: bridge that is not there. ``api.py`` builds the config from the env
+        #: main wrote at spawn, so the provider core never opens IPC itself.
+        self.browser: BrowserEngine = (
+            BrowserEngine(BridgeDriver(_make_browser_request(browser_bridge)))
+            if browser_bridge is not None and browser_bridge.configured
+            else BrowserEngine()
+        )
+        #: C42 — the confined richer file verbs. ``FilesEngine`` reuses
+        #: ``Workspace`` for every resolution; the provider delegates and records
+        #: effects on the way back, exactly as it does for ``device.file.*``.
+        self.files: FilesEngine | None = (
+            FilesEngine(workspace) if workspace is not None else None
+        )
+        #: C42 — local playback through MPRIS. ``MediaEngine`` is constructed
+        #: with the driver, the configured workspace (for ``open_file``
+        #: confinement), and a ``browser_open`` delegate that routes
+        #: ``open_url`` through the browser capability. Constructed eagerly so a
+        #: capability that is not advertised is still honestly ``unavailable``
+        #: rather than ``not supported``.
+        #: Legacy sync delegate: the engine's ``open_url`` takes a callable
+        #: returning a plain dict, and this handler runs in ``_execute_async``
+        #: as an awaited call, so the async path (below, ``_media_open_url``)
+        #: is the one that runs. Kept honest by reading the live engine state
+        #: rather than navigating: it never claims "opened".
+        _browser = self.browser
+        def _media_open_url(url: str) -> dict[str, Any]:  # sync delegate for MediaEngine
+            if not _browser.is_open:
+                return {"status": "unavailable", "reason": "no browser session — call open first"}
+            return {"status": "ok", "url": url, "note": "media.open_url delegates to the controlled browser; use browser.navigate for a verified navigation"}
+        #: The media engine is constructed eagerly so a capability that is not
+        #: advertised is still honestly ``unavailable`` rather than ``not
+        #: supported``. Its ``open_url`` delegates through the *browser
+        #: capability*, and the provider's ``_media_open_url`` is async — the
+        #: engine's sync callable is only the legacy delegate above; the real
+        #: async navigation happens in the provider wrapper.
+        self.media: MediaEngine = MediaEngine(
+            MprisMediaDriver(),
+            workspace=workspace,
+            browser_open=_media_open_url,
+        )
 
     # -- dispatch ---------------------------------------------------------
     def supports(self, action: Action) -> bool:
@@ -263,6 +401,48 @@ class LaptopProvider(ActionProvider):
             "device.gui.click": lambda: self._gui_click(action),
             "device.gui.type": lambda: self._gui_type(action),
             "device.gui.scroll": lambda: self._gui_scroll(action),
+            "booking.submit": lambda: self._submit(action),
+            "order.place": lambda: self._submit(action),
+            # C42 — the controlled browser. Each named operation is one method
+            # on ``BrowserEngine`` and one registered capability. There is no
+            # ``browser.eval`` and no ``browser.run_python`` here.
+            "browser.open": lambda: self._browser_open(action),
+            "browser.navigate": lambda: self._browser_navigate(action),
+            "browser.search": lambda: self._browser_search(action),
+            "browser.inspect": lambda: self._browser_inspect(action),
+            "browser.snapshot": lambda: self._browser_snapshot(action),
+            "browser.click": lambda: self._browser_click(action),
+            "browser.type": lambda: self._browser_type(action),
+            "browser.select": lambda: self._browser_select(action),
+            "browser.scroll": lambda: self._browser_scroll(action),
+            "browser.back": lambda: self._browser_back(action),
+            "browser.forward": lambda: self._browser_forward(action),
+            "browser.refresh": lambda: self._browser_refresh(action),
+            "browser.wait": lambda: self._browser_wait(action),
+            "browser.stop": lambda: self._browser_stop(action),
+            # C42 — the richer confined file verbs. Each is sync and confined
+            # to the workspace; it runs off the loop in a worker thread.
+            "device.files.list": lambda: self._files_list(action),
+            "device.files.search": lambda: self._files_search(action),
+            "device.files.read": lambda: self._files_read(action),
+            "device.files.open": lambda: self._files_open(action),
+            "device.files.info": lambda: self._files_info(action),
+            "device.files.create": lambda: self._files_create(action),
+            "device.files.rename": lambda: self._files_rename(action),
+            "device.files.move": lambda: self._files_move(action),
+            "device.files.copy": lambda: self._files_copy(action),
+            "device.files.edit": lambda: self._files_edit(action),
+            "device.files.trash": lambda: self._files_trash(action),
+            # C42 — local playback through MPRIS. Each is a read-back
+            # verified command on the media engine.
+            "media.status": lambda: self._media_status(action),
+            "media.play": lambda: self._media_play(action),
+            "media.pause": lambda: self._media_pause(action),
+            "media.next": lambda: self._media_next(action),
+            "media.previous": lambda: self._media_previous(action),
+            "media.volume": lambda: self._media_volume(action),
+            "media.open_file": lambda: self._media_open_file(action),
+            "media.open_url": lambda: self._media_open_url(action),
         }
         handler = handlers.get(action.type)
         if handler is None:
@@ -288,6 +468,384 @@ class LaptopProvider(ActionProvider):
             data=data,
             simulated=self.simulated,
         )
+
+    # -- C42: browser, files, media dispatch -----------------------------
+    #
+    # Each method below is one thin named wrapper around an engine. The
+    # provider's job here is argument extraction and effect recording; the
+    # engine owns the operation. ``_effects`` recording is the provider's
+    # job (engines do not thread action ids), exactly as for ``device.file.*``.
+    # No ``verify()`` override — verification stays the engine's job.
+
+    async def _browser_open(self, action: Action) -> dict[str, Any]:
+        url = action.parameters.get("url")
+        if not isinstance(url, str) or not url:
+            raise ProviderError("browser.open requires a url", FailureKind.INVALID_INPUT)
+        result = await self.browser.open(url)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_navigate(self, action: Action) -> dict[str, Any]:
+        url = action.parameters.get("url")
+        if not isinstance(url, str) or not url:
+            raise ProviderError("browser.navigate requires a url", FailureKind.INVALID_INPUT)
+        result = await self.browser.navigate(url)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_search(self, action: Action) -> dict[str, Any]:
+        query = action.parameters.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ProviderError("browser.search requires a query", FailureKind.INVALID_INPUT)
+        engine = action.parameters.get("engine")
+        if engine is not None and not isinstance(engine, str):
+            raise ProviderError("browser.search engine must be a string", FailureKind.INVALID_INPUT)
+        result = await self.browser.search(query, engine)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_inspect(self, action: Action) -> dict[str, Any]:
+        result = await self.browser.inspect()
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_snapshot(self, action: Action) -> dict[str, Any]:
+        result = await self.browser.snapshot()
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_click(self, action: Action) -> dict[str, Any]:
+        raw_ref = action.parameters.get("ref")
+        if not isinstance(raw_ref, int) or isinstance(raw_ref, bool):
+            raise ProviderError("browser.click requires an integer ref", FailureKind.INVALID_INPUT)
+        ref = raw_ref
+        double = bool(action.parameters.get("double", False))
+        result = await self.browser.click(ref, double)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_type(self, action: Action) -> dict[str, Any]:
+        ref = action.parameters.get("ref")
+        text = action.parameters.get("text", "")
+        if ref is None:
+            raise ProviderError("browser.type requires a ref", FailureKind.INVALID_INPUT)
+        if not isinstance(text, str):
+            raise ProviderError("browser.type text must be a string", FailureKind.INVALID_INPUT)
+        result = await self.browser.type_(ref, text)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_select(self, action: Action) -> dict[str, Any]:
+        ref = action.parameters.get("ref")
+        value = action.parameters.get("value")
+        if ref is None:
+            raise ProviderError("browser.select requires a ref", FailureKind.INVALID_INPUT)
+        if not isinstance(value, str):
+            raise ProviderError("browser.select value must be a string", FailureKind.INVALID_INPUT)
+        result = await self.browser.select(ref, value)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_scroll(self, action: Action) -> dict[str, Any]:
+        ref = action.parameters.get("ref")
+        direction = action.parameters.get("direction", "down")
+        amount = action.parameters.get("amount", 300)
+        result = await self.browser.scroll(ref, direction, amount)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_back(self, action: Action) -> dict[str, Any]:
+        result = await self.browser.back()
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_forward(self, action: Action) -> dict[str, Any]:
+        result = await self.browser.forward()
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_refresh(self, action: Action) -> dict[str, Any]:
+        result = await self.browser.refresh()
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_wait(self, action: Action) -> dict[str, Any]:
+        ms = action.parameters.get("ms")
+        until = action.parameters.get("until")
+        result = await self.browser.wait(ms, until)
+        self._record_browser_effect(action, result)
+        return result
+
+    async def _browser_stop(self, action: Action) -> dict[str, Any]:
+        # The engine's `stop()` is a deliberate zero-argument session teardown:
+        # it takes no reason, because no page learns why a session ended. The
+        # caller's reason is read (so a malformed parameter fails as input)
+        # but never forwarded to the driver or the page.
+        reason = action.parameters.get("reason", "stopped")
+        if reason is not None and not isinstance(reason, str):
+            raise ProviderError("browser.stop reason must be a string", FailureKind.INVALID_INPUT)
+        result = await self.browser.stop()
+        self._record_browser_effect(action, result)
+        return result
+
+    def _record_browser_effect(self, action: Action, result: dict[str, Any]) -> None:
+        """Record the engine's read-back as the verifier's witness, iff it is ``ok``.
+
+        The browser engine already reads the page back as part of every operation
+        (a navigation refreshes the facts, a click refreshes them after the
+        click, a snapshot rebuilds the ref map). Wait — the click handler does
+        not itself re-read; observe() therefore must not be the one to do so
+        either. What is recorded here is the *result the engine handed back*,
+        captured as a structural copy, so observe() can answer from the recorded
+        effect without issuing a second network request.
+
+        Only ``status == "ok"`` is a witness. Every refusal — ``stale``,
+        ``needs_user``, ``unavailable``, ``error`` — is no evidence at all, and
+        recording it as an effect would let verify() match on the label alone.
+        On a refusal we record nothing, exactly as the filesystem handlers do
+        when they raise.
+
+        Bounded and sanitized: the stored dict carries url/title and small
+        counts/flags only — never page text, element bodies, cookies, or
+        credentials. The engine already redacts those before returning, but the
+        record is re-sanitized here so a future engine change cannot leak them
+        into the ledger.
+        """
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return
+        effect: dict[str, Any] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "status": "ok",
+        }
+        # Only fixed, bounded evidence keys. Anything else (page text, refs,
+        # references into the window subtree, credentials) stays out.
+        for key in (
+            "url", "title", "url_after", "changed", "inserted",
+            "element_count", "count", "ref_map_size", "truncated", "results",
+        ):
+            if key in result:
+                effect[key] = result[key] if key != "results" else result[key][:10]
+        self._effects[action.action_id] = effect
+
+    # -- C42: files -------------------------------------------------------
+    def _files_engine(self) -> FilesEngine:
+        engine = self.files
+        if engine is None:
+            raise ProviderError("no workspace configured", FailureKind.AUTHORIZATION)
+        return engine
+
+    async def _files_list(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        limit = action.parameters.get("limit")
+        return await asyncio.to_thread(engine.list_, path, limit)
+
+    async def _files_search(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        pattern = action.parameters.get("pattern", "")
+        limit = action.parameters.get("limit")
+        return await asyncio.to_thread(engine.search, path, pattern, limit)
+
+    async def _files_read(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        if not isinstance(path, str) or not path:
+            raise ProviderError("device.files.read requires a path", FailureKind.INVALID_INPUT)
+        result = await asyncio.to_thread(engine.read, path)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "path": path,
+            "size": result.get("size"),
+            "sha256": result.get("sha256"),
+        }
+        return result
+
+    async def _files_open(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        return await asyncio.to_thread(engine.open_, path)
+
+    async def _files_info(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        return await asyncio.to_thread(engine.info, path)
+
+    async def _files_create(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        content = action.parameters.get("content", "")
+        result = await asyncio.to_thread(engine.create, path, content)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "path": path,
+            "bytes": result.get("bytes"),
+            "sha256": result.get("sha256"),
+        }
+        return result
+
+    async def _files_rename(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        to = action.parameters.get("to", "")
+        result = await asyncio.to_thread(engine.rename, path, to)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "path": path,
+            "to": to,
+        }
+        return result
+
+    async def _files_move(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        to = action.parameters.get("to", "")
+        result = await asyncio.to_thread(engine.move, path, to)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "path": path,
+            "to": to,
+        }
+        return result
+
+    async def _files_copy(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        to = action.parameters.get("to", "")
+        result = await asyncio.to_thread(engine.copy, path, to)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "path": path,
+            "to": to,
+            "copied": result.get("copied"),
+        }
+        return result
+
+    async def _files_edit(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        find = action.parameters.get("find", "")
+        replace = action.parameters.get("replace", "")
+        replace_all = bool(action.parameters.get("all", False))
+        result = await asyncio.to_thread(engine.edit, path, find, replace, replace_all)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "path": path,
+            "sha256": result.get("sha256"),
+            "replacements": result.get("replacements"),
+        }
+        return result
+
+    async def _files_trash(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        result = await asyncio.to_thread(engine.trash, path)
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "path": path,
+            "trashed": result.get("trashed", False),
+        }
+        return result
+
+    # -- C42: media -------------------------------------------------------
+    async def _media_status(self, action: Action) -> dict[str, Any]:
+        result = await asyncio.to_thread(self.media.status)
+        self._record_media_effect(action, result)
+        return result
+
+    async def _media_play(self, action: Action) -> dict[str, Any]:
+        ref = action.parameters.get("ref")
+        result = await asyncio.to_thread(self.media.play, ref)
+        self._record_media_effect(action, result)
+        return result
+
+    async def _media_pause(self, action: Action) -> dict[str, Any]:
+        ref = action.parameters.get("ref")
+        result = await asyncio.to_thread(self.media.pause, ref)
+        self._record_media_effect(action, result)
+        return result
+
+    async def _media_next(self, action: Action) -> dict[str, Any]:
+        result = await asyncio.to_thread(self.media.next_track)
+        self._record_media_effect(action, result)
+        return result
+
+    async def _media_previous(self, action: Action) -> dict[str, Any]:
+        result = await asyncio.to_thread(self.media.previous_track)
+        self._record_media_effect(action, result)
+        return result
+
+    async def _media_volume(self, action: Action) -> dict[str, Any]:
+        level = action.parameters.get("level")
+        muted = action.parameters.get("muted")
+        result = await asyncio.to_thread(self.media.volume, level, muted)
+        self._record_media_effect(action, result)
+        return result
+
+    async def _media_open_file(self, action: Action) -> dict[str, Any]:
+        path = action.parameters.get("path", "")
+        result = await asyncio.to_thread(self.media.open_file, path)
+        self._record_media_effect(action, result)
+        return result
+
+    def _record_media_effect(self, action: Action, result: dict[str, Any]) -> None:
+        """Record the engine's read-back as the verifier's witness, iff it is ``ok``.
+
+        The media engine already reads the player back after every command
+        (a play is confirmed by the reported ``playing`` state, a volume set
+        by the reported level). What is recorded here is the *result the
+        engine handed back*, captured as a structural copy, so observe() can
+        answer from the recorded effect without issuing a second MPRIS query.
+
+        Only ``status == "ok"`` is a witness. Every refusal —
+        ``unavailable``, ``ambiguous``, ``no_effect``, ``unsupported``,
+        ``invalid_input`` — is no evidence at all, and recording it as an
+        effect would let verify() match on the label alone. On a refusal we
+        record nothing, exactly as the filesystem handlers do when they raise.
+
+        Bounded and sanitized: the stored dict carries player identity (the
+        bus name, already a public identifier), track title, state, level,
+        muted, and flags only — never arbitrary metadata, file paths, or
+        secrets. The engine already reports only what a player announced, but
+        the record is re-sanitized here so a future engine change cannot leak
+        more into the ledger.
+        """
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return
+        effect: dict[str, Any] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "status": "ok",
+        }
+        # Only fixed, bounded evidence keys. Anything else (file URIs, raw
+        # metadata blobs, position counters) stays out.
+        for key in (
+            "player", "track", "state", "level", "muted", "changed",
+            "players", "position_s", "duration_s", "opened", "path", "url",
+        ):
+            if key in result:
+                effect[key] = result[key] if key != "players" else result[key][:8]
+        # ``players`` is a bounded list of bus names; cap it like ``results``.
+        if isinstance(effect.get("players"), list):
+            effect["players"] = effect["players"][:8]
+        self._effects[action.action_id] = effect
+
+    async def _media_open_url(self, action: Action) -> dict[str, Any]:
+        url = action.parameters.get("url", "")
+        # ``open_url`` drives the controlled browser, not a media pipeline.
+        # The engine is async, so await it here rather than through a sync
+        # delegate that cannot verify the navigation.
+        if not isinstance(url, str) or not url:
+            return {"status": "unavailable", "reason": "url must be a non-empty string"}
+        return await self.browser.navigate(url)
 
     def _perform(self, action: Action, workspace: Workspace) -> dict[str, Any]:
         params = action.parameters
@@ -349,6 +907,46 @@ class LaptopProvider(ActionProvider):
                     # and the panel is told so rather than left to infer completeness.
                     emit("elements.note", "the walk reached its element ceiling; "
                          "elements past it are not listed")
+        # C42 — the richer file verbs. ``device.files.read`` carries its body
+        # under ``content`` and ``device.files.edit`` carries a unified diff
+        # under ``preview`` (diff only, never surrounding context). Both ride
+        # the same transient channel as ``device.file.read``.
+        if action.type == "device.files.read":
+            if data.get("binary"):
+                return
+            emit = output_callback()
+            if emit is not None:
+                emit("content", str(data.get("content") or ""))
+            return
+        if action.type == "device.files.edit":
+            emit = output_callback()
+            if emit is not None:
+                emit("files.preview", str(data.get("preview") or ""))
+            return
+        # C42 — the browser. ``BrowserEngine`` already emits ``browser.url``,
+        # ``browser.title`` and ``browser.elements`` itself via the same
+        # output callback, and ``browser.page`` on inspect. The provider does
+        # not re-emit those (no double-emit); it only emits the media meta
+        # label here because the media engine does not own a stream.
+        if action.type.startswith("media."):
+            label = self.media_meta_label(data)
+            if label is not None:
+                emit = output_callback()
+                if emit is not None:
+                    emit("media.meta", label)
+
+    def media_meta_label(self, data: dict[str, Any]) -> str | None:
+        """The ``media.meta`` transient-stream payload for one result.
+
+        Wins the race between "the engine's own label" and "a formatted
+        '<player> — <track>' pair": the engine returns its own
+        :meth:`MediaEngine.meta_label`, so this is a thin passthrough that
+        keeps ``_stream_content`` from reaching into the engine's private
+        shape. Returns ``None`` unless the action succeeded.
+        """
+        if data.get("status") != "ok":
+            return None
+        return self.media.meta_label(data)
 
     # -- files ------------------------------------------------------------
     def _list(self, action: Action, workspace: Workspace, params: dict[str, Any]) -> dict[str, Any]:
@@ -1340,6 +1938,47 @@ class LaptopProvider(ActionProvider):
         )
         return data
 
+    async def _submit(self, action: Action) -> dict[str, Any]:
+        """Refuse a payment submit honestly: there is no backend to submit through.
+
+        This handler exists so that the two CRITICAL capabilities have a real one
+        (``SUPPORTED == IMPLEMENTED`` is a structural invariant of this build), and it
+        does the only faithful thing a build without a payment integration can do —
+        it raises ``PERMANENT`` naming what is missing.
+
+        Three temptations are refused here on purpose:
+
+        * **Fabricating a reference.** Returning ``{"status": "ok", "reference":
+          "BK-1234"}`` would let the verifier and the audit trail record a booking
+          that does not exist. There is no booking to read back, so there is no
+          success to report.
+        * **Recording an effect.** ``self._effects`` is what ``observe()`` re-reads;
+          an entry for a submit that never left this process would be a witness to
+          nothing, and ``_journal_effect`` would copy it into the durable ledger.
+        * **Retrying.** ``max_attempts`` is 1 at the definition, and correctly so: a
+          submit that half-ran may have taken the money already, and a second attempt
+          is a second booking.
+
+        The parameter check above the refusal is not a security boundary — the
+        registry's ``check_params`` already refused anything undeclared — it is the
+        same defensive shape every other handler here uses when called directly.
+        """
+        required = {
+            "booking.submit": ("journey", "passenger", "fare"),
+            "order.place": ("items", "total"),
+        }[action.type]
+        for name in required:
+            value = action.parameters.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ProviderError(
+                    f"{name} must be a non-empty string", FailureKind.INVALID_INPUT
+                )
+        raise ProviderError(
+            "this build has no payment backend, so it cannot submit a booking or place "
+            "an order; nothing was submitted and no confirmation was recorded",
+            FailureKind.PERMANENT,
+        )
+
     # -- verification -----------------------------------------------------
     # -- dispatch ledger --------------------------------------------------
     def _save_row(self, action_id: str, **changes: Any) -> None:
@@ -1614,6 +2253,88 @@ class LaptopProvider(ActionProvider):
         C6 weights this observation above any claim this provider makes, so it has to
         be an answer to "what is true now", not a recording of what the code intended.
         """
+        # -- C42 readonly file probes (live re-read, no effect, no ledger) ----
+        # list/search/info/open are reads: the handlers deliberately record no
+        # effect, and test_browser_files_media_provider pins that ("Reads do not
+        # mutate, so they journal nothing."). The gate above therefore hides them
+        # from the recorded-effect branches below. This branch sits ahead of the
+        # gate so the verifier can still confirm them from a live, confined
+        # re-read — the same live answer observe() gives for the legacy
+        # device.file.* reads below — while writing nothing to _effects and
+        # nothing to the ledger. A refusal (confinement, missing path where the
+        # request needs one) is no evidence, so every failure path returns None
+        # and the verifier reads the step as unconfirmed.
+        if action.type == "device.files.list":
+            if self.files is None:
+                return None
+            try:
+                fresh = self.files.list_(action.parameters.get("path", ""), action.parameters.get("limit"))
+            except (AgentError, OSError):
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"path": fresh.get("path")},
+                "state": {"count": fresh.get("count")},
+            }
+        if action.type == "device.files.search":
+            if self.files is None:
+                return None
+            try:
+                fresh = self.files.search(
+                    action.parameters.get("path", ""),
+                    action.parameters.get("pattern", ""),
+                    action.parameters.get("limit"),
+                )
+            except (AgentError, OSError):
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"path": fresh.get("path"), "pattern": action.parameters.get("pattern", "")},
+                "state": {"count": fresh.get("count")},
+            }
+        if action.type == "device.files.info":
+            if self.files is None:
+                return None
+            try:
+                fresh = self.files.info(action.parameters.get("path", ""))
+            except (AgentError, OSError):
+                return None
+            if not fresh.get("exists"):
+                # Metadata that says the path is absent does not witness the
+                # requested lookup; returning it would let the verifier confirm
+                # via the path alone. An absent path is unconfirmed, honestly.
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"path": fresh.get("path") or action.parameters.get("path", "")},
+                "state": {
+                    "exists": fresh.get("exists"),
+                    "is_dir": fresh.get("is_dir"),
+                    "size": fresh.get("size"),
+                    "kind": fresh.get("kind"),
+                },
+            }
+        if action.type == "device.files.open":
+            if self.files is None:
+                return None
+            try:
+                fresh = self.files.open_(action.parameters.get("path", ""))
+            except (AgentError, OSError):
+                return None
+            if fresh.get("status") != "ok":
+                # No opener, failed launch, non-zero exit: nothing was opened,
+                # so there is no witness to record. Re-running the opener here
+                # is also never an observation: it performs the act a second time.
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"path": fresh.get("path") or action.parameters.get("path", "")},
+                "state": {"opened": fresh.get("opened")},
+            }
         recorded = self._effects.get(action.action_id)
         if not isinstance(recorded, dict):
             # C35: this process may not be the one that did the work. The ledger holds
@@ -1646,7 +2367,9 @@ class LaptopProvider(ActionProvider):
         # configured root. Answering these before the guard is what lets an agent with
         # a desktop and no workspace (a perfectly ordinary configuration) still have
         # its screen actions verified.
-        action_type = recorded.get("action_type")
+        action_type = recorded.get("action_type") or ""
+        if not isinstance(action_type, str):
+            return None
         if action_type == "device.screen.capture":
             # A capture is evidenced by the portal having returned a frame, and by that
             # frame's own dimensions -- never by the image, which is not retained. A
@@ -1689,6 +2412,92 @@ class LaptopProvider(ActionProvider):
         # request that was refused is the exact shape of a false confirmation.
         if action_type in {"device.gui.click", "device.gui.type", "device.gui.scroll"}:
             return self._observe_gui(action, recorded)
+        # -- consequential submits, same reason for sitting above the guard ----------
+        # A submit drives a website; it has no path under the configured root. And a
+        # submit this build refused is *not* an observation: the handler raises before
+        # recording anything, so there is normally no record here at all. The branch is
+        # written anyway so that a future handler which records a refusal cannot have
+        # that refusal counted as a witness — "nothing was submitted" must read as
+        # unconfirmed, never as confirmed.
+        if action_type in {"booking.submit", "order.place"}:
+            if recorded.get("status") != "submitted":
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {
+                    key: value
+                    for key, value in action.parameters.items()
+                    if key in ("journey", "passenger", "fare", "items", "total")
+                },
+                "state": {"reference": recorded.get("reference")},
+            }
+        # -- C42: the controlled browser and local playback, above the guard ------
+        # Browser and media have no path under the configured root: the browser
+        # lives in its own window and the player on its own session bus. Both
+        # engines already read back after every operation (the browser refreshes
+        # its page facts, the media engine re-reads the player), so observe()
+        # answers from the recorded read-back without issuing a second network
+        # request or a second MPRIS query. That is the design's whole point: a
+        # second read would be both more work and a second source of truth.
+        #
+        # Every refusal — ``stale``, ``needs_user``, ``unavailable``, ``error``,
+        # ``ambiguous``, ``no_effect``, ``unsupported``, ``invalid_input`` — is
+        # no evidence at all, and it returns None here, because the wrappers
+        # record *nothing* on a refusal. A browser refusal that somehow did
+        # record an effect cannot have it counted as a witness either: only
+        # ``status == "ok"`` observed through the recorded effect counts.
+        if action_type.startswith("browser."):
+            if recorded.get("status") != "ok":
+                return None
+            # The engine already redacted page content before returning it;
+            # this narrows it further to the bounded evidence keys the effect
+            # recorder itself captured. The ledger never grows a page.
+            params: dict[str, Any] = {}
+            for key in ("url", "title", "url_after"):
+                if recorded.get(key) is not None:
+                    params[key] = recorded[key]
+            # There is no honest echo for ``ref`` above all: it is an opaque
+            # session-scoped handle, and the recorded effect does not carry the
+            # resolved driver element id. Echoing the requested ref against
+            # itself is a tautology the verifier would pass for the wrong
+            # element, so ``ref`` is simply carried into ``state`` as an opaque
+            # identifier for audit — it never participates in the parameter
+            # comparison, and verification relies on the other read-back fields.
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": params,
+                "state": {
+                    key: recorded[key]
+                    for key in ("changed", "inserted", "element_count",
+                                "count", "ref_map_size", "truncated", "results")
+                    if key in recorded
+                },
+            }
+        if action_type.startswith("media."):
+            if recorded.get("status") != "ok":
+                return None
+            # The engine already read the player back; observe() trusts that
+            # read-back and never re-queries MPRIS. ``unavailable`` /
+            # ``ambiguous`` / ``no_effect`` / ``unsupported`` / ``invalid_input``
+            # never reach this dict (the wrapper records nothing for them), so
+            # they read as unconfirmed rather than as a confirmed empty result.
+            params = {}
+            for key in ("player", "track", "state", "url", "path"):
+                if recorded.get(key) is not None:
+                    params[key] = recorded[key]
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": params,
+                "state": {
+                    key: recorded[key]
+                    for key in ("level", "muted", "changed", "opened",
+                                "position_s", "duration_s", "players")
+                    if key in recorded
+                },
+            }
         workspace = self.workspace
         if workspace is None:
             return None

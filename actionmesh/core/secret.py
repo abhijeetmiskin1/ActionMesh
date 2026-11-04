@@ -47,6 +47,18 @@ class SecretError(RuntimeError):
     """Raised when key material is unusable. Fails closed: no implicit fallback."""
 
 
+def key_fingerprint(material: bytes) -> str:
+    """An audit-safe fingerprint of key material: HMAC-SHA256 truncated.
+
+    Reported so a deployment can confirm *which* key a store was sealed with
+    (e.g. after rotation) without ever writing the key itself into a log or an
+    audit record. The fingerprint cannot be used to recover or forge the key.
+    """
+    if not material:
+        raise SecretError("key material is required")
+    return hashlib.sha256(material).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class ServerKey:
     """Key material plus how it was obtained, so the server can be honest about it.
@@ -59,6 +71,10 @@ class ServerKey:
     material: bytes
     source: str
     durable: bool
+
+    @property
+    def fingerprint(self) -> str:
+        return key_fingerprint(self.material)
 
     def __repr__(self) -> str:  # never print the key
         return f"ServerKey(source={self.source!r}, durable={self.durable})"
@@ -158,5 +174,6 @@ __all__ = [
     "KEY_BYTES",
     "SecretError",
     "ServerKey",
+    "key_fingerprint",
     "load_key",
 ]

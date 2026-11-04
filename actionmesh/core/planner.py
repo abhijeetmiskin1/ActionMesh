@@ -108,8 +108,15 @@ def _file(m: re.Match[str]) -> dict[str, Any]:
     return {"path": m.group("path").strip()}
 
 
-def _launch(m: re.Match[str]) -> dict[str, Any]:
-    return {"app": m.group("app").strip()}
+def _launch(m: re.Match[str]) -> dict[str, Any] | None:
+    app = m.group("app").strip()
+    # A single app name only. A multi-word imperative ("show me pizza",
+    # "find trains ...", "and ...") is not an app name: declining here lets
+    # the website-intent branch in VoiceOS handle it, and the generic
+    # fallback "cannot launch" must never swallow a sentence it cannot run.
+    if any(marker in app.lower() for marker in (" and ", " show me ", " find ", " search ", " pizza", " zomato", "train")):
+        return None
+    return {"app": app}
 
 
 def _payment(m: re.Match[str]) -> dict[str, Any]:
@@ -152,7 +159,7 @@ def _named(m: re.Match[str], *groups: str) -> dict[str, Any]:
 
 
 _RULES: tuple[
-    tuple[str, re.Pattern[str], Callable[[re.Match[str]], dict[str, Any]]], ...
+    tuple[str, re.Pattern[str], Callable[[re.Match[str]], dict[str, Any] | None]], ...
 ] = (
     # messaging: "tell alice: hi" / "message bob, running late" (colon or comma),
     # then "tell alice that ...", then the bare "tell mom I'll be late" form.
@@ -263,7 +270,10 @@ def _match(clause: str) -> ProposedAction | None:
     for action_type, pattern, build in _RULES:
         match = pattern.match(clause)
         if match:
-            return _action(action_type, **build(match))
+            params = build(match)
+            if params is None:
+                continue
+            return _action(action_type, **params)
     return None
 
 

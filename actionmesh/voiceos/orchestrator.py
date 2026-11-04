@@ -354,6 +354,24 @@ class Orchestrator:
         for key, expected in when.items():
             if key == "step":
                 continue
+            if key == "state":
+                actual_state = earlier.state
+                if expected == "success":
+                    # Templates name the executor's outcome, not the provider's
+                    # ``status`` field. A step only reaches this branch after the
+                    # executor returned SUCCESS, which the orchestrator records
+                    # as ``succeeded`` (verified) or ``succeeded_unverified``.
+                    # Anything else -- failed, denied, cancelled, skipped -- did
+                    # not succeed, however the provider worded its own result.
+                    if actual_state not in {"succeeded", "succeeded_unverified"}:
+                        return False
+                elif actual_state != expected and observed.get(key) != expected:
+                    return False
+                continue
+            if key == "verified":
+                if earlier.verified != expected:
+                    return False
+                continue
             actual = observed.get(key)
             if actual != expected:
                 return False
@@ -401,6 +419,13 @@ class Orchestrator:
                 value = value.get(str(spec.get("field") or ""))
             if value is None or value == "":
                 return False
+            # Browser refs are opaque integers minted by the browser layer; the
+            # registry schema for browser.* payloads declares every ``ref``
+            # parameter as a string.  Cast a digit-only integer observation to
+            # str here so the plan stays schema-correct; the browser engine's
+            # ``_resolve`` re-parses it with ``int(ref)``.
+            if name == "ref" and isinstance(value, int) and not isinstance(value, bool):
+                value = str(value)
             step.parameters[name] = value
         return True
 

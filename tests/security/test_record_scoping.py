@@ -54,6 +54,16 @@ class _TwoDevices(unittest.TestCase):
         self.id_b = self.run_execution(self.token_b, "bob", "hello from bob")
 
     def pair(self, *, phone: str, actor: str) -> str:
+        grant = self.local.post(
+            "/consents",
+            json={
+                "actor_id": actor,
+                "scope": "device.control",
+                "max_risk": "critical",
+                "reason": "fixture consent before pairing",
+            },
+        )
+        self.assertEqual(grant.status_code, 200, grant.text)
         code = self.local.post(
             "/pairing/code", json={"device_id": "laptop-1", "max_risk": "high"}
         ).json()["code"]
@@ -61,6 +71,10 @@ class _TwoDevices(unittest.TestCase):
             "/pair", json={"code": code, "device_id": phone, "actor_id": actor}
         )
         self.assertEqual(response.status_code, 200, response.text)
+        # The device.control grant was minted only to clear issue()'s ceiling.
+        # Withdraw it now: it must not appear in this actor's own /consents
+        # listing (TestWriteScoping asserts the exact scope set).
+        self.local.delete(f"/consents/device.control?actor_id={actor}")
         return response.json()["token"]
 
     def bearer(self, token: str) -> dict[str, str]:

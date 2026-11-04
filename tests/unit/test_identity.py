@@ -124,9 +124,10 @@ class TestIdentityModel(unittest.TestCase):
         for key in dumped:
             self.assertNotIn("token", key.lower())
             self.assertNotIn("secret", key.lower())
+        # expires_at is an expiry fact (like revoked_at), it is not a secret.
         self.assertEqual(
             set(dumped),
-            {"identity_id", "device_id", "kind", "label", "created_at", "revoked_at"},
+            {"identity_id", "device_id", "kind", "label", "created_at", "revoked_at", "expires_at"},
         )
 
     def test_identity_id_is_required(self) -> None:

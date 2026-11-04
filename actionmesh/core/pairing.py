@@ -339,6 +339,15 @@ class PairingService:
                 phone, DeviceKind.PHONE, label=phone_name, now=moment
             )
         except IdentityError as exc:
+            self._record(
+                "pairing.redeem_failed",
+                phone,
+                {
+                    "laptop_device_id": record.laptop_device_id,
+                    "code_id": record.code_id,
+                    "reason": "already_enrolled",
+                },
+            )
             raise PairingError(
                 f"{phone!r} is already enrolled ({exc}); revoke the device before "
                 "pairing it again"
@@ -378,6 +387,16 @@ class PairingService:
             # A half-finished pairing must not leave an identity that blocks the
             # next attempt and that nothing can authenticate as.
             self.identities.revoke(identity.identity_id, now=moment)
+            self._record(
+                "pairing.redeem_failed",
+                phone,
+                {
+                    "laptop_device_id": record.laptop_device_id,
+                    "code_id": record.code_id,
+                    "identity_id": identity.identity_id,
+                    "reason": "mint_failed",
+                },
+            )
             raise
         self._record(
             "pairing.completed",
@@ -392,6 +411,66 @@ class PairingService:
             },
         )
         return credential, token, device
+
+    def reconnect(
+        self,
+        raw_code: object,
+        *,
+        phone_device_id: str,
+        actor_id: str,
+        phone_name: str = "",
+        now: datetime | None = None,
+    ) -> tuple[Credential, str, DeviceInfo, str]:
+        """Reconnect a previously paired phone whose identity is revoked/expired.
+
+        The ONLY reconnect path: a fresh pairing code from the laptop mints a new
+        identity + credential, and the revoked/expiry identity is never resurrected
+        (no un-revoke, no re-enroll of the old identity_id). A live identity is
+        refused — a phone that is still enrolled must rotate, not re-pair. Returns
+        ``(credential, token, device, previous_identity_id)``.
+
+        Redeem's order-of-operations guarantees (attempt budget first, code spent
+        before minting, enroll via the identity store) are reused by spending the
+        code through :meth:`redeem` after the revoked/expired check, so this
+        method adds only the reconnect admission test and the audit event.
+        """
+        moment = now or _utcnow()
+        phone = (phone_device_id or "").strip()
+        if not phone:
+            raise PairingError("phone_device_id is required")
+        previous = self.identities.for_device(phone)
+        if previous is None:
+            raise PairingError(
+                f"{phone!r} has never been paired; use a normal pairing instead"
+            )
+        if previous.is_active(moment):
+            raise PairingError(
+                f"{phone!r} is still enrolled and active; rotate its credential "
+                "instead of re-pairing it"
+            )
+        # The binding is dropped so a fresh identity can enroll under the same
+        # device_id. The old record is kept and stays revoked/expired — nothing
+        # is resurrected, and the new identity gets its own id.
+        self.identities.unbind(phone)
+        credential, token, device = self.redeem(
+            raw_code,
+            phone_device_id=phone,
+            actor_id=actor_id,
+            phone_name=phone_name,
+            now=moment,
+        )
+        self._record(
+            "pairing.reconnect_completed",
+            phone,
+            {
+                "identity_id": credential.identity_id,
+                "previous_identity_id": previous.identity_id,
+                "credential_id": credential.credential_id,
+                "actor_id": credential.actor_id,
+                "max_risk": credential.max_risk.value,
+            },
+        )
+        return credential, token, device, previous.identity_id
 
     # -- attempt accounting ------------------------------------------------
     def _consume_attempt(self, now: datetime) -> None:

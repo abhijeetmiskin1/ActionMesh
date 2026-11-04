@@ -101,16 +101,101 @@ const SPECS = [
 ];
 
 /**
- * The specs with no secret in them. A shallow copy per call so a renderer-side mutation
- * cannot reach the module's own table.
+ * Media purposes are deliberately not the text adapters. They are closed tables of
+ * vendors this build knows about, and every entry is `implemented: false` — a metered
+ * image or audio call is not made up because the chat adapter works. The entries exist
+ * so the bars can say which vendors are planned; choosing one is refused until a real
+ * adapter and a real probe exist.
  */
-function publicSpecs() {
-  return SPECS.map((spec) => ({ ...spec, models: [...spec.models] }));
+const MEDIA_SPECS = {
+  image: [
+    {
+      id: 'openai_images',
+      label: 'OpenAI Images',
+      implemented: false,
+      requiresKey: true,
+      requiresBaseUrl: false,
+      defaultModel: '',
+      models: [],
+      unavailableReason: 'Not wired in this build. An image adapter and a real probe must exist before a key is accepted.',
+    },
+    {
+      id: 'stability',
+      label: 'Stability AI',
+      implemented: false,
+      requiresKey: true,
+      requiresBaseUrl: false,
+      defaultModel: '',
+      models: [],
+      unavailableReason: 'Not wired in this build. An image adapter and a real probe must exist before a key is accepted.',
+    },
+    {
+      id: 'replicate',
+      label: 'Replicate',
+      implemented: false,
+      requiresKey: true,
+      requiresBaseUrl: false,
+      defaultModel: '',
+      models: [],
+      unavailableReason: 'Not wired in this build. An image adapter and a real probe must exist before a key is accepted.',
+    },
+  ],
+  audio: [
+    {
+      id: 'elevenlabs',
+      label: 'ElevenLabs',
+      implemented: false,
+      requiresKey: true,
+      requiresBaseUrl: false,
+      defaultModel: '',
+      models: [],
+      unavailableReason: 'Not wired in this build. An audio adapter and a real probe must exist before a key is accepted.',
+    },
+    {
+      id: 'deepgram',
+      label: 'Deepgram',
+      implemented: false,
+      requiresKey: true,
+      requiresBaseUrl: false,
+      defaultModel: '',
+      models: [],
+      unavailableReason: 'Not wired in this build. An audio adapter and a real probe must exist before a key is accepted.',
+    },
+    {
+      id: 'openai_tts',
+      label: 'OpenAI TTS',
+      implemented: false,
+      requiresKey: true,
+      requiresBaseUrl: false,
+      defaultModel: '',
+      models: [],
+      unavailableReason: 'Not wired in this build. An audio adapter and a real probe must exist before a key is accepted.',
+    },
+  ],
+};
+
+const TEXT_PURPOSES = ['chat', 'reasoning'];
+
+/** The closed table for a purpose. Unknown purposes get no specs at all. */
+function specsFor(purpose) {
+  const p = String(purpose || '').trim().toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(MEDIA_SPECS, p)) return MEDIA_SPECS[p];
+  if (!p || TEXT_PURPOSES.includes(p)) return SPECS;
+  return [];
 }
 
-function specFor(id) {
+/**
+ * The specs with no secret in them. A shallow copy per call so a renderer-side mutation
+ * cannot reach the module's own table. Omitted purpose means the text table (the
+ * pre-C42 behaviour), because the planner only knows the text adapters.
+ */
+function publicSpecs(purpose) {
+  return specsFor(purpose).map((spec) => ({ ...spec, models: [...spec.models] }));
+}
+
+function specFor(id, purpose) {
   const wanted = String(id || '').trim();
-  return SPECS.find((spec) => spec.id === wanted) || null;
+  return specsFor(purpose).find((spec) => spec.id === wanted) || null;
 }
 
 /** A short sentence for a state; the only thing the renderer ever shows. */
@@ -323,7 +408,7 @@ async function test(config, options = {}) {
   const apiKey = String(source.apiKey || '').trim();
   const requestImpl = (options && options.request) || https.request;
 
-  const spec = specFor(provider);
+  const spec = specFor(provider, source.purpose);
   if (!spec) return result('not_configured', 'Choose a provider first.');
   if (!spec.implemented) {
     return result('provider_unavailable', spec.unavailableReason || 'This provider is not implemented.');
@@ -564,7 +649,7 @@ async function generate(config, request, options = {}) {
   const apiKey = String(source.apiKey || '').trim();
   const requestImpl = (options && options.request) || https.request;
 
-  const spec = specFor(provider);
+  const spec = specFor(provider, source.purpose);
   if (!spec) return generationResult('not_configured', 'Choose a provider first.');
   if (!spec.implemented) {
     return generationResult(
@@ -746,6 +831,7 @@ function _withRequest(first, second) {
 
 module.exports = {
   SPECS,
+  MEDIA_SPECS,
   publicSpecs,
   specFor,
   test,

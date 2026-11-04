@@ -8,13 +8,15 @@ import json
 import os
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from actionmesh.agent.browser_bridge import browser_bridge_config_from_env
 from actionmesh.agent.commands import CommandPolicy
 from actionmesh.agent.config import AgentConfig, AgentConfigError
 from actionmesh.agent.definitions import PROVIDER, register_device_actions
@@ -74,21 +76,12 @@ from actionmesh.voiceos import (
     TaskSession,
     VoiceOsStore,
     load_templates,
+    model_bridge,
 )
 from actionmesh.voiceos.automation_run import Runner, schedule_next
 from actionmesh.voiceos.automation_scheduler import Scheduler, summarize_run
 from actionmesh.voiceos.automation_store import AutomationStore
 from actionmesh.voiceos.diagnosis import unobserved
-from actionmesh.voiceos.workflow_draft import draft as workflow_draft
-from actionmesh.voiceos.workflow_draft import draft_to_body
-from actionmesh.voiceos.workflows import (
-    Workflow,
-    WorkflowError,
-    describe_workflow,
-    new_workflow_id,
-    validate_schedule,
-    validate_workflow,
-)
 from actionmesh.voiceos.diagnosis_flow import (
     analysis_step,
     analyze,
@@ -96,15 +89,14 @@ from actionmesh.voiceos.diagnosis_flow import (
     last_log_step,
     log_excerpt,
 )
-from actionmesh.voiceos import model_bridge
 from actionmesh.voiceos.llm import (
     BridgeError,
     BridgeUnavailable,
+    bridge_config_from_env,
     build_analyst,
     build_catalogue,
     build_planner,
     build_provider,
-    bridge_config_from_env,
     llm_config_from_env,
 )
 from actionmesh.voiceos.models import Conversation
@@ -112,12 +104,27 @@ from actionmesh.voiceos.reasoning import describe_session
 from actionmesh.voiceos.targeting import TargetChoice, default_target
 from actionmesh.voiceos.targeting import current as targeting_current
 from actionmesh.voiceos.targeting import resolve as resolve_target
+from actionmesh.voiceos.workflow_draft import draft as workflow_draft
+from actionmesh.voiceos.workflow_draft import draft_to_body
+from actionmesh.voiceos.workflows import (
+    Workflow,
+    WorkflowError,
+    describe_workflow,
+    new_workflow_id,
+    validate_workflow,
+)
 
 #: Loopback addresses, and nothing else. A deployment behind a relay sets
 #: ``ACTIONMESH_ALLOW_REMOTE_PAIRING`` deliberately rather than adding an address
 #: here, because "which networks count as being in the room" is not something the
 #: protocol should pretend to know.
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "::1"})
+
+
+_background_tasks: set[asyncio.Task[Any]] = set()
+"""Retained so a fire-and-forget automation notification is not left to the
+garbage collector mid-flight (RUF006): referenced until the done-callback
+discards it."""
 
 
 def _enum(enum_type: type, value: Any, field: str) -> Any:
@@ -653,10 +660,14 @@ def create_app(
         loop = asyncio.get_running_loop()
         event_id = str(getattr(event, "event_id", "") or "")
         timestamp = getattr(event, "timestamp", None)
-        occurred_at = timestamp.isoformat() if hasattr(timestamp, "isoformat") else ""
+        occurred_at = (
+            timestamp.isoformat()
+            if isinstance(timestamp, datetime)
+            else ""
+        )
 
         async def _fire() -> None:
-            try:
+            with suppress(Exception):
                 await _automation_scheduler().on_event(
                     event_type,
                     event_id=event_id,
@@ -664,10 +675,10 @@ def create_app(
                     state=state,
                     occurred_at=occurred_at,
                 )
-            except Exception:  # noqa: BLE001 - a trigger must not break the publisher
-                pass
 
-        loop.create_task(_fire(), name=f"automation-event:{event_id}")
+        task = loop.create_task(_fire(), name=f"automation-event:{event_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     app.state.automation_listener = _automation_listener
     hub = getattr(engine, "events", None)
@@ -762,6 +773,13 @@ def create_app(
                     # graph addressed to this machine cannot be told apart from one
                     # addressed to a Windows box, and both would run here.
                     device_id=agent.config.device_id,
+                    # C42: the browser drive socket main wrote at spawn, when the
+                    # service was started by the Electron shell. Environment only:
+                    # the socket path and a per-launch token, never a credential.
+                    # A deployment started any other way has neither variable
+                    # set, the config is unconfigured, and the browser answers
+                    # ``unavailable`` honestly rather than dialling a dead path.
+                    browser_bridge=browser_bridge_config_from_env(),
                 ),
             )
             register_device_strategies(engine.verifier)
@@ -772,6 +790,12 @@ def create_app(
         agent.register()
         agent.heartbeat()
         app.state.agent = agent
+        # Phase 2 Agent 3: wire the forget-cascade. DeviceRegistry.forget() now
+        # clears the agent-side cached presence record so a forgotten device
+        # cannot resurrect via a stale heartbeat (Agent 4 gap 1). The registry
+        # was built before the agent existed, so the wiring is post-construction.
+        if getattr(app.state.devices, "presence", None) is None:
+            app.state.devices.presence = agent
     else:
         app.state.agent = None
     # The rule-based planner proposes only what this deployment can actually carry
@@ -878,10 +902,23 @@ def create_app(
         # with the first about which credentials exist.
         app.state.credentials = pairing.credentials
     else:
+        def record_credential_event(
+            event: str, subject: str, payload: dict[str, object]
+        ) -> None:
+            """Chain a credential lifecycle event. Same sink shape as pairing."""
+            audit.append(
+                kind="credential",
+                actor="credentials",
+                subject=subject,
+                result=event,
+                payload=payload,
+            )
+
         credentials = CredentialStore(
             app.state.identities,
             key=app.state.server_key.material,
             consents=app.state.consent_store.grants_for,
+            audit=record_credential_event,
         )
 
         def record_pairing_event(
@@ -902,6 +939,12 @@ def create_app(
             )
 
         app.state.credentials = credentials
+        # Phase 4 Agent 3 — credential cascade on forget: the registry revokes
+        # live credentials when a device is forgotten, not just identity/presence.
+        # Post-construction assignment (registry is built before credentials);
+        # defensive so a registry without the slot can never break pairing.
+        with suppress(Exception):
+            app.state.devices.credentials = credentials
         app.state.pairing = PairingService(
             identities=app.state.identities,
             credentials=credentials,
@@ -2017,14 +2060,14 @@ def create_app(
                         "state": state,
                     }
             if verdict.get("usable"):
-                provider_name = verdict.get("provider") or provider_name
-                model = verdict.get("model") or model
+                provider_name = str(verdict.get("provider") or provider_name)
+                model = str(verdict.get("model") or model)
             else:
                 mode = "deterministic"
             # The detail is worth showing whether the mode changed or not: a refusing
             # state explains the fallback, an unverified-but-active one carries the
             # "press Test Connection" caveat into the chip's tooltip.
-            reason = verdict.get("detail") or reason
+            reason = str(verdict.get("detail") or reason)
 
         return {
             "mode": mode,
@@ -2264,7 +2307,7 @@ def create_app(
                 device.device_id: device.name
                 for device in app.state.devices.all_devices()
             }
-        except Exception:  # noqa: BLE001 - a description must not fail a read
+        except Exception:
             names = {}
         out["description_text"] = describe_workflow(workflow, devices=names)
         out["trigger_kind"] = workflow.trigger_kind()

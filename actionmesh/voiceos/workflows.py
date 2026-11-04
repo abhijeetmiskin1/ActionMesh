@@ -392,7 +392,7 @@ def validate_schedule(raw: Any) -> dict[str, Any]:
         )
     if kind == "interval":
         try:
-            seconds = int(raw.get("seconds"))
+            seconds = int(raw.get("seconds") or 0)
         except (TypeError, ValueError):
             raise WorkflowError("an interval schedule needs whole seconds") from None
         if seconds < MIN_INTERVAL_S:

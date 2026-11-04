@@ -55,6 +55,20 @@ class _EnvPatch(unittest.TestCase):
 
     def pair(self, max_risk: str = "medium") -> tuple[str, dict]:
         """Mint on the laptop at a chosen ceiling, spend from the phone across the room."""
+        # Mint-time consent ceiling (credentials.issue): the actor must have
+        # consented at or above the code's ceiling before redeem, or issue()
+        # refuses. device.control does not authorize message.send, so
+        # consentless execution tests below still see denial.
+        grant = self.local.post(
+            "/consents",
+            json={
+                "actor_id": "abhi",
+                "scope": "device.control",
+                "max_risk": "critical",
+                "reason": "fixture consent before pairing",
+            },
+        )
+        self.assertEqual(grant.status_code, 200, grant.text)
         code = self.local.post(
             "/pairing/code", json={"device_id": "laptop-1", "max_risk": max_risk}
         ).json()["code"]

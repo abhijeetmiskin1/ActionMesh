@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from actionmesh.core.sqlite_guard import guarded, make_lock
+
 
 @dataclass
 class _Entry:
@@ -72,12 +74,14 @@ class SQLiteIdempotencyLedger:
 
     def __init__(self, path: str = ":memory:") -> None:
         self.connection = sqlite3.connect(path, check_same_thread=False)
+        self._lock = make_lock()
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS idempotency_entries "
             "(key TEXT PRIMARY KEY, state TEXT NOT NULL, result TEXT)"
         )
         self.connection.commit()
 
+    @guarded
     def begin(self, key: str) -> tuple[bool, Any]:
         try:
             self.connection.execute(
@@ -91,6 +95,7 @@ class SQLiteIdempotencyLedger:
             ).fetchone()
             return True, json.loads(row[0]) if row and row[0] else None
 
+    @guarded
     def complete(self, key: str, result: Any) -> None:
         self.connection.execute(
             "UPDATE idempotency_entries SET state = 'done', result = ? WHERE key = ?",
@@ -98,19 +103,23 @@ class SQLiteIdempotencyLedger:
         )
         self.connection.commit()
 
+    @guarded
     def fail(self, key: str) -> None:
         self.release(key)
 
+    @guarded
     def release(self, key: str) -> None:
         self.connection.execute("DELETE FROM idempotency_entries WHERE key = ?", (key,))
         self.connection.commit()
 
+    @guarded
     def state(self, key: str) -> str | None:
         row = self.connection.execute(
             "SELECT state FROM idempotency_entries WHERE key = ?", (key,)
         ).fetchone()
         return row[0] if row else None
 
+    @guarded
     def close(self) -> None:
         self.connection.close()
 

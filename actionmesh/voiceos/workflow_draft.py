@@ -206,6 +206,8 @@ def parse_schedule(sentence: str) -> tuple[dict[str, Any], str]:
                     "(say 'every Monday')"
                 )
             return {"kind": "weekly", "days": days, "at": at}, weekly.group(0)
+        if daily is None:
+            return {}, "a recurring schedule was recognised but no time of day was given"
         return {"kind": "daily", "at": at}, daily.group(0)
     at = _clock_time(sentence)
     if at is not None and re.search(r"\b(morning|evening|night|afternoon)\b", sentence, re.I):

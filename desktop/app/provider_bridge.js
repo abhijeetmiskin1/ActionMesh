@@ -68,6 +68,15 @@ const NO_GENERATE_DETAIL = 'Model generation is not available in this build.';
 const SETTINGS_UNREADABLE_DETAIL = 'The stored provider settings could not be read.';
 const BAD_TOKEN_DETAIL = 'The request token was not accepted.';
 
+//: Which lane answers a VoiceOS request. Planning and diagnosis are both reasoning
+//: work; the chat lane is the fallback because it is the one a pre-C42 setup is
+//: already configured in, and because a person who set up "the AI" once expects the
+//: planner to keep using it until they say otherwise. A chat lane the user marked
+//: default goes first (`purposeDefaultLane`); otherwise Reasoning wins whenever it is
+//: configured, so changing Reasoning changes the planner and only the planner.
+const DEFAULT_LANES = ['chat', 'reasoning'];
+const REASONING_LANES = ['reasoning', 'chat'];
+
 /**
  * Is a live process answering on this path?
  *
@@ -180,13 +189,108 @@ async function startBridge(options) {
     try { noteTestResult(state); } catch { /* main owns its cache; a failure is theirs */ }
   }
 
-  function hasStoredKey() {
+  /**
+   * The lanes to resolve for a planning request, in order.
+   *
+   * `providerDefault` is the "Set as default" switch from the chat card. It is read
+   * here — and only here — because this is the one consumer with a notion of "the AI
+   * this app uses". Reading it is what makes the button an action rather than a badge:
+   * with it on, a configured chat lane goes ahead of a configured reasoning lane for
+   * the planner. It does not change anything else, and it grants nothing.
+   */
+  function planningLanes() {
+    let chatIsDefault = false;
     try {
-      if (typeof settings.hasSecret === 'function') return Boolean(settings.hasSecret('providerApiKey'));
-      return Boolean(settings.secret('providerApiKey'));
+      chatIsDefault = Boolean(settings.get('providerDefault'));
     } catch {
-      return false;
+      chatIsDefault = false;
     }
+    return chatIsDefault ? DEFAULT_LANES : REASONING_LANES;
+  }
+
+  /**
+   * The per-lane configuration VoiceOS should use, resolved in order.
+   *
+   * A lane is "set" when it names a provider. Its key falls back to the legacy chat
+   * secret (``providerApiKey``) only for the chat lane itself — that is the pre-C42
+   * slot, and it belongs to chat. Every other lane reads only its own secret, so a
+   * key entered for Reasoning can never be spent by Image or by Chat.
+   *
+   * Returns the first lane that names a provider, plus whether that lane is the
+   * legacy chat one, so the status frame and the generate path report the same thing.
+   */
+  function laneFor(lanes) {
+    for (const lane of lanes) {
+      let providerId = '';
+      let model = '';
+      let endpoint = '';
+      let timeout = 0;
+      let key = '';
+      try {
+        providerId = String(settings.get(`purpose_${lane}_provider`) || '');
+        model = String(settings.get(`purpose_${lane}_model`) || '');
+        endpoint = String(settings.get(`purpose_${lane}_endpoint`) || '');
+        timeout = Number(settings.get(`purpose_${lane}_timeout`)) || 0;
+        key = String(settings.secret(`${lane}ApiKey`) || '');
+        // The chat lane is where a pre-C42 setup lives: main.js's `purposeSecretKey`
+        // treats the legacy provider key as chat's own when chat has no key of its
+        // own, and the bridge has to read the same slot or the two surfaces disagree
+        // about whether the planner is about to have a credential.
+        if (lane === 'chat' && !key) key = String(settings.secret('providerApiKey') || '');
+      } catch {
+        // Unreadable settings are not a configuration: report the fail-closed answer
+        // rather than a half-filled lane.
+        return { lane, provider: '', model: '', endpoint: '', timeout: 0, apiKey: '', configured: false, legacy: false };
+      }
+      if (providerId) {
+        // A lane that names a provider but has no credential cannot answer, and
+        // stopping here would strand the planner on it forever while a perfectly
+        // usable Reasoning lane sat configured next to it. Missing keys fall through
+        // to the next lane; the *last* attempt is what the refusal reports, so the
+        // sentence the user sees is about the lane that was actually tried.
+        const spec = specFor(providerId);
+        const keyless = Boolean(spec) && spec.requiresKey === false;
+        const usable = Boolean(spec) && spec.implemented && (keyless || Boolean(key));
+        if (!usable && lanes.indexOf(lane) < lanes.length - 1) continue;
+        return {
+          lane,
+          provider: providerId,
+          model,
+          endpoint,
+          timeout,
+          apiKey: key,
+          configured: true,
+          legacy: false,
+        };
+      }
+    }
+    // Nothing in this build's lanes has ever been set. The legacy single-provider
+    // keys are the chat lane in everything but name: keeping them working is the
+    // whole point of not migrating them behind the user's back.
+    let providerId = '';
+    let model = '';
+    let endpoint = '';
+    let timeout = 0;
+    let key = '';
+    try {
+      providerId = String(settings.get('providerName') || '');
+      model = String(settings.get('providerModel') || '');
+      endpoint = String(settings.get('providerEndpoint') || '');
+      timeout = Number(settings.get('providerTimeout')) || 0;
+      key = String(settings.secret('providerApiKey') || '');
+    } catch {
+      return { lane: 'legacy', provider: '', model: '', endpoint: '', timeout: 0, apiKey: '', configured: false, legacy: true };
+    }
+    return {
+      lane: 'legacy',
+      provider: providerId,
+      model,
+      endpoint,
+      timeout,
+      apiKey: key,
+      configured: Boolean(providerId),
+      legacy: true,
+    };
   }
 
   function specFor(providerId) {
@@ -224,18 +328,14 @@ async function startBridge(options) {
   }
 
   async function statusFrame() {
-    let providerId = '';
-    let model = '';
-    try {
-      providerId = String(settings.get('providerName') || '');
-      model = String(settings.get('providerModel') || '');
-    } catch {
-      providerId = '';
-      model = '';
-    }
+    // The lane the next plan would use, not a fixed one: this frame is what
+    // /voiceos/status reports as "will a model answer", so it has to be resolved by
+    // the same rule the generate path uses below.
+    const lane = laneFor(planningLanes());
+    const providerId = lane.provider;
     const spec = specFor(providerId);
-    const effectiveModel = model || (spec && spec.defaultModel ? String(spec.defaultModel) : '');
-    const hasKey = hasStoredKey();
+    const effectiveModel = lane.model || (spec && spec.defaultModel ? String(spec.defaultModel) : '');
+    const hasKey = Boolean(lane.apiKey);
     // `implemented` describes the chosen provider, so an unchosen one is not implemented.
     const implemented = Boolean(spec) && Boolean(spec.implemented) && generateIsAvailable();
     const configured = Boolean(spec) && Boolean(effectiveModel);
@@ -245,7 +345,7 @@ async function startBridge(options) {
     let state = '';
     if (getStatus) {
       try {
-        const info = getStatus();
+        const info = getStatus(lane.lane);
         if (info && typeof info.state === 'string' && info.state) state = info.state;
       } catch { /* fall through to what this module knows */ }
     }
@@ -259,6 +359,9 @@ async function startBridge(options) {
       model: effectiveModel,
       implemented,
       hasKey,
+      // Which lane answered. Safe metadata the shell uses to say "the planner is on
+      // Reasoning" rather than making the user guess which card the planner reads.
+      purpose: lane.lane,
       state,
       // The sentence the peer shows when it falls back because of this state. Kept in
       // the shell: it is the same table the header bar uses, so the two surfaces cannot
@@ -280,19 +383,17 @@ async function startBridge(options) {
 
     // Live reads, every request. A cached config would keep serving the previous
     // provider after the user changed it — and would hold a copy of the key longer
-    // than necessary.
-    let providerId;
-    let model;
-    let baseUrl;
-    let apiKey;
-    try {
-      providerId = String(settings.get('providerName') || '');
-      model = String(settings.get('providerModel') || '');
-      baseUrl = String(settings.get('providerEndpoint') || '');
-      apiKey = String(settings.secret('providerApiKey') || '');
-    } catch {
-      return { ok: false, state: 'not_configured', detail: SETTINGS_UNREADABLE_DETAIL };
+    // than necessary. The lane is resolved by the same rule the status frame uses, so
+    // what the UI reports and what the planner does cannot drift apart.
+    const lane = laneFor(planningLanes());
+    if (!lane.configured) {
+      recordVerified('not_configured');
+      return { ok: false, state: 'not_configured', detail: STATE_DETAIL.not_configured };
     }
+    const providerId = lane.provider;
+    const model = lane.model;
+    const baseUrl = lane.endpoint;
+    const apiKey = lane.apiKey;
 
     // No key, no call — and no exception to the key-free reply. Asked only for a
     // provider that requires one, so a keyless local endpoint is not mislabelled.
@@ -314,7 +415,9 @@ async function startBridge(options) {
       apiKey,
       timeoutSeconds: typeof request.timeout_s === 'number' && Number.isFinite(request.timeout_s)
         ? request.timeout_s
-        : Number(settings.get('providerTimeout')) || undefined,
+        : lane.timeout > 0
+          ? lane.timeout
+          : undefined,
     };
 
     let outcome;

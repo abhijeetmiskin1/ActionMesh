@@ -29,6 +29,7 @@ import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
+from actionmesh.core.sqlite_guard import guarded, make_lock
 from actionmesh.voiceos.workflows import AutomationRun, Workflow
 
 #: Bump by one with each migration appended below.
@@ -88,6 +89,7 @@ class AutomationStore:
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
+        self._lock = make_lock()
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self._open_schema()
 
@@ -120,10 +122,14 @@ class AutomationStore:
         # is already proven to be an int in sqlite's own range, so it renders as digits.
         self.connection.execute(f"PRAGMA user_version={version}")
 
+    @guarded
+
     def schema_version(self) -> int:
         return self._user_version()
 
     # -- workflows ---------------------------------------------------------
+
+    @guarded
 
     def save_workflow(self, workflow: Workflow) -> None:
         self.connection.execute(
@@ -144,12 +150,16 @@ class AutomationStore:
         )
         self.connection.commit()
 
+    @guarded
+
     def get_workflow(self, workflow_id: str) -> Workflow | None:
         row = self.connection.execute(
             "SELECT payload FROM automation_workflows WHERE workflow_id = ?",
             (workflow_id,),
         ).fetchone()
         return Workflow.from_dict(json.loads(row[0])) if row else None
+
+    @guarded
 
     def list_workflows(self, actor_id: str | None = None, limit: int = 100) -> list[Workflow]:
         """Newest first. ``actor_id=None`` is the operator's unscoped view."""
@@ -167,6 +177,8 @@ class AutomationStore:
             ).fetchall()
         return [Workflow.from_dict(json.loads(row[0])) for row in rows]
 
+    @guarded
+
     def delete_workflow(self, workflow_id: str) -> bool:
         """Remove a workflow. Its run history is kept: it is a record, not a child."""
         cursor = self.connection.execute(
@@ -174,6 +186,8 @@ class AutomationStore:
         )
         self.connection.commit()
         return cursor.rowcount > 0
+
+    @guarded
 
     def due_workflows(self, now_iso: str, limit: int = 20) -> list[Workflow]:
         """Enabled workflows whose next run is at or before ``now_iso``.
@@ -191,6 +205,8 @@ class AutomationStore:
         return [Workflow.from_dict(json.loads(row[0])) for row in rows]
 
     # -- runs --------------------------------------------------------------
+
+    @guarded
 
     def claim(self, run: AutomationRun) -> bool:
         """Write the run row, or report that someone else already owns the slot.
@@ -216,6 +232,8 @@ class AutomationStore:
         self.connection.commit()
         return cursor.rowcount == 1
 
+    @guarded
+
     def save_run(self, run: AutomationRun) -> None:
         self.connection.execute(
             "UPDATE automation_runs SET state = ?, payload = ? WHERE run_id = ?",
@@ -224,11 +242,15 @@ class AutomationStore:
         self.connection.commit()
         self._trim_runs()
 
+    @guarded
+
     def get_run(self, run_id: str) -> AutomationRun | None:
         row = self.connection.execute(
             "SELECT payload FROM automation_runs WHERE run_id = ?", (run_id,)
         ).fetchone()
         return AutomationRun.from_dict(json.loads(row[0])) if row else None
+
+    @guarded
 
     def run_for_slot(self, workflow_id: str, slot: str) -> AutomationRun | None:
         row = self.connection.execute(
@@ -236,6 +258,8 @@ class AutomationStore:
             (workflow_id, slot),
         ).fetchone()
         return AutomationRun.from_dict(json.loads(row[0])) if row else None
+
+    @guarded
 
     def list_runs(
         self,
@@ -261,6 +285,8 @@ class AutomationStore:
             params,
         ).fetchall()
         return [AutomationRun.from_dict(json.loads(row[0])) for row in rows]
+
+    @guarded
 
     def reconcile_claimed(self) -> list[AutomationRun]:
         """A run a previous process claimed and never started becomes ``missed``.
@@ -301,12 +327,16 @@ class AutomationStore:
         )
         self.connection.commit()
 
+    @guarded
+
     def healthy(self) -> bool:
         try:
             self.connection.execute("SELECT 1").fetchone()
         except sqlite3.Error:
             return False
         return True
+
+    @guarded
 
     def close(self) -> None:
         self.connection.close()

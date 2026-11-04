@@ -166,7 +166,7 @@ class EventHub:
             for listener in tuple(self._listeners):
                 try:
                     listener(event)
-                except Exception:  # noqa: BLE001 - an observer must not stop a publish
+                except Exception:
                     self._listeners.remove(listener)
 
     def _capture(self, event: MeshEvent) -> None:

@@ -43,6 +43,21 @@ function el(tag, attrs, children) {
 
 const byId = (id) => document.getElementById(id);
 
+/**
+ * Wire one control by id, tolerating its absence.
+ *
+ * Every screen in this shell is built from the same document, so a control that is
+ * not there is not a programming error to throw on at boot — it is a screen that was
+ * not linked in. Returning `null` keeps the rest of `wire()` running: one missing
+ * button must not take the whole window down.
+ */
+function on(id, type, handler, options) {
+  const node = byId(id);
+  if (!node) return null;
+  node.addEventListener(type, handler, options);
+  return node;
+}
+
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
   return node;
@@ -97,6 +112,9 @@ function shortId(id) {
 let toastTimer = null;
 function toast(message, kind) {
   const node = byId('toast');
+  // The toast is a convenience, never the record: a screen without one still shows
+  // the same fact in place, so a missing node drops the message rather than the boot.
+  if (!node) return;
   node.textContent = message;
   node.dataset.kind = kind || '';
   node.hidden = false;
@@ -176,6 +194,9 @@ const state = {
   // notes} }. `null` means "not measured yet", and the guide then says so rather than
   // showing a verdict it has not obtained.
   guideVerdicts: null,
+  // Per-purpose specs and statuses (C42). Specs: purpose -> array; Statuses: purpose -> object.
+  purposeSpecs: {},
+  purposeStatuses: {},
 };
 
 const IDENTITY = { id: 'voiceos-local' };
@@ -205,6 +226,7 @@ const VIEWS = {
   history: { eyebrow: 'What actually happened', title: 'History' },
   devices: { eyebrow: 'This laptop', title: 'Devices' },
   visual: { eyebrow: 'Seeing the screen', title: 'Visual Intelligence' },
+  browser: { eyebrow: 'Web pages', title: 'Browser' },
   settings: { eyebrow: 'Application', title: 'Settings' },
 };
 
@@ -260,6 +282,17 @@ function applyAppState(next) {
   // second round-trip. It is a state and a sentence; never a credential.
   if (next.provider) {
     state.providerStatus = next.provider;
+  }
+  if (next.purposes) {
+    // The per-purpose statuses ride on the same push, so the header and the lanes
+    // stay current without a second round-trip. They are states and sentences;
+    // never credentials.
+    state.purposeStatuses = { ...state.purposeStatuses, ...next.purposes };
+    if (next.purposes.chat) state.providerStatus = next.purposes.chat;
+    renderProviderBar(state.purposeStatuses.chat || state.providerStatus);
+    renderHomeProviderKv();
+    renderSettingsProviderCard();
+  } else if (next.provider) {
     renderProviderBar(next.provider);
   }
 }
@@ -406,19 +439,10 @@ function renderDevicePill(devices) {
   dot.className = `dot ${local.online ? 'online' : 'offline'}`;
 }
 
-function renderHomeProviderKv() {
-  const info = state.appState && state.appState.provider;
-  const host = byId('homeProviderKv');
-  if (!host) return;
-  const rows = [
-    ['Provider', info && info.providerLabel ? info.providerLabel : 'not configured'],
-    ['Model', info && info.model ? info.model : '—'],
-    ['Connection', info ? info.text : 'unknown'],
-  ];
-  replace(host, rows.flatMap(([term, value]) => [el('dt', { text: term }), el('dd', { text: value })]));
-  const configure = byId('homeProviderConfigure');
-  if (configure) configure.disabled = false;
-}
+// The single-provider table that used to sit here was replaced by the four lanes;
+// its body survived as a second `renderHomeProviderKv` declaration, and the later
+// declaration won the hoist, so it silently did nothing. Removed rather than
+// renamed: two functions with one name is a bug waiting to be re-introduced.
 
 function renderExecutionRows(host, records, onPick) {
   if (!records.length) {
@@ -528,6 +552,9 @@ function renderReply(host, answer, onSession) {
 
 /** Microphone: one press, one utterance, or an honest answer that it is unavailable. */
 function wirePushToTalk(button, input, replyHost) {
+  // Called once per ask box with the element that box was found by id. A box that was
+  // not linked in leaves `button` null; there is nothing to wire and nothing to say.
+  if (!button || !input) return;
   const Native = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!Native) {
     button.title = 'Speech recognition is unavailable in this window — VoiceOS has its own page';
@@ -1155,6 +1182,11 @@ function handleStreamEvent(event) {
 
   // Everything else is a fact about a record; the cheapest honest response is to
   // re-read the view, not to patch local state from an event payload.
+  // The executions history (history.js) owns its own dedupe + transient rules;
+  // delegating here keeps both views consistent without duplicating them.
+  if (typeof ActionMeshHistory !== 'undefined' && ActionMeshHistory.handleStreamEvent) {
+    ActionMeshHistory.handleStreamEvent(event);
+  }
   if (state.view === 'live') {
     if (data.execution_id && state.selectedExecution === data.execution_id) {
       loadExecution(data.execution_id);
@@ -2166,10 +2198,9 @@ async function refreshSettings() {
   byId('setWorkspace').value = settings.workspaceRoot || '';
   byId('setAllowShell').checked = Boolean(settings.allowShell);
   byId('setAllowDesktop').checked = Boolean(settings.allowDesktop);
+  byId('setAllowBrowser').checked = Boolean(settings.allowBrowser);
+  byId('setAllowMedia').checked = Boolean(settings.allowMedia);
   byId('setAllowedCommands').value = (settings.allowedCommands || []).join(', ');
-  byId('setProviderName').value = settings.providerName || '';
-  byId('setProviderEndpoint').value = settings.providerEndpoint || '';
-  byId('setProviderModel').value = settings.providerModel || '';
 
   byId('shortcutStatus').textContent = appState.shortcutRegistered
     ? `${prettyAccelerator(settings.shortcut)} is registered system-wide.`
@@ -2177,19 +2208,11 @@ async function refreshSettings() {
       ? `${prettyAccelerator(settings.shortcut)} is not registered — another application may own it.`
       : 'The global shortcut is turned off.');
 
-  const secret = settings.secrets && settings.secrets.providerApiKey;
-  const keyStatus = byId('keyStatus');
-  if (!settings.encryptionAvailable) {
-    keyStatus.textContent = 'The OS keyring is unavailable, so a key cannot be stored here. Nothing is written in plain text.';
-    byId('providerSave').disabled = true;
-  } else {
-    byId('providerSave').disabled = false;
-    keyStatus.textContent = secret && secret.present
-      ? 'A key is held in the OS keyring. Only its presence is shown here.'
-      : (secret && secret.status === 'unreadable'
-        ? 'A stored key could not be decrypted by this session; save a new one.'
-        : 'No key is stored.');
-  }
+  // The old single-provider card is hidden in index.html and its fields are no longer
+  // read: every provider setting now goes through the per-purpose surface above, and a
+  // renderer that kept writing the legacy keys would let one screen silently disagree
+  // with the lane cards. The keyring's availability is still worth stating, and each
+  // lane already says it when it is false.
 
   replace(byId('aboutKv'), [
     el('dt', { text: 'Version' }), el('dd', { text: appState.version || '—' }),
@@ -2214,6 +2237,8 @@ async function saveSettings() {
       workspaceRoot: byId('setWorkspace').value.trim(),
       allowShell: byId('setAllowShell').checked,
       allowDesktop: byId('setAllowDesktop').checked,
+      allowBrowser: byId('setAllowBrowser').checked,
+      allowMedia: byId('setAllowMedia').checked,
       allowedCommands: byId('setAllowedCommands').value.split(',').map((s) => s.trim()).filter(Boolean),
     };
     const answer = await bridge.updateSettings(patch);
@@ -2230,49 +2255,12 @@ async function saveSettings() {
   }
 }
 
-async function saveProvider() {
-  const button = byId('providerSave');
-  button.disabled = true;
-  try {
-    const patch = {
-      providerName: byId('setProviderName').value.trim(),
-      providerEndpoint: byId('setProviderEndpoint').value.trim(),
-      providerModel: byId('setProviderModel').value.trim(),
-    };
-    // Only send the key when the user actually typed one: an empty box means
-    // "leave the stored key alone", not "clear it". Clearing is its own button.
-    const key = byId('setProviderKey').value;
-    if (key) patch.providerApiKey = key;
-    const answer = await bridge.updateSettings(patch);
-    byId('setProviderKey').value = '';
-    const secret = answer && answer.settings && answer.settings.secrets && answer.settings.secrets.providerApiKey;
-    if (key && secret && secret.status === 'unavailable') {
-      toast('The key was not stored: the OS keyring is unavailable. Nothing was written in plain text.', 'bad');
-    } else {
-      toast('Provider settings saved.', 'good');
-    }
-    await refreshSettings();
-  } catch (error) {
-    toast(`Provider settings were not saved: ${error.message}`, 'bad');
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function clearProviderKey() {
-  const button = byId('providerClear');
-  button.disabled = true;
-  try {
-    await bridge.updateSettings({ providerApiKey: '' });
-    byId('setProviderKey').value = '';
-    toast('The stored key was removed.', 'good');
-    await refreshSettings();
-  } catch (error) {
-    toast(`The key was not removed: ${error.message}`, 'bad');
-  } finally {
-    button.disabled = false;
-  }
-}
+// The pre-C42 "Save provider" / "Clear key" pair used to write the legacy single
+// provider slot — name, model, endpoint and credential — directly. Both jobs are now
+// done by the purpose modal's Save (`cfgSave` → `purpose:configure`) and Remove
+// (`cfgRemove` → `purpose:remove`), for one named job at a time, so the duplicated path
+// is gone rather than merely hidden. The hidden markup it drove was removed from
+// index.html too: a form nothing reads is a trap for the next person.
 
 async function backendAction(action) {
   const label = { restart: 'Restarting', stop: 'Stopping', start: 'Starting' }[action] || 'Working';
@@ -2366,8 +2354,10 @@ function visualSharingOn() {
 function renderSharing() {
   const chip = byId('visualSharing');
   const on = visualSharingOn();
-  chip.textContent = on ? 'sharing a frame' : 'not sharing';
-  chip.dataset.state = on ? 'on' : 'off';
+  if (chip) {
+    chip.textContent = on ? 'sharing a frame' : 'not sharing';
+    chip.dataset.state = on ? 'on' : 'off';
+  }
   const stop = byId('visualStop');
   if (stop) stop.disabled = !on;
   // The stop control exists precisely so that holding a frame is always undoable
@@ -3360,6 +3350,151 @@ function refreshVisual() {
 }
 
 // ---------------------------------------------------------------------------
+// BROWSER (C42)
+// ---------------------------------------------------------------------------
+// Every control is a press, never a timer: each button invokes exactly one
+// named preload method (`browserOpen`, `browserNavigate`, …) and renders the
+// reply it returns. Replies and pushed events are turned into text with
+// createElement + textContent — page content is displayed, never executed,
+// and no page string is used as an element id or a selector. Refs are the
+// opaque integers the snapshot stamped; the page never gets to name one.
+const browserState = { lastReply: null, busy: false };
+
+function browserRefInput() {
+  const node = byId('browserRef');
+  const ref = node ? Number(node.value) : NaN;
+  return Number.isSafeInteger(ref) && ref >= 1 ? ref : null;
+}
+
+function renderBrowserObservation(reply) {
+  const box = byId('browserObservation');
+  if (!box) return;
+  if (!reply) {
+    replace(box, [el('p', { class: 'fine', text: 'No observation yet. Open a page to begin.' })]);
+    return;
+  }
+  const rows = [['Status', reply.status || '—']];
+  if (reply.url) rows.push(['URL', reply.url]);
+  if (reply.title) rows.push(['Title', reply.title]);
+  if (reply.note) rows.push(['Note', reply.note]);
+  if (reply.changed !== undefined) rows.push(['Changed', reply.changed ? 'yes' : 'no']);
+  replace(box, [kvTable(rows)]);
+  const chip = byId('browserSessionChip');
+  if (chip) {
+    const live = reply.status === 'ok';
+    chip.dataset.state = live ? 'on' : 'off';
+    chip.textContent = live ? 'driving' : (reply.status === 'unavailable' ? 'no session' : String(reply.status || '—'));
+  }
+  const stateChipNode = byId('browserStateChip');
+  if (stateChipNode) stateChipNode.textContent = reply.status || '—';
+  const info = byId('browserWindowInfo');
+  if (info) {
+    replace(info, [kvTable([
+      ['URL', reply.url || '—'],
+      ['Epoch', reply.epoch !== undefined ? String(reply.epoch) : '—'],
+    ])]);
+  }
+}
+
+function renderBrowserElements(reply) {
+  const list = byId('browserElements');
+  const count = byId('browserElementCount');
+  if (!list) return;
+  const elements = reply && Array.isArray(reply.elements) ? reply.elements : [];
+  if (count) count.textContent = String(elements.length);
+  if (!elements.length) {
+    replace(list, [el('li', { class: 'empty', text: 'No elements in the last snapshot.' })]);
+    return;
+  }
+  const items = elements.map((item) => {
+    const name = item.name ? ` — ${item.name}` : '';
+    const password = item.password ? ' (password field)' : (item.disabled ? ' (disabled)' : '');
+    return el('li', { text: `#${item.ref} ${item.tag}${name}${password}` });
+  });
+  replace(list, items);
+}
+
+async function runBrowserOp(label, makeCall) {
+  if (browserState.busy) return;
+  browserState.busy = true;
+  try {
+    const reply = await makeCall();
+    browserState.lastReply = reply || null;
+    renderBrowserObservation(reply);
+    if (reply && Array.isArray(reply.elements)) renderBrowserElements(reply);
+  } catch (error) {
+    renderBrowserObservation({ status: 'error', note: error && error.message ? error.message : 'the drive refused' });
+  } finally {
+    browserState.busy = false;
+  }
+}
+
+function wireBrowser() {
+  const address = () => {
+    const node = byId('browserAddress');
+    return node ? node.value.trim() : '';
+  };
+  on('browserOpen', 'click', () => {
+    const url = address();
+    if (!url) { toast('Type an address first.', 'bad'); return; }
+    runBrowserOp('open', () => bridge.browserOpen({ url }));
+  });
+  on('browserNavigate', 'click', () => {
+    const url = address();
+    if (!url) { toast('Type an address first.', 'bad'); return; }
+    runBrowserOp('navigate', () => bridge.browserNavigate({ url }));
+  });
+  on('browserSearch', 'click', () => {
+    const query = address();
+    if (!query) { toast('Type search terms first.', 'bad'); return; }
+    runBrowserOp('search', () => bridge.browserSearch({ query }));
+  });
+  on('browserBack', 'click', () => runBrowserOp('back', () => bridge.browserBack()));
+  on('browserForward', 'click', () => runBrowserOp('forward', () => bridge.browserForward()));
+  on('browserRefresh', 'click', () => runBrowserOp('refresh', () => bridge.browserRefresh()));
+  on('browserWait', 'click', () => runBrowserOp('wait', () => bridge.browserWait({ ms: 500, until: 'load' })));
+  on('browserStop', 'click', () => runBrowserOp('stop', () => bridge.browserStop()));
+  on('browserInspect', 'click', () => runBrowserOp('inspect', () => bridge.browserInspect()));
+  on('browserState', 'click', () => runBrowserOp('state', () => bridge.browserState()));
+  on('browserClick', 'click', () => {
+    const ref = browserRefInput();
+    if (ref === null) { toast('Enter an element ref from the list (e.g. 3).', 'bad'); return; }
+    runBrowserOp('click', () => bridge.browserClick({ ref }));
+  });
+  on('browserType', 'click', () => {
+    const ref = browserRefInput();
+    const textNode = byId('browserText');
+    const text = textNode ? textNode.value : '';
+    if (ref === null) { toast('Enter an element ref from the list (e.g. 3).', 'bad'); return; }
+    runBrowserOp('type', () => bridge.browserType({ ref, text }));
+    if (textNode) textNode.value = '';
+  });
+  on('browserSelect', 'click', () => {
+    const ref = browserRefInput();
+    const textNode = byId('browserText');
+    const value = textNode ? textNode.value : '';
+    if (ref === null) { toast('Enter an element ref from the list (e.g. 3).', 'bad'); return; }
+    runBrowserOp('select', () => bridge.browserSelect({ ref, value }));
+  });
+  on('browserScroll', 'click', () => {
+    const ref = browserRefInput();
+    runBrowserOp('scroll', () => bridge.browserScroll({ direction: 'down', ref: ref === null ? undefined : ref, amount: 600 }));
+  });
+  if (typeof bridge.onBrowserEvent === 'function') {
+    bridge.onBrowserEvent((event) => {
+      if (!event) return;
+      renderBrowserObservation({ status: 'ok', url: event.url, title: event.title, epoch: event.epoch });
+      if (Array.isArray(event.elements)) renderBrowserElements(event);
+    });
+  }
+}
+
+function refreshBrowser() {
+  // Entering the view reads nothing from the machine; it repaints the last reply.
+  renderBrowserObservation(browserState.lastReply);
+}
+
+// ---------------------------------------------------------------------------
 // VOICE COMMANDS
 // ---------------------------------------------------------------------------
 // Two honest facts govern this view:
@@ -3865,8 +4000,38 @@ function setVoiceModel(status) {
 }
 
 // ---------------------------------------------------------------------------
-// AI PROVIDER — header bar and configuration modal
+// AI PROVIDER — four purposes: chat | reasoning | image | audio
 // ---------------------------------------------------------------------------
+// The renderer draws one compact bar in the header (chat only) and four lane
+// cards into #homeProviderKv and #settingsProviderKv. All four talk to the
+// purpose-scoped IPC surface only — no key material ever crosses the bridge,
+// and "Connected" is shown only when a test call actually said so.
+const PURPOSES = ['chat', 'reasoning', 'image', 'audio'];
+
+/**
+ * The elements every screen depends on.
+ *
+ * Not every id in index.html belongs here — a control that is missing costs its own
+ * feature and is guarded where it is wired. These are the anchors: the two view
+ * headings, the rail, the toast, the lane hosts, and the provider modal. Without them
+ * the page cannot describe itself truthfully, and starting anyway would paint a shell
+ * whose every claim was about absent controls.
+ */
+const REQUIRED_IDS = [
+  'app', 'viewEyebrow', 'viewTitle',
+  'railDot', 'railStatus', 'railVersion', 'railShortcut', 'streamPill', 'toast',
+  'homeProviderKv', 'settingsProviderKv', 'providerStatus',
+  'providerModal', 'providerModalTitle', 'cfgProvider', 'cfgModel',
+  'cfgTest', 'cfgSave', 'cfgRemove', 'cfgApiKey', 'cfgStatus',
+];
+
+const PURPOSE_LABELS = {
+  chat: 'Chat',
+  reasoning: 'Reasoning',
+  image: 'Image',
+  audio: 'Audio',
+};
+
 const PROVIDER_STATE_CHIP = {
   not_configured: 'Not configured',
   missing_key: 'Missing API key',
@@ -3878,78 +4043,245 @@ const PROVIDER_STATE_CHIP = {
   rate_limited: 'Rate limited',
 };
 
-async function refreshProviderBar() {
-  try {
-    const status = await bridge.providerStatus();
-    state.providerStatus = status;
-    renderProviderBar(status);
-  } catch (error) {
-    // A failure here is not worth a toast on every poll; the bar says "unknown".
-    renderProviderBar(null);
+// The modal is one shared form; `#providerModal[data-purpose]` says which job it
+// is configuring. Every save/test/remove the modal performs carries that string.
+function currentModalPurpose() {
+  const backdrop = byId('providerModal');
+  const p = backdrop && backdrop.dataset ? backdrop.dataset.purpose : '';
+  return PURPOSES.includes(p) ? p : 'chat';
+}
+
+async function loadPurposeSpecs() {
+  // Static tables from the main process, read once per purpose before the first
+  // render. A failure leaves that lane's list empty rather than inventing a
+  // provider; the lanes still render with "not configured".
+  for (const purpose of PURPOSES) {
+    try {
+      const answer = await bridge.purposeSpecs(purpose);
+      state.purposeSpecs[purpose] = (answer && answer.ok && answer.specs) || [];
+    } catch {
+      state.purposeSpecs[purpose] = [];
+    }
   }
+}
+
+async function refreshPurposes() {
+  // Pull each purpose's status explicitly. `appState().purposes` pushes the same
+  // objects on a backend change; this is the pull path used by boot, the poll, and
+  // after any configure/test/remove so the lanes show the truth, not a guess.
+  for (const purpose of PURPOSES) {
+    try {
+      const answer = await bridge.purposeStatus(purpose);
+      if (answer && answer.ok && answer.status) {
+        state.purposeStatuses[purpose] = answer.status;
+        if (purpose === 'chat') state.providerStatus = answer.status;
+      }
+    } catch {
+      // Leave the last-known status in place; a failed pull must not blank the UI
+      // into implying something was removed.
+    }
+  }
+  renderProviderBar(state.purposeStatuses.chat || state.providerStatus);
+  renderHomeLanes();
+  renderSettingsLanes();
+}
+
+function laneButton(action, purpose, label, extraAttrs) {
+  return el('button', {
+    type: 'button',
+    class: 'btn ghost small',
+    dataset: { laneAction: action, purpose, ...(extraAttrs || {}) },
+    text: label,
+  });
+}
+
+function laneCard(purpose) {
+  const status = state.purposeStatuses[purpose] || {};
+  const stateName = status.state || 'not_configured';
+  const lines = [];
+  const providerLine = status.provider
+    ? `${status.providerLabel || status.provider}${status.model ? ` · ${status.model}` : ''}`
+    : 'no provider chosen';
+  lines.push(el('div', { class: 'purpose-lane-line', text: providerLine }));
+  if (status.legacy) {
+    lines.push(el('div', {
+      class: 'purpose-lane-line',
+      text: 'Using your earlier chat setup — saving here switches this job to its own configuration.',
+    }));
+  }
+  const keyLine = status.hasKey
+    ? 'Key held in the OS keyring.'
+    : (status.encryptionAvailable === false
+      ? 'No key can be stored: the OS keyring is unavailable.'
+      : 'No key stored yet.');
+  lines.push(el('div', { class: 'purpose-lane-line', text: keyLine }));
+  if (status.detail) {
+    lines.push(el('div', { class: 'purpose-lane-detail', text: status.detail }));
+  }
+  const tested = status.testedAt ? ` · tested ${timeAgo(status.testedAt)}` : '';
+  lines.push(el('div', { class: 'purpose-lane-tested', text: tested.slice(3) || '' }));
+
+  const actions = el('div', { class: 'purpose-lane-actions' }, [
+    laneButton('configure', purpose, 'Configure'),
+    laneButton('test', purpose, 'Test'),
+  ]);
+  if (purpose === 'chat') {
+    // "Default" is the planner's lane preference, so the card says which state it is
+    // in rather than offering the same press forever.
+    const isDefault = Boolean(state.appState && state.appState.settings
+      && state.appState.settings.providerDefault);
+    if (isDefault) {
+      lines.push(el('div', { class: 'purpose-lane-line', text: 'The planner uses this lane.' }));
+    }
+    actions.append(laneButton('default', 'chat', isDefault ? 'Planner default' : 'Set as default'));
+  }
+
+  return el('div', { class: 'purpose-lane', dataset: { purpose } }, [
+    el('div', { class: 'purpose-lane-head' }, [
+      el('span', { class: 'purpose-lane-name', text: PURPOSE_LABELS[purpose] || purpose }),
+      stateChip(stateName),
+    ]),
+    ...lines,
+    actions,
+  ]);
+}
+
+function renderLanesInto(host) {
+  if (!host) return;
+  replace(host, PURPOSES.map(laneCard));
+}
+
+function renderHomeLanes() {
+  renderLanesInto(byId('homeProviderKv'));
+  const configure = byId('homeProviderConfigure');
+  if (configure) configure.disabled = false;
+  // "Set default" picks the *currently configured* chat provider as the planner's
+  // remembered choice — it needs a configured chat lane, not a verified one. The
+  // button is wired once; here it only tracks whether there is anything to set.
+  const homeDefault = byId('homeProviderDefault');
+  if (homeDefault) {
+    if (!homeDefault._wired) {
+      homeDefault._wired = true;
+      homeDefault.addEventListener('click', () => laneSetDefault().catch((error) => toast(error.message, 'bad')));
+    }
+    const chat = state.purposeStatuses.chat || {};
+    homeDefault.disabled = !chat.provider;
+  }
+}
+
+function renderSettingsLanes() {
+  renderLanesInto(byId('settingsProviderKv'));
+  const note = byId('settingsProviderNote');
+  if (note) {
+    note.textContent = 'A lane is connected only after its own Test Connection passes. '
+      + 'Image and audio adapters are not implemented in this build, so their lanes '
+      + 'refuse a key until an adapter and a real probe exist.';
+  }
+}
+
+// Kept as the name refreshHome() calls; it now renders the four lanes.
+function renderHomeProviderKv() {
+  renderHomeLanes();
+}
+
+// Kept as the name refreshSettings() calls; it now renders the four lanes.
+function renderSettingsProviderCard() {
+  renderSettingsLanes();
 }
 
 function renderProviderBar(status) {
-  const select = byId('providerSelect');
-  const modelSelect = byId('modelSelect');
+  // The header bar is the chat lane in miniature: one provider select, one model
+  // select, one verdict. The selects are looked up by class inside the chat bar,
+  // and every lookup is guarded — a missing element must never crash boot().
+  const bar = document.querySelector('.provider-bar[data-purpose="chat"]');
+  if (!bar) return;
+  const select = bar.querySelector('.purpose-provider-select');
+  const modelSelect = bar.querySelector('.purpose-model-select');
   const chip = byId('providerStatus');
-  if (!select || !modelSelect || !chip) return;
 
-  const specs = state.providerSpecs || [];
-  if (select.options.length !== specs.length) {
-    clear(select);
-    for (const spec of specs) {
-      select.append(el('option', {
-        value: spec.id,
-        text: spec.implemented ? spec.label : `${spec.label} — not implemented`,
-        disabled: !spec.implemented,
-      }));
+  const specs = state.purposeSpecs.chat || [];
+  if (select) {
+    if (select.options.length !== specs.length || select.dataset.signature !== specs.map((s) => s.id).join('|')) {
+      select.dataset.signature = specs.map((s) => s.id).join('|');
+      clear(select);
+      for (const spec of specs) {
+        select.append(el('option', {
+          value: spec.id,
+          text: spec.implemented ? spec.label : `${spec.label} — not implemented`,
+          disabled: !spec.implemented,
+        }));
+      }
     }
+    // Unimplemented options are present and disabled: hiding them would make the
+    // list look like the whole world, and selecting one is refused at the main
+    // process too.
+    if (status && status.provider) select.value = status.provider;
   }
-  // Unimplemented options are present and disabled: hiding them would make the list
-  // look like the whole world, and selecting one is refused at the main process too.
-  if (status && status.provider) select.value = status.provider;
 
-  const currentSpec = specs.find((spec) => spec.id === (status && status.provider));
-  const models = currentSpec ? [...currentSpec.models] : [];
-  const currentModel = (status && status.model) || '';
-  if (currentModel && !models.includes(currentModel)) models.unshift(currentModel);
-  const modelSignature = models.join('|');
-  if (modelSelect.dataset.signature !== modelSignature) {
-    modelSelect.dataset.signature = modelSignature;
-    clear(modelSelect);
-    if (!models.length) {
-      modelSelect.append(el('option', { value: '', text: 'no model' }));
-    } else {
-      for (const model of models) modelSelect.append(el('option', { value: model, text: model }));
+  if (modelSelect) {
+    const currentSpec = specs.find((spec) => spec.id === (status && status.provider));
+    const models = currentSpec ? [...currentSpec.models] : [];
+    const currentModel = (status && status.model) || '';
+    if (currentModel && !models.includes(currentModel)) models.unshift(currentModel);
+    const modelSignature = models.join('|');
+    if (modelSelect.dataset.signature !== modelSignature) {
+      modelSelect.dataset.signature = modelSignature;
+      clear(modelSelect);
+      if (!models.length) {
+        modelSelect.append(el('option', { value: '', text: 'no model' }));
+      } else {
+        for (const model of models) modelSelect.append(el('option', { value: model, text: model }));
+      }
     }
+    modelSelect.value = currentModel;
+    modelSelect.disabled = !(status && status.provider);
   }
-  modelSelect.value = currentModel;
 
-  const key = status ? status.state : 'not_configured';
-  chip.dataset.state = key;
-  chip.textContent = PROVIDER_STATE_CHIP[key] || 'Unknown';
-  chip.title = status && status.detail ? status.detail : '';
+  if (chip) {
+    const key = status ? status.state : 'not_configured';
+    chip.dataset.state = key;
+    chip.textContent = PROVIDER_STATE_CHIP[key] || 'Unknown';
+    chip.title = status && status.detail ? status.detail : '';
+  }
 }
 
-function openProviderModal() {
+function openProviderModal(purpose) {
   const backdrop = byId('providerModal');
   if (!backdrop) return;
+  const p = PURPOSES.includes(purpose) ? purpose : currentModalPurpose();
+  backdrop.dataset.purpose = p;
+  const title = byId('providerModalTitle');
+  if (title) title.textContent = `AI provider configuration — ${PURPOSE_LABELS[p] || p}`;
   backdrop.hidden = false;
-  fillProviderModal();
+  fillProviderModal(p);
+  const first = byId('cfgProvider');
+  if (first) first.focus();
 }
 
 function closeProviderModal() {
   const backdrop = byId('providerModal');
   if (backdrop) backdrop.hidden = true;
-  byId('cfgApiKey').value = '';
+  const key = byId('cfgApiKey');
+  if (key) key.value = '';
 }
 
-function fillProviderModal() {
-  const specs = state.providerSpecs || [];
-  const status = state.providerStatus || {};
+function specsForModal(purpose) {
+  return state.purposeSpecs[purpose] || [];
+}
+
+function fillProviderModal(purpose) {
+  const p = purpose || currentModalPurpose();
+  const specs = specsForModal(p);
+  const status = state.purposeStatuses[p] || {};
   const select = byId('cfgProvider');
-  if (!select.options.length) {
+  if (!select) return;
+  // The option list is rebuilt whenever the purpose changes or the table differs;
+  // reusing a stale list from another purpose would offer providers that lane
+  // cannot use.
+  const signature = `${p}|${specs.map((s) => s.id).join('|')}`;
+  if (select.dataset.signature !== signature) {
+    select.dataset.signature = signature;
+    clear(select);
     for (const spec of specs) {
       select.append(el('option', {
         value: spec.id,
@@ -3958,33 +4290,33 @@ function fillProviderModal() {
       }));
     }
   }
-  // With nothing configured yet, `status.provider` is empty. Falling back to the
-  // first spec is the right *default*, but it must also be what the select shows:
-  // otherwise the form reads "Not configured — No provider has been chosen" while a
-  // provider is visibly selected, and saving would store Anthropic without the person
-  // having chosen it.
+  // With nothing configured, `status.provider` is empty. Falling back to the first
+  // usable spec is the right *suggestion*, and the select must show exactly that,
+  // because the form would otherwise read "nothing chosen" while a provider is
+  // visibly selected — and Save would store it without the person choosing it.
   const firstUsable = specs.find((spec) => spec.implemented) || specs[0];
   select.value = status.provider || (firstUsable && firstUsable.id) || '';
   byId('cfgModel').value = status.model || '';
-  byId('cfgBaseUrl').value = '';
+  // Show what is actually stored, so pressing Save without touching the form cannot
+  // silently erase a custom endpoint or a non-default timeout. The endpoint belongs to
+  // the stored provider; if the person has picked a different one it is not theirs to
+  // reuse, so it stays blank.
+  byId('cfgBaseUrl').value = select.value === status.provider ? (status.endpoint || '') : '';
   byId('cfgApiKey').value = '';
-  byId('cfgTimeout').value = '12';
+  byId('cfgTimeout').value = String(status.timeout || 12);
   applyProviderChoice();
   const keyHint = byId('cfgKeyHint');
   if (status.hasKey) {
-    keyHint.textContent = 'A key is stored in the OS keyring. It is never shown again; paste a new one to replace it.';
+    keyHint.textContent = 'A key is stored in the OS keyring for this job. It is never shown again; paste a new one to replace it.';
   } else if (status.encryptionAvailable === false) {
     keyHint.textContent = 'The OS keyring is unavailable, so no key can be stored here. Nothing is written in plain text.';
   } else {
-    keyHint.textContent = 'Stored by the OS keyring. It is never returned to this page.';
+    keyHint.textContent = 'Stored by the OS keyring, for this job only. It is never returned to this page.';
   }
-  // Nothing configured and nothing connected: the provider and model boxes are
-  // showing what would be used, not what is in use. Saying so is the difference
-  // between "not configured" and a claim the app has not earned.
   if (!status.provider) {
     setCfgStatus(
       'not_configured',
-      'Nothing is configured yet. The provider and model above are a suggestion; '
+      'Nothing is configured for this job yet. The provider and model above are a suggestion; '
         + 'Save configuration stores the one you pick.',
     );
     return;
@@ -3993,11 +4325,11 @@ function fillProviderModal() {
 }
 
 function applyProviderChoice() {
+  const p = currentModalPurpose();
   const id = byId('cfgProvider').value;
-  const spec = (state.providerSpecs || []).find((entry) => entry.id === id);
+  const spec = specsForModal(p).find((entry) => entry.id === id);
   const baseRow = byId('cfgBaseUrlRow');
-  if (spec && spec.requiresBaseUrl) baseRow.hidden = false;
-  else baseRow.hidden = true;
+  if (baseRow) baseRow.hidden = !(spec && spec.requiresBaseUrl);
 
   const list = byId('cfgModelOptions');
   clear(list);
@@ -4014,6 +4346,10 @@ function applyProviderChoice() {
     : 'Test Connection calls the provider adapter for real — a stored key alone is not "connected".';
   byId('cfgTest').disabled = !spec || !spec.implemented;
   byId('cfgSave').disabled = !spec || !spec.implemented;
+  // "Default" is the legacy single-provider notion — the planner's chat choice.
+  // It is honest only for the chat lane.
+  const def = byId('cfgDefault');
+  if (def) def.disabled = p !== 'chat';
 }
 
 function setCfgStatus(stateName, detail) {
@@ -4024,8 +4360,11 @@ function setCfgStatus(stateName, detail) {
 }
 
 function providerPayload() {
-  // Only these fields leave the renderer. No actor, no authority, no capability.
+  // Only these fields leave the renderer, plus the purpose they belong to.
+  // No actor, no authority, no capability — and the key only ever leaves on a
+  // save/test call, never back.
   return {
+    purpose: currentModalPurpose(),
     provider: byId('cfgProvider').value,
     model: byId('cfgModel').value.trim(),
     baseUrl: byId('cfgBaseUrl').value.trim(),
@@ -4039,15 +4378,20 @@ async function testProviderConnection() {
   button.disabled = true;
   setCfgStatus('connecting', 'calling the provider');
   try {
-    const answer = await bridge.providerTest(providerPayload());
+    const answer = await bridge.purposeTest(providerPayload());
     if (!answer || !answer.ok) {
       setCfgStatus('provider_unavailable', (answer && answer.error) || 'the main process refused the request');
       return;
     }
     setCfgStatus(answer.state, answer.detail || '');
-    // Testing does not save. The modal says "not saved" so the next Save is not a
-    // surprise; the header keeps showing the stored configuration.
-    await refreshProviderBar();
+    // Testing does not save. A probe the main process recorded becomes the lane's
+    // state, so the header, Home and Settings follow it; the modal is refilled only
+    // when the stored status now agrees with what was just printed. Otherwise the
+    // refill would wipe the verdict with "nothing configured yet" — reporting the
+    // old state over a credential the provider just refused.
+    await refreshPurposes();
+    const refreshed = state.purposeStatuses[currentModalPurpose()];
+    if (refreshed && refreshed.state === answer.state) fillProviderModal();
   } catch (error) {
     setCfgStatus('provider_unavailable', error.message);
   } finally {
@@ -4055,19 +4399,33 @@ async function testProviderConnection() {
   }
 }
 
+// Write the fields the person can see, and merge in the stored provider, model
+// and endpoint this lane already uses when the modal left them blank. Without the
+// merge, pressing Save after a provider switch would silently drop a configured
+// model or custom endpoint.
+function mergeConfigured(patch, configured) {
+  const out = { ...patch };
+  if (!out.provider) out.provider = configured.provider || '';
+  if (!out.model) out.model = configured.model || '';
+  if (!out.baseUrl) out.baseUrl = configured.endpoint || '';
+  return out;
+}
+
 async function saveProviderConfig() {
   const button = byId('cfgSave');
   button.disabled = true;
   try {
-    const answer = await bridge.providerConfigure(providerPayload());
+    const payload = mergeConfigured(providerPayload(), state.purposeStatuses[currentModalPurpose()] || {});
+    const answer = await bridge.purposeConfigure(payload);
     if (!answer || !answer.ok) {
       setCfgStatus('not_configured', (answer && answer.error) || 'not saved');
       return;
     }
     byId('cfgApiKey').value = '';
-    toast('Provider configuration saved.', 'good');
-    state.providerStatus = answer.status;
-    renderProviderBar(answer.status);
+    toast(`${PURPOSE_LABELS[payload.purpose]} configuration saved. Run Test Connection to verify it.`, 'good');
+    state.purposeStatuses[payload.purpose] = answer.status;
+    if (payload.purpose === 'chat') state.providerStatus = answer.status;
+    renderProviderBar(state.purposeStatuses.chat);
     fillProviderModal();
     renderHomeProviderKv();
     renderSettingsProviderCard();
@@ -4082,10 +4440,16 @@ async function removeProviderKey() {
   const button = byId('cfgRemove');
   button.disabled = true;
   try {
-    const answer = await bridge.providerRemove();
-    toast('Stored credentials removed.', 'good');
-    state.providerStatus = answer && answer.status;
-    renderProviderBar(state.providerStatus);
+    const payload = providerPayload();
+    const answer = await bridge.purposeRemove({ purpose: payload.purpose });
+    if (!answer || !answer.ok) {
+      toast((answer && answer.error) || 'The key was not removed.', 'bad');
+      return;
+    }
+    toast(`${PURPOSE_LABELS[payload.purpose]} key removed from the keyring.`, 'good');
+    state.purposeStatuses[payload.purpose] = answer.status;
+    if (payload.purpose === 'chat') state.providerStatus = answer.status;
+    renderProviderBar(state.purposeStatuses.chat);
     fillProviderModal();
     renderHomeProviderKv();
     renderSettingsProviderCard();
@@ -4097,50 +4461,123 @@ async function removeProviderKey() {
 }
 
 async function setProviderAsDefault() {
-  // "Default" in this build means: choose this provider for the header and keep it
-  // across restarts. It grants nothing — the backend's planner is unchanged.
-  const answer = await bridge.providerConfigure({ ...providerPayload(), setDefault: true });
+  // "Default" is a real setting with one consumer: the planner prefers the chat
+  // lane over the reasoning lane when both are configured. It grants nothing —
+  // the backend's policy is unchanged. Only chat has a default to set.
+  if (currentModalPurpose() !== 'chat') return;
+  const answer = await bridge.purposeSetDefault({ purpose: 'chat' });
   if (answer && answer.ok) {
-    toast('This provider is now the default.', 'good');
+    toast('The planner will now use your chat lane.', 'good');
     state.providerStatus = answer.status;
+    state.purposeStatuses.chat = answer.status;
     renderProviderBar(answer.status);
+    renderHomeProviderKv();
+    await refreshPurposes();
   } else {
     toast((answer && answer.error) || 'Could not set the default.', 'bad');
   }
 }
 
-function renderSettingsProviderCard() {
-  const host = byId('settingsProviderKv');
-  if (!host) return;
-  const status = state.providerStatus || {};
-  replace(host, [
-    el('dt', { text: 'Provider' }), el('dd', { text: status.providerLabel || 'not configured' }),
-    el('dt', { text: 'Model' }), el('dd', { text: status.model || '—' }),
-    el('dt', { text: 'Connection' }), el('dd', { text: PROVIDER_STATE_CHIP[status.state] || 'unknown' }),
-    el('dt', { text: 'API key' }), el('dd', { text: status.hasKey ? 'held in the OS keyring' : 'not stored' }),
-  ]);
-  const note = byId('settingsProviderNote');
-  if (note) note.textContent = status.detail || '';
+async function laneTest(purpose) {
+  // The lane's Test button runs the *stored* configuration for that job: an empty
+  // override tells the main process to read the keyring itself.
+  const status = state.purposeStatuses[purpose] || {};
+  if (!status.provider) {
+    toast(`${PURPOSE_LABELS[purpose]} has no provider to test yet.`, 'bad');
+    return;
+  }
+  const answer = await bridge.purposeTest({ purpose });
+  if (!answer || !answer.ok) {
+    toast((answer && answer.error) || 'The test could not run.', 'bad');
+    return;
+  }
+  toast(`${PURPOSE_LABELS[purpose]} — ${PROVIDER_STATE_CHIP[answer.state] || answer.state}.`,
+    answer.state === 'connected' ? 'good' : 'bad');
+  await refreshPurposes();
 }
 
-async function loadProviderSpecs() {
-  try {
-    const answer = await bridge.providerSpecs();
-    state.providerSpecs = (answer && answer.specs) || [];
-  } catch {
-    state.providerSpecs = [];
+async function laneSetDefault() {
+  const status = state.purposeStatuses.chat || {};
+  if (!status.provider) {
+    toast('Configure a chat provider first.', 'bad');
+    return;
+  }
+  const answer = await bridge.purposeSetDefault({ purpose: 'chat' });
+  if (answer && answer.ok) {
+    toast('The planner will now use your chat lane.', 'good');
+    state.providerStatus = answer.status;
+    state.purposeStatuses.chat = answer.status;
+    renderProviderBar(answer.status);
+    renderHomeProviderKv();
+    await refreshPurposes();
+  } else {
+    toast((answer && answer.error) || 'Could not set the default.', 'bad');
   }
 }
 
 function wireProvider() {
+  // Header chat bar. The selects live inside `.provider-bar[data-purpose="chat"]`
+  // and are addressed by class; every lookup is guarded so a layout change can
+  // never take boot() down with it.
+  const bar = document.querySelector('.provider-bar[data-purpose="chat"]');
+  if (bar) {
+    const modelSelect = bar.querySelector('.purpose-model-select');
+    if (modelSelect) {
+      // Changing the model is a real setting change, with no other effect.
+      modelSelect.addEventListener('change', async (event) => {
+        try {
+          const answer = await bridge.purposeSetModel({ purpose: 'chat', model: event.target.value });
+          if (answer && answer.ok && answer.status) {
+            state.purposeStatuses.chat = answer.status;
+            state.providerStatus = answer.status;
+            renderProviderBar(answer.status);
+            renderHomeProviderKv();
+            toast('Model changed. Run Test Connection to verify it.', 'good');
+          } else {
+            toast((answer && answer.error) || 'The model was not changed.', 'bad');
+          }
+        } catch (error) {
+          toast(`The model was not changed: ${error.message}`, 'bad');
+        }
+      });
+    }
+    const providerSelect = bar.querySelector('.purpose-provider-select');
+    if (providerSelect) {
+      providerSelect.addEventListener('change', (event) => {
+        // Choosing a provider in the header only pre-fills the modal; it does not
+        // save, because a provider without a key is not a configuration.
+        openProviderModal('chat');
+        const cfg = byId('cfgProvider');
+        if (cfg) {
+          cfg.value = event.target.value;
+          applyProviderChoice();
+        }
+      });
+    }
+  }
+
   const configure = byId('providerConfigure');
-  if (configure) configure.addEventListener('click', openProviderModal);
+  if (configure) {
+    configure.addEventListener('click', () => openProviderModal(configure.dataset.configurePurpose || 'chat'));
+  }
   const homeConfigure = byId('homeProviderConfigure');
-  if (homeConfigure) homeConfigure.addEventListener('click', openProviderModal);
-  const settingsConfigure = byId('settingsProviderConfigure');
-  if (settingsConfigure) settingsConfigure.addEventListener('click', openProviderModal);
-  const settingsTest = byId('settingsProviderTest');
-  if (settingsTest) settingsTest.addEventListener('click', () => { openProviderModal(); testProviderConnection(); });
+  if (homeConfigure) homeConfigure.addEventListener('click', () => openProviderModal('chat'));
+
+  // Lane buttons are event-delegated: the lane cards are re-rendered on every
+  // status change, and a listener on the container survives that without
+  // re-wiring or duplicating.
+  for (const host of [byId('homeProviderKv'), byId('settingsProviderKv')]) {
+    if (!host) continue;
+    host.addEventListener('click', (event) => {
+      const button = event.target.closest ? event.target.closest('button[data-lane-action]') : null;
+      if (!button || !host.contains(button)) return;
+      const action = button.dataset.laneAction;
+      const purpose = button.dataset.purpose;
+      if (action === 'configure') openProviderModal(purpose);
+      else if (action === 'test') laneTest(purpose).catch((error) => toast(error.message, 'bad'));
+      else if (action === 'default') laneSetDefault().catch((error) => toast(error.message, 'bad'));
+    });
+  }
 
   const close = byId('providerModalClose');
   if (close) close.addEventListener('click', closeProviderModal);
@@ -4154,31 +4591,13 @@ function wireProvider() {
     if (event.key === 'Escape' && backdrop && !backdrop.hidden) closeProviderModal();
   });
 
-  byId('cfgProvider').addEventListener('change', applyProviderChoice);
-  byId('cfgTest').addEventListener('click', testProviderConnection);
-  byId('cfgSave').addEventListener('click', saveProviderConfig);
-  byId('cfgRemove').addEventListener('click', removeProviderKey);
-  byId('cfgDefault').addEventListener('click', setProviderAsDefault);
-
-  // Changing the model in the header is a real setting change, with no other effect.
-  byId('modelSelect').addEventListener('change', async (event) => {
-    try {
-      const answer = await bridge.providerSetModel(event.target.value);
-      state.providerStatus = answer && answer.status;
-      renderProviderBar(state.providerStatus);
-      toast('Model changed. Run Test Connection to verify it.', 'good');
-    } catch (error) {
-      toast(`The model was not changed: ${error.message}`, 'bad');
-    }
-  });
-  byId('providerSelect').addEventListener('change', (event) => {
-    // Choosing a provider in the header only pre-fills the modal; it does not save,
-    // because a provider without a key is not a configuration.
-    openProviderModal();
-    byId('cfgProvider').value = event.target.value;
-    applyProviderChoice();
-  });
+  on('cfgProvider', 'change', applyProviderChoice);
+  on('cfgTest', 'click', testProviderConnection);
+  on('cfgSave', 'click', saveProviderConfig);
+  on('cfgRemove', 'click', removeProviderKey);
+  on('cfgDefault', 'click', setProviderAsDefault);
 }
+
 
 // Sidebar collapse and the header's small controls.
 function wireShell() {
@@ -4214,11 +4633,21 @@ function refreshCurrent() {
     case 'home': return refreshHome();
     case 'tasks': return refreshTasks();
     case 'automations': return refreshAutomations();
-    case 'history': return refreshHistory();
+    case 'history': {
+      // The automations history and the executions history share the view.
+      // Each owns its own list; the executions list stays silent until its
+      // hosts exist (history.js guards), so nothing here can break the panel.
+      const primary = refreshHistory();
+      if (typeof ActionMeshHistory !== 'undefined' && ActionMeshHistory.refreshExecHistory) {
+        return Promise.allSettled([primary, ActionMeshHistory.refreshExecHistory()]);
+      }
+      return primary;
+    }
     case 'live': return refreshLive();
     case 'approvals': return refreshApprovals();
     case 'devices': return refreshDevices();
     case 'visual': return refreshVisual();
+    case 'browser': return refreshBrowser();
     case 'settings': return refreshSettings();
     case 'voice': return refreshVoice();
     default: return undefined;
@@ -4233,7 +4662,7 @@ function wire() {
   for (const button of document.querySelectorAll('[data-goto]')) {
     button.addEventListener('click', () => showView(button.dataset.goto));
   }
-  byId('refreshAll').addEventListener('click', () => {
+  on('refreshAll', 'click', () => {
     refreshCurrent();
     if (state.view === 'settings') loadBackendLog();
   });
@@ -4247,78 +4676,87 @@ function wire() {
       refreshHome();
     });
   };
-  byId('homeAskSend').addEventListener('click', askHome);
-  byId('homeAsk').addEventListener('submit', (event) => { event.preventDefault(); askHome(); });
+  on('homeAskSend', 'click', askHome);
+  on('homeAsk', 'submit', (event) => { event.preventDefault(); askHome(); });
   wirePushToTalk(byId('homeAskMic'), homeInput, homeReply);
 
   const taskInput = byId('taskAskText');
   const taskReply = el('div', { class: 'reply', hidden: true });
-  byId('taskAsk').after(taskReply);
-  byId('taskAsk').addEventListener('submit', (event) => event.preventDefault());
+  const taskForm = byId('taskAsk');
+  if (taskForm) taskForm.after(taskReply);
+  on('taskAsk', 'submit', (event) => event.preventDefault());
   const askTask = () => {
     propose(taskInput.value, taskReply, {
       onSession: (id) => { state.selectedTask = id; },
     }).then((answer) => {
       if (!answer) return;
       taskInput.value = '';
-      byId('taskNotes').textContent = 'A task was proposed. Press Run on a step to carry it out.';
+      const notes = byId('taskNotes');
+      if (notes) notes.textContent = 'A task was proposed. Press Run on a step to carry it out.';
       refreshTasks();
       if (answer.session_id) loadTask(answer.session_id);
     });
   };
-  byId('taskAskSend').addEventListener('click', askTask);
-  taskInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') { event.preventDefault(); askTask(); }
-  });
+  on('taskAskSend', 'click', askTask);
+  if (taskInput) {
+    taskInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); askTask(); }
+    });
+  }
   wirePushToTalk(byId('taskAskMic'), taskInput, taskReply);
 
   // Visual Intelligence (C38): every control is a press, never a timer.
   wireVisual();
+  wireBrowser();
   wireShell();
   wireVoice();
   wireProvider();
 
   // Approvals and the standing permissions that keep them rare
-  byId('consentGrant').addEventListener('click', (event) => {
+  on('consentGrant', 'click', (event) => {
     event.preventDefault();
     grantConsent(event.currentTarget);
   });
-  byId('consentScope').addEventListener('keydown', (event) => {
+  on('consentScope', 'keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); grantConsent(byId('consentGrant')); }
   });
 
   // Automations
-  byId('automationRefresh').addEventListener('click', () => refreshAutomations());
-  byId('automationDraftGo').addEventListener('click', draftAutomation);
-  byId('automationText').addEventListener('keydown', (event) => {
+  on('automationRefresh', 'click', () => refreshAutomations());
+  on('automationDraftGo', 'click', draftAutomation);
+  on('automationText', 'keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); draftAutomation(); }
   });
-  byId('historyRefresh').addEventListener('click', () => refreshHistory());
+  on('historyRefresh', 'click', () => refreshHistory());
+  on('execHistoryRefresh', 'click', () => {
+    if (typeof ActionMeshHistory !== 'undefined' && ActionMeshHistory.refreshExecHistory) {
+      ActionMeshHistory.refreshExecHistory();
+    }
+  });
 
   // Devices
-  byId('devicesRefresh').addEventListener('click', () => refreshDevices());
-  byId('pairMint').addEventListener('click', mintPairing);
-  byId('pairRevoke').addEventListener('click', revokePairings);
-  byId('pairDeviceId').addEventListener('input', (event) => {
+  on('devicesRefresh', 'click', () => refreshDevices());
+  on('pairMint', 'click', mintPairing);
+  on('pairRevoke', 'click', revokePairings);
+  on('pairDeviceId', 'input', (event) => {
     event.target.dataset.touched = 'true';
   });
 
   // Settings
-  byId('settingsSave').addEventListener('click', (event) => { event.preventDefault(); saveSettings(); });
-  byId('settingsAbout').addEventListener('click', (event) => { event.preventDefault(); bridge.showAbout(); });
-  byId('providerSave').addEventListener('click', saveProvider);
-  byId('providerClear').addEventListener('click', clearProviderKey);
-  byId('backendRestart').addEventListener('click', () => backendAction('restart'));
-  byId('backendStop').addEventListener('click', () => backendAction('stop'));
-  byId('backendOpenData').addEventListener('click', async () => {
+  on('settingsSave', 'click', (event) => { event.preventDefault(); saveSettings(); });
+  on('settingsAbout', 'click', (event) => { event.preventDefault(); bridge.showAbout(); });
+  on('backendRestart', 'click', () => backendAction('restart'));
+  on('backendStop', 'click', () => backendAction('stop'));
+  on('backendOpenData', 'click', async () => {
     try { await bridge.openDataDir(); } catch (error) { toast(error.message, 'bad'); }
   });
-  const logDetails = byId('backendLog').closest('details');
+  const log = byId('backendLog');
+  const logDetails = log ? log.closest('details') : null;
   if (logDetails) logDetails.addEventListener('toggle', () => { if (logDetails.open) loadBackendLog(); });
-  byId('setShortcut').addEventListener('input', (event) => { event.target.dataset.touched = 'true'; });
-  byId('openDashboard').addEventListener('click', () => bridge.openWebPage('dashboard'));
-  byId('openVoice').addEventListener('click', () => bridge.openWebPage('voice'));
-  byId('clearWeb').addEventListener('click', async () => {
+  on('setShortcut', 'input', (event) => { event.target.dataset.touched = 'true'; });
+  on('openDashboard', 'click', () => bridge.openWebPage('dashboard'));
+  on('openVoice', 'click', () => bridge.openWebPage('voice'));
+  on('clearWeb', 'click', async () => {
     try {
       await bridge.clearWebSession();
       toast('The browser pages’ local data was cleared.', 'good');
@@ -4348,13 +4786,40 @@ function wire() {
 }
 
 async function boot() {
+  // The renderer and index.html are two files that have to agree. When they do not —
+  // an older page cached, a half-finished edit, a build that dropped a section — the
+  // failure otherwise arrives as a TypeError from somewhere deep in rendering, which
+  // reads like a crash rather than like the markup being wrong. Naming the anchors
+  // that are absent is the same refusal, stated early enough to act on.
+  const missing = REQUIRED_IDS.filter((id) => !byId(id));
+  if (missing.length) {
+    const note = document.createElement('pre');
+    note.className = 'boot-refusal';
+    note.textContent = `This window is missing elements it cannot run without: ${missing.join(', ')}.\n`
+      + 'Nothing below would be truthful, so the interface has not started. '
+      + 'Reloading the app restores the page from index.html.';
+    document.body.append(note);
+    return { ok: false, missing };
+  }
   wire();
-  // The provider table is static and comes from the main process, so it is read
-  // before the first render of the header; a failure leaves both lists empty rather
-  // than inventing a provider.
-  await loadProviderSpecs();
+  // The provider tables are static and come from the main process, so they are read
+  // before the first render of the header; a failure leaves each lane's list empty
+  // rather than inventing a provider.
+  await loadPurposeSpecs();
   await refreshAppState();
-  await refreshProviderBar().catch(() => {});
+  await refreshPurposes().catch(() => {});
+  // First-run onboarding (onboarding.js). Mounted only on a fresh install:
+  // the wizard itself writes onboardingCompleted once on Finish, so this
+  // gate is re-checked on every boot and never flips silently. The host
+  // is optional — its absence must never become a boot failure.
+  const mount = byId('onboardingMount');
+  if (mount && typeof ActionMeshOnboarding !== 'undefined' && ActionMeshOnboarding.renderOnboarding) {
+    const settings = (state.appState && state.appState.settings) || {};
+    if (settings.onboardingCompleted !== true) {
+      mount.hidden = false;
+      ActionMeshOnboarding.renderOnboarding(mount, bridge, { initialState: state.appState });
+    }
+  }
   // The stream is opened by the main process when the backend comes up, which can be
   // before this page has finished loading — its "open" status would then be pushed to
   // nobody, leaving the header saying "stream …" while events were arriving fine. A

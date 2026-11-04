@@ -272,6 +272,238 @@ def device_definitions() -> list[ActionDefinition]:
             "Scroll the region holding a named element to an edge (top/bottom/left/right)",
             timeout_s=20.0,
         ),
+        # --- consequential web submits (C42, contract §2.4/§3) ---------------
+        # These are the two capabilities a website workflow may end on, and they are
+        # the *only* way a booking or an order is submitted: ``browser.click`` is a
+        # MEDIUM interaction and never becomes one of these (see
+        # ``tests/security/test_submit_bypass.py``). The separation is structural —
+        # the browser engine has no submit verb at all — because a click that
+        # happened to land on a "Place order" button must not be an approval.
+        #
+        # CRITICAL here, in the definition, is what makes the policy engine force
+        # ``WAITING_PERMISSION`` on every call regardless of what any client or model
+        # says. Risk is set in this file and nowhere else; a request can raise it and
+        # never lower it. ``payment.execute`` is the scope the contract assigns to a
+        # consequential submit (contract §3) — it is already CRITICAL, so these
+        # actions reuse it rather than inventing a weaker one.
+        #
+        # One attempt, for the same reason as every other device action and more so:
+        # a submit that half-ran may have taken the money already, and a retry is a
+        # second booking.
+        #
+        # Parameters are the exact fields the reviewed operation carried. They exist
+        # so the executor can bind an approval to *this* journey/order rather than to
+        # a description of one; a field the caller changes after the review is a
+        # different operation, not the approved one.
+        # --- browser (C42, contract §2.1) ----------------------------------
+        # One controlled session, named operations only, targeted by opaque refs
+        # minted by snapshot/inspect — never by selector or coordinate. Login /
+        # CAPTCHA / OTP / MFA are user handoffs (status "needs_user"), and the
+        # engine has no submit verb: browser.click can never become a booking.
+        _def(
+            "browser.open", RiskLevel.LOW, ["browser.control"],
+            {"url": _S}, ["url"],
+            "Open a website in the controlled browser session",
+            timeout_s=45.0,
+        ),
+        _def(
+            "browser.navigate", RiskLevel.LOW, ["browser.control"],
+            {"url": _S}, ["url"],
+            "Navigate the controlled browser session to a URL",
+            timeout_s=45.0,
+        ),
+        _def(
+            "browser.search", RiskLevel.LOW, ["browser.control", "search.web"],
+            {"query": _S, "engine": _S}, ["query"],
+            "Search the web from the controlled browser session (read-only)",
+            timeout_s=45.0,
+        ),
+        _def(
+            "browser.inspect", RiskLevel.LOW, ["browser.control"],
+            {}, [],
+            "Inspect the current page: URL, title and addressable elements",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.snapshot", RiskLevel.LOW, ["browser.control"],
+            {}, [],
+            "Snapshot the current page's addressable elements as refs",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.click", RiskLevel.MEDIUM, ["browser.control"],
+            {"ref": _S, "double": _BOOL}, ["ref"],
+            "Click one element identified by a snapshot ref",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.type", RiskLevel.MEDIUM, ["browser.control"],
+            {"ref": _S, "text": _S}, ["ref", "text"],
+            "Type text into one element identified by a snapshot ref",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.select", RiskLevel.MEDIUM, ["browser.control"],
+            {"ref": _S, "value": _S}, ["ref", "value"],
+            "Select a value in one element identified by a snapshot ref",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.scroll", RiskLevel.LOW, ["browser.control"],
+            {"ref": _S, "direction": _S, "amount": _NUM}, ["direction"],
+            "Scroll the page or one element in a direction",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.back", RiskLevel.LOW, ["browser.control"],
+            {}, [],
+            "Go back one page in the controlled browser session",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.forward", RiskLevel.LOW, ["browser.control"],
+            {}, [],
+            "Go forward one page in the controlled browser session",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.refresh", RiskLevel.LOW, ["browser.control"],
+            {}, [],
+            "Reload the current page in the controlled browser session",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.wait", RiskLevel.LOW, ["browser.control"],
+            {"ms": _NUM, "until": _S}, [],
+            "Wait briefly for the page to settle",
+            timeout_s=30.0,
+        ),
+        _def(
+            "browser.stop", RiskLevel.MEDIUM, ["browser.control"],
+            {}, [],
+            "Stop the current browser task until a fresh open",
+            timeout_s=30.0,
+        ),
+        # --- files (C42, contract §2.2) ------------------------------------
+        # Richer verbs over the same confined Workspace boundary as
+        # device.file.* — no new shell route, no widened root.
+        _def(
+            "device.files.list", RiskLevel.MEDIUM, ["device.file.list"],
+            {"path": _S, "limit": _NUM}, ["path"],
+            "List entries in a directory inside the workspace root",
+        ),
+        _def(
+            "device.files.search", RiskLevel.LOW, ["device.file.list"],
+            {"path": _S, "pattern": _S, "limit": _NUM}, ["path", "pattern"],
+            "Search file names under a directory inside the workspace root",
+        ),
+        _def(
+            "device.files.read", RiskLevel.MEDIUM, ["file.read"],
+            {"path": _S}, ["path"],
+            "Read one file inside the workspace root",
+        ),
+        _def(
+            "device.files.open", RiskLevel.MEDIUM, ["device.file.list"],
+            {"path": _S}, ["path"],
+            "Open a file in its default application",
+        ),
+        _def(
+            "device.files.info", RiskLevel.LOW, ["device.file.list"],
+            {"path": _S}, ["path"],
+            "Report metadata for one path inside the workspace root",
+        ),
+        _def(
+            "device.files.create", RiskLevel.HIGH, ["file.write"],
+            {"path": _S, "content": _S}, ["path", "content"],
+            "Create one file inside the workspace root",
+        ),
+        _def(
+            "device.files.rename", RiskLevel.HIGH, ["file.write"],
+            {"path": _S, "to": _S}, ["path", "to"],
+            "Rename one file inside the workspace root",
+        ),
+        _def(
+            "device.files.move", RiskLevel.HIGH, ["file.write"],
+            {"path": _S, "to": _S}, ["path", "to"],
+            "Move one file inside the workspace root",
+        ),
+        _def(
+            "device.files.copy", RiskLevel.MEDIUM, ["file.read", "file.write"],
+            {"path": _S, "to": _S}, ["path", "to"],
+            "Copy one file inside the workspace root",
+        ),
+        _def(
+            "device.files.edit", RiskLevel.HIGH, ["file.write"],
+            {"path": _S, "find": _S, "replace": _S, "all": _BOOL},
+            ["path", "find", "replace"],
+            "Replace text in one file inside the workspace root",
+        ),
+        _def(
+            "device.files.trash", RiskLevel.HIGH, ["file.delete"],
+            {"path": _S}, ["path"],
+            "Move one file to the OS trash",
+        ),
+        # --- media (C42, contract §2.3) ------------------------------------
+        # Playback is only claimed after the real player state is read back;
+        # an unreachable player is "unavailable", never a simulated success.
+        _def(
+            "media.status", RiskLevel.LOW, ["media.control"],
+            {}, [],
+            "Report the current media player state",
+        ),
+        _def(
+            "media.play", RiskLevel.LOW, ["media.control"],
+            {"ref": _S}, [],
+            "Play the current media selection",
+        ),
+        _def(
+            "media.pause", RiskLevel.LOW, ["media.control"],
+            {"ref": _S}, [],
+            "Pause the current media selection",
+        ),
+        _def(
+            "media.next", RiskLevel.LOW, ["media.control"],
+            {}, [],
+            "Play the next media item",
+        ),
+        _def(
+            "media.previous", RiskLevel.LOW, ["media.control"],
+            {}, [],
+            "Play the previous media item",
+        ),
+        _def(
+            "media.volume", RiskLevel.LOW, ["media.control"],
+            {"level": _NUM, "muted": _BOOL}, [],
+            "Set media volume or mute",
+        ),
+        _def(
+            "media.open_file", RiskLevel.MEDIUM,
+            ["media.control", "system.app.launch"],
+            {"path": _S}, ["path"],
+            "Open a media file inside the workspace root in its default app",
+        ),
+        _def(
+            "media.open_url", RiskLevel.LOW, ["browser.control"],
+            {"url": _S}, ["url"],
+            "Open a media URL through the browser",
+            timeout_s=45.0,
+        ),
+        # --- consequential web submits (C42, contract §2.4/§3) ---------------
+        _def(
+            "booking.submit", RiskLevel.CRITICAL, ["payment.execute"],
+            {"journey": _S, "passenger": _S, "fare": _S},
+            ["journey", "passenger", "fare"],
+            "Submit a reviewed train booking — consequential, requires explicit final "
+            "confirmation",
+            timeout_s=90.0,
+        ),
+        _def(
+            "order.place", RiskLevel.CRITICAL, ["payment.execute"],
+            {"items": _S, "total": _S}, ["items", "total"],
+            "Place a reviewed food order — consequential, requires explicit final "
+            "confirmation",
+            timeout_s=90.0,
+        ),
     ]
 
 
@@ -293,6 +525,20 @@ REQUIRING_FILE_ROOT: frozenset[str] = frozenset(
         "device.project.list",
         "device.project.status",
         "device.project.open",
+        # C42: the richer file verbs resolve inside the same confined root.
+        "device.files.list",
+        "device.files.search",
+        "device.files.read",
+        "device.files.open",
+        "device.files.info",
+        "device.files.create",
+        "device.files.rename",
+        "device.files.move",
+        "device.files.copy",
+        "device.files.edit",
+        "device.files.trash",
+        # C42: media.open_file opens a confined local file.
+        "media.open_file",
     }
 )
 REQUIRING_SHELL: frozenset[str] = frozenset(
@@ -354,6 +600,55 @@ IMPLEMENTED: frozenset[str] = frozenset(
         "device.gui.click",
         "device.gui.type",
         "device.gui.scroll",
+        # C42: the two consequential submits. They are in this set because this build
+        # *does* carry them out — through a fail-closed handler that refuses, naming the
+        # missing payment backend, when none is configured — and
+        # ``SUPPORTED == IMPLEMENTED`` is the invariant that keeps an advertised
+        # capability from having no handler at all. Whether one may be *advertised* is a
+        # separate question, answered by :data:`REQUIRING_PAYMENT` and by
+        # ``config.advertise()``.
+        "booking.submit",
+        "order.place",
+        # C42: browser, richer files and media engines. Each id here is backed by a
+        # real handler in ``LaptopProvider`` — ``browser.*`` by ``BrowserEngine``,
+        # ``device.files.*`` by ``FilesEngine``, ``media.*`` by ``MediaEngine`` — so
+        # adding them to this set is what lets ``SUPPORTED == IMPLEMENTED`` stay true
+        # while the 33 new capabilities become resolvable. Whether each one is
+        # *advertised* is answered separately by ``REQUIRING_BROWSER`` /
+        # ``REQUIRING_MEDIA`` / ``REQUIRING_FILE_ROOT`` and by ``config.advertise()``.
+        "browser.open",
+        "browser.navigate",
+        "browser.search",
+        "browser.inspect",
+        "browser.snapshot",
+        "browser.click",
+        "browser.type",
+        "browser.select",
+        "browser.scroll",
+        "browser.back",
+        "browser.forward",
+        "browser.refresh",
+        "browser.wait",
+        "browser.stop",
+        "device.files.list",
+        "device.files.search",
+        "device.files.read",
+        "device.files.open",
+        "device.files.info",
+        "device.files.create",
+        "device.files.rename",
+        "device.files.move",
+        "device.files.copy",
+        "device.files.edit",
+        "device.files.trash",
+        "media.status",
+        "media.play",
+        "media.pause",
+        "media.next",
+        "media.previous",
+        "media.volume",
+        "media.open_file",
+        "media.open_url",
     }
 )
 
@@ -369,6 +664,69 @@ REQUIRING_DESKTOP: frozenset[str] = frozenset(
         "device.gui.click",
         "device.gui.type",
         "device.gui.scroll",
+    }
+)
+
+
+#: Capabilities that reach the browser session. Closed unless the operator opens
+#: the ``allow_browser`` boundary (contract §4): a build without a browser
+#: partition must not advertise ``browser.*`` — same rule as shell/desktop.
+REQUIRING_BROWSER: frozenset[str] = frozenset(
+    {
+        "browser.open",
+        "browser.navigate",
+        "browser.search",
+        "browser.inspect",
+        "browser.snapshot",
+        "browser.click",
+        "browser.type",
+        "browser.select",
+        "browser.scroll",
+        "browser.back",
+        "browser.forward",
+        "browser.refresh",
+        "browser.wait",
+        "browser.stop",
+        # media.open_url drives the browser capability, so it shares this gate.
+        "media.open_url",
+    }
+)
+
+#: Capabilities that control a local media player. Closed unless the operator
+#: opens the ``allow_media`` boundary (contract §4), so a headless agent never
+#: advertises a player it cannot reach. ``media.open_file`` additionally needs
+#: a workspace root (it opens a confined local file).
+REQUIRING_MEDIA: frozenset[str] = frozenset(
+    {
+        "media.status",
+        "media.play",
+        "media.pause",
+        "media.next",
+        "media.previous",
+        "media.volume",
+        "media.open_file",
+        "media.open_url",
+    }
+)
+
+#: Capabilities that spend money. **Closed by default, and unlike every other gate that
+#: is the whole point.**
+#:
+#: A file root buys file actions a directory to work in; a shell flag buys a command
+#: policy to run under. A payment boundary buys nothing this build can honour: there is
+#: no booking site, no payment processor, and no stored card behind either capability.
+#: So an agent that advertised them by default would announce a CRITICAL action, force a
+#: user through an approval card that promises a booking, and then fail at the last step
+#: — the "authorized, prompted, then failed" outcome the other gates exist to prevent,
+#: made worse by the fact that the consequential thing about it is the money.
+#:
+#: Advertising them requires an operator to open the boundary *and* the deployment to
+#: have a backend that can actually submit; the handler below (``provider.py``) refuses
+#: with ``PERMANENT`` when it does not, so "advertised" never becomes "pretended".
+REQUIRING_PAYMENT: frozenset[str] = frozenset(
+    {
+        "booking.submit",
+        "order.place",
     }
 )
 
@@ -449,8 +807,11 @@ __all__ = [
     "CAPABILITIES",
     "IMPLEMENTED",
     "PROVIDER",
+    "REQUIRING_BROWSER",
     "REQUIRING_DESKTOP",
     "REQUIRING_FILE_ROOT",
+    "REQUIRING_MEDIA",
+    "REQUIRING_PAYMENT",
     "REQUIRING_SHELL",
     "advertised_ceiling",
     "device_definitions",

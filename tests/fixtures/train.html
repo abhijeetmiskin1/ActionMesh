@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Train Journey Search</title>
+</head>
+<body>
+    <h1>Book a Train Journey</h1>
+
+    <form method="post" action="book-journey.html">
+        <h2>Journey Details</h2>
+
+        <label for="origin">From station</label>
+        <input type="text" id="origin" name="origin" placeholder="New Delhi" required>
+
+        <label for="destination">To station</label>
+        <input type="text" id="destination" name="destination" placeholder="Mumbai Central" required>
+
+        <label for="date">Travel date</label>
+        <input type="date" id="date" name="date" required>
+
+        <label for="class">Travel class</label>
+        <select id="class" name="class">
+            <option value="sleeper">Sleeper - $18.00</option>
+            <option value="3ac">3AC - $42.00</option>
+            <option value="2ac">2AC - $61.00</option>
+        </select>
+
+        <p class="fare-display">Fare shown: $42.00</p>
+
+        <h2>Passenger Details</h2>
+
+        <label for="passenger-name">Passenger name</label>
+        <input type="text" id="passenger-name" name="passenger-name" required>
+
+        <label for="passenger-age">Passenger age</label>
+        <input type="number" id="passenger-age" name="passenger-age" required>
+
+        <button type="submit">Book &amp; Pay</button>
+    </form>
+
+    <nav>
+        <a href="index.html">Cancel and go home</a>
+    </nav>
+</body>
+</html>

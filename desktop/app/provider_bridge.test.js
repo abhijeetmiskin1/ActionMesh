@@ -53,6 +53,7 @@ function fakeProviders({ generateImpl } = {}) {
   const specs = [
     { id: 'anthropic', implemented: true, requiresKey: true, defaultModel: 'claude-sonnet-5-5' },
     { id: 'openai', implemented: true, requiresKey: true, defaultModel: 'gpt-4o' },
+    { id: 'openai_compatible', implemented: true, requiresKey: true, defaultModel: 'local-model' },
   ];
   return {
     calls,
@@ -401,4 +402,226 @@ test('the socket is mode 0600 after listen', async (t) => {
   });
   const mode = fs.statSync(socketPath).mode & 0o777;
   assert.equal(mode, 0o600);
+});
+// -- per-purpose routing ---------------------------------------------------------
+
+// The bridge used to read the single pre-C42 provider slot, so choosing a Reasoning
+// provider in Settings changed a card and nothing else: the planner kept using
+// whatever chat had. These tests pin the routing rule itself.
+
+function laneSettings({ lanes = {}, legacy = {} } = {}) {
+  const values = {
+    providerName: '', providerModel: '', providerEndpoint: '', providerTimeout: 12,
+    purpose_chat_provider: '', purpose_chat_model: '', purpose_chat_endpoint: '', purpose_chat_timeout: 12,
+    purpose_reasoning_provider: '', purpose_reasoning_model: '', purpose_reasoning_endpoint: '', purpose_reasoning_timeout: 12,
+    ...legacy,
+  };
+  const secrets = {};
+  for (const [lane, config] of Object.entries(lanes)) {
+    values[`purpose_${lane}_provider`] = config.provider || '';
+    values[`purpose_${lane}_model`] = config.model || '';
+    values[`purpose_${lane}_endpoint`] = config.endpoint || '';
+    if (config.timeout) values[`purpose_${lane}_timeout`] = config.timeout;
+    if (config.key) secrets[`${lane}ApiKey`] = config.key;
+  }
+  return fakeSettings({ values, secrets });
+}
+
+async function statusOf(socketPath) {
+  const { frame } = await roundTrip(socketPath, `${JSON.stringify({ token: TOKEN, op: 'status' })}\n`);
+  return frame;
+}
+
+test('the planner uses the reasoning lane when it is configured', async (t) => {
+  const settings = laneSettings({
+    lanes: {
+      chat: { provider: 'anthropic', model: 'claude-sonnet-5-5', key: 'chat-key' },
+      reasoning: { provider: 'openai', model: 'gpt-4o', key: 'reasoning-key' },
+    },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[0].config.provider, 'openai');
+  assert.equal(providers.calls[0].config.model, 'gpt-4o');
+  assert.equal(providers.calls[0].config.apiKey, 'reasoning-key');
+});
+
+test('changing chat does not move the planner while reasoning is configured', async (t) => {
+  const settings = laneSettings({
+    lanes: {
+      chat: { provider: 'anthropic', model: 'claude-sonnet-5-5', key: 'chat-key' },
+      reasoning: { provider: 'openai', model: 'gpt-4o', key: 'reasoning-key' },
+    },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  // What the Chat card writes.
+  settings.state.values.purpose_chat_provider = 'openai';
+  settings.state.values.purpose_chat_model = 'gpt-4o';
+  settings.state.secrets.chatApiKey = 'new-chat-key';
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[1].config.provider, 'openai');
+  assert.equal(providers.calls[1].config.model, 'gpt-4o');
+  assert.equal(providers.calls[1].config.apiKey, 'reasoning-key');
+});
+
+test('with only a chat lane the planner uses it, key and all', async (t) => {
+  const settings = laneSettings({
+    lanes: { chat: { provider: 'openai', model: 'gpt-4o', key: 'chat-key' } },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[0].config.provider, 'openai');
+  assert.equal(providers.calls[0].config.apiKey, 'chat-key');
+});
+
+test('a reasoning lane with no key falls through to a configured chat lane', async (t) => {
+  const settings = laneSettings({
+    lanes: {
+      chat: { provider: 'anthropic', model: 'claude-sonnet-5-5', key: 'chat-key' },
+      reasoning: { provider: 'openai', model: 'gpt-4o' },
+    },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[0].config.provider, 'anthropic');
+  assert.equal(providers.calls[0].config.apiKey, 'chat-key');
+});
+
+test('neither lane configured still uses the pre-C42 provider', async (t) => {
+  const settings = laneSettings({
+    legacy: { providerName: 'anthropic', providerModel: 'claude-sonnet-5-5' },
+  });
+  settings.state.secrets.providerApiKey = 'legacy-key';
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[0].config.provider, 'anthropic');
+  assert.equal(providers.calls[0].config.apiKey, 'legacy-key');
+});
+
+test('a key entered for one lane is never spent by another', async (t) => {
+  // Reasoning has a key, chat does not. Falling through to chat must not lend it
+  // reasoning's credential: that would be one lane's key paid out under another's
+  // provider, and the user would have no way to see it happened.
+  const settings = laneSettings({
+    lanes: {
+      chat: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
+      reasoning: { provider: 'openai', model: 'gpt-4o', key: 'reasoning-key' },
+    },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls.length, 1);
+  assert.equal(providers.calls[0].config.provider, 'openai');
+  assert.equal(providers.calls[0].config.apiKey, 'reasoning-key');
+});
+
+test('the default switch moves the planner to the chat lane', async (t) => {
+  const settings = laneSettings({
+    lanes: {
+      chat: { provider: 'anthropic', model: 'claude-sonnet-5-5', key: 'chat-key' },
+      reasoning: { provider: 'openai', model: 'gpt-4o', key: 'reasoning-key' },
+    },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[0].config.provider, 'openai');
+
+  settings.state.values.providerDefault = true;
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[1].config.provider, 'anthropic');
+  assert.equal(providers.calls[1].config.apiKey, 'chat-key');
+});
+
+test('status reports the lane the planner would actually use', async (t) => {
+  const settings = laneSettings({
+    lanes: {
+      chat: { provider: 'anthropic', model: 'claude-sonnet-5-5', key: 'chat-key' },
+      reasoning: { provider: 'openai', model: 'gpt-4o', key: 'reasoning-key' },
+    },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  const frame = await statusOf(socketPath);
+  assert.equal(frame.purpose, 'reasoning');
+  assert.equal(frame.provider, 'openai');
+  assert.equal(frame.model, 'gpt-4o');
+  assert.equal(frame.hasKey, true);
+  assert.equal(frame.configured, true);
+});
+
+test('status asks main about the same lane it reports', async (t) => {
+  const settings = laneSettings({
+    lanes: { reasoning: { provider: 'openai', model: 'gpt-4o', key: 'reasoning-key' } },
+  });
+  const providers = fakeProviders();
+  const asked = [];
+  const { socketPath } = await withBridge(t, {
+    settings,
+    providers,
+    getStatus: (lane) => { asked.push(lane); return { state: 'invalid_credentials' }; },
+  });
+
+  const frame = await statusOf(socketPath);
+  assert.deepEqual(asked, ['reasoning']);
+  assert.equal(frame.state, 'invalid_credentials');
+});
+
+test('status with no lane configured reports the legacy chat lane', async (t) => {
+  const settings = laneSettings({
+    legacy: { providerName: 'anthropic', providerModel: 'claude-sonnet-5-5' },
+  });
+  settings.state.secrets.providerApiKey = API_KEY;
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  const frame = await statusOf(socketPath);
+  assert.equal(frame.purpose, 'legacy');
+  assert.equal(frame.provider, 'anthropic');
+  assert.ok(!JSON.stringify(frame).includes(API_KEY));
+});
+
+test('a per-lane endpoint and timeout reach the provider config', async (t) => {
+  const settings = laneSettings({
+    lanes: {
+      reasoning: {
+        provider: 'openai_compatible', model: 'local-model',
+        endpoint: 'https://example.invalid/v1', key: 'local-key', timeout: 33,
+      },
+    },
+  });
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  await roundTrip(socketPath, frameFor({}));
+  assert.equal(providers.calls[0].config.baseUrl, 'https://example.invalid/v1');
+  assert.equal(providers.calls[0].config.timeoutSeconds, 33);
+});
+
+test('an unconfigured lane produces a stated refusal, not a provider call', async (t) => {
+  const settings = laneSettings();
+  const providers = fakeProviders();
+  const { socketPath } = await withBridge(t, { settings, providers });
+
+  const { frame } = await roundTrip(socketPath, frameFor({}));
+  assert.equal(frame.ok, false);
+  assert.equal(frame.state, 'not_configured');
+  assert.equal(typeof frame.detail, 'string');
+  assert.equal(providers.calls.length, 0);
 });

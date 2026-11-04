@@ -119,6 +119,20 @@ SAFE_RESULT_KEYS = frozenset(
         "element_changed",
         "moved",
         "detail",
+        # Media read-back. The engine only surfaces fields a real MPRIS
+        # read-back produced (player id, track title capped by
+        # MAX_SCALAR_STRING, volume level, mute flag, positions). Track text
+        # is whatever the player reports — metadata, never audio bytes — and
+        # a name the caller itself asked to open is not a disclosure.
+        "player",
+        "track",
+        "level",
+        "muted",
+        "position_s",
+        "duration_s",
+        "players",
+        "candidates",
+        "requested_level",
     }
 )
 

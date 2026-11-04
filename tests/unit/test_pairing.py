@@ -16,6 +16,7 @@ from actionmesh.core.pairing import (
     normalize_code,
     screen_payload,
 )
+from actionmesh.core.permissions.context import PermissionGrant
 from actionmesh.protocol.models import DeviceKind, RiskLevel
 
 KEY = b"0123456789abcdef" * 2
@@ -27,7 +28,24 @@ def _service(
 ) -> tuple[PairingService, IdentityStore, CredentialStore, DeviceRegistry, list]:
     identities = IdentityStore()
     devices = DeviceRegistry(identities=identities)
-    credentials = CredentialStore(identities, key=KEY)
+    # Consent ceiling hook: abhi has consented to device.control at CRITICAL,
+    # so redeeming a HIGH-ceiling code can mint within its ceiling. The
+    # default LOW credential still releases nothing: grants_for() drops scopes
+    # whose risk sits above the credential's own ceiling.
+    credentials = CredentialStore(
+        identities,
+        key=KEY,
+        consents=lambda actor_id: [
+            PermissionGrant(
+                scope="device.control",
+                granted_by=actor_id,
+                max_risk=RiskLevel.CRITICAL,
+                granted_at=PAST,
+            )
+        ]
+        if actor_id == "abhi"
+        else [],
+    )
     events: list[tuple[str, str, dict[str, object]]] = []
     pairing = PairingService(
         identities=identities,

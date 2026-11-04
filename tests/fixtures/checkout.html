@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pizza Checkout</title>
+</head>
+<body>
+    <h1>Complete Your Order</h1>
+    <div class="order-summary">
+        <h2>Your Items</h2>
+        <ul>
+            <li>Margherita Pizza x 2 - $12.00 each</li>
+            <li>Coke x 1 - $2.50</li>
+        </ul>
+        <p>Total: $26.50</p>
+    </div>
+    
+    <form method="post" action="submit-order.html">
+        <label for="name">Full Name</label>
+        <input type="text" id="name" name="name" required>
+        
+        <label for="address">Delivery Address</label>
+        <textarea id="address" name="address" required></textarea>
+        
+        <label for="phone">Phone Number</label>
+        <input type="tel" id="phone" name="phone" required>
+        
+        <!-- Hidden price field - must participate in confirmation fingerprint -->
+        <input type="hidden" id="total-price" name="total-price" value="26.50">
+        
+        <button type="submit">Place Order</button>
+    </form>
+</body>
+</html>

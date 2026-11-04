@@ -88,7 +88,8 @@ DANGEROUS_CALLS = {"eval", "exec", "__import__", "compile"}
 
 #: Per-path exemptions, spelled out member by member. The only capabilities granted in
 #: this repository today are one function in the laptop agent's runner, one loopback
-#: probe, and one outbound HTTPS call in the reviewed model transport.
+#: probe, one outbound HTTPS call in the reviewed model transport, one AF_UNIX connect
+#: in the desktop model bridge, and two fixed-binary OS integrations in the file engine.
 MEMBER_ALLOWLIST: dict[str, set[str]] = {
     "actionmesh/agent/runner.py": {"asyncio.create_subprocess_exec"},
     # Loopback liveness probing. Structurally safe because `is_listening` accepts an
@@ -119,6 +120,23 @@ MEMBER_ALLOWLIST: dict[str, set[str]] = {
     # doing. `tests/unit/test_model_bridge.py` asserts the AF_UNIX-only construction
     # through the public functions rather than trusting this comment.
     "actionmesh/voiceos/model_bridge.py": {"socket.socket"},
+    # C42: the file engine's two OS integrations -- `gio trash` and `xdg-open`. Both are
+    # fixed argv lists (`[binary, *fixed_args, absolute_path]`), `shell` is never set,
+    # both streams are DEVNULL, and each call has a timeout; the binary is looked up on
+    # PATH by name and the path element is already confined by `Workspace.resolve`. The
+    # grant is member-by-member because that is exactly what the capability is: two
+    # named calls, not "this file may spawn". `tests/unit/test_files_agent.py` asserts
+    # the refusals (no opener, escaped path, no shell) through the public methods.
+    "actionmesh/agent/files.py": {"subprocess.run"},
+    # C42: the browser drive bridge. Same AF_UNIX shape as the model bridge
+    # above, but awaited on the event loop because the browser driver is
+    # awaited: the destination is a Unix domain socket inside the desktop
+    # app's own profile directory, handed to this process in its environment,
+    # and it authenticates with a per-launch token. No hostname, no port, no
+    # address to substitute. ``tests/unit/test_browser_bridge.py`` asserts the
+    # AF_UNIX-only construction and the token-in-frame shape through the
+    # public functions rather than trusting this comment.
+    "actionmesh/agent/browser_bridge.py": {"asyncio.open_unix_connection"},
 }
 
 #: Imports of an otherwise-banned module that one specific file is permitted. Kept apart
@@ -127,6 +145,9 @@ MEMBER_ALLOWLIST: dict[str, set[str]] = {
 IMPORT_ALLOWLIST: dict[str, set[str]] = {
     # AF_UNIX only; see the member grant above for why that is the whole story.
     "actionmesh/voiceos/model_bridge.py": {"socket"},
+    # Same grant as the member entry above: the two calls need the name `subprocess`
+    # in scope, and nothing else in this file is permitted to use it.
+    "actionmesh/agent/files.py": {"subprocess"},
 }
 
 #: Network access by module *import* is still forbidden package-wide, with no
@@ -328,12 +349,17 @@ class DangerousPrimitiveTests(unittest.TestCase):
                 "actionmesh/agent/processes.py": {"asyncio.open_connection"},
                 "actionmesh/voiceos/transport.py": {"asyncio.open_connection"},
                 "actionmesh/voiceos/model_bridge.py": {"socket.socket"},
+                "actionmesh/agent/files.py": {"subprocess.run"},
+                "actionmesh/agent/browser_bridge.py": {"asyncio.open_unix_connection"},
             },
             "changing this line is a security decision, not a convenience",
         )
         self.assertEqual(
             IMPORT_ALLOWLIST,
-            {"actionmesh/voiceos/model_bridge.py": {"socket"}},
+            {
+                "actionmesh/voiceos/model_bridge.py": {"socket"},
+                "actionmesh/agent/files.py": {"subprocess"},
+            },
             "changing this line is a security decision, not a convenience",
         )
 
@@ -427,6 +453,54 @@ class DangerousPrimitiveTests(unittest.TestCase):
                 if isinstance(arg, ast.Attribute):
                     families.add(arg.attr)
         self.assertEqual(families, {"AF_UNIX", "SOCK_STREAM"})
+
+    def test_the_file_engine_exemption_is_two_fixed_argv_calls(self) -> None:
+        """C42's grant is bounded by content, not by a comment.
+
+        `files.py` may call `subprocess.run`. What makes that safe is the argument list
+        at each of the two call sites -- a binary path followed by fixed words and one
+        already-confined path -- so this test reads the real calls out of the source and
+        asserts that shape. Anything the grant did not describe -- a shell, a second
+        spawn member, a stdout it can read back -- is refused here even though
+        `subprocess.run` itself is permitted in this file.
+        """
+        rel = "actionmesh/agent/files.py"
+        self.assertEqual(MEMBER_ALLOWLIST[rel], {"subprocess.run"})
+        self.assertEqual(IMPORT_ALLOWLIST[rel], {"subprocess"})
+
+        tree = ast.parse((PACKAGE / "agent" / "files.py").read_text(encoding="utf-8"))
+        spawns = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _call_name(node) == "subprocess.run"
+        ]
+        self.assertEqual(len(spawns), 2, "exactly the trash backend and the opener")
+        for node in spawns:
+            # One positional argument: the argv list. A shell string is the other shape.
+            self.assertEqual(len(node.args), 1)
+            argv = node.args[0]
+            self.assertIsInstance(argv, ast.List, "the command is a list, never a string")
+            keywords = {keyword.arg for keyword in node.keywords}
+            self.assertNotIn("shell", keywords)
+            # Both streams are discarded: the child's output is never read back, so no
+            # OS helper can hand this process text it would then act on.
+            for stream in ("stdout", "stderr"):
+                value = next(k for k in node.keywords if k.arg == stream)
+                self.assertIsInstance(value.value, ast.Attribute)
+                self.assertEqual(value.value.attr, "DEVNULL")
+            self.assertIn("timeout", keywords, "a helper that hangs cannot hang the agent")
+
+        # A different member of the same module would still be refused.
+        for source in (
+            "subprocess.Popen(cmd)\n",
+            "subprocess.check_output(cmd)\n",
+        ):
+            probe = ast.parse(source)
+            self.assertTrue(_flag_members(rel, probe), source)
+        # `subprocess.run` is permitted here, so `shell=True` on it is caught by the
+        # keyword scanner instead -- the grant names a call, never an argument.
+        self.assertTrue(
+            _flag_shell_keywords(rel, ast.parse("subprocess.run(cmd, shell=True)\n"))
+        )
 
     def test_exemptions_do_not_reach_the_never_allowed_set(self) -> None:
         # Even the runner cannot shell out, exec source, or hand a callback to the
@@ -554,6 +628,7 @@ class DangerousPrimitiveTests(unittest.TestCase):
         self.assertEqual(
             sorted(set(users)),
             [
+                "actionmesh/agent/browser_bridge.py",
                 "actionmesh/agent/processes.py",
                 "actionmesh/voiceos/transport.py",
             ],

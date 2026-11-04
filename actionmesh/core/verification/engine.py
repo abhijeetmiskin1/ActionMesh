@@ -15,6 +15,7 @@ An action type with no registered strategy is reported ``UNSUPPORTED`` — not
 from __future__ import annotations
 
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from actionmesh.core.verification.verdicts import (
     Evidence,
@@ -41,6 +42,47 @@ class Observable(Protocol):
 def _observed(provider: ActionProvider, action: Action) -> dict[str, Any] | None:
     getter = getattr(provider, "observe", None)
     return getter(action) if callable(getter) else None
+
+
+def _norm_url(value: Any) -> tuple | None:
+    """Canonical form for URL-typed fields, or None for non-URL values.
+
+    Browsers canonicalize URLs: 'https://example.com' becomes
+    'https://example.com/' on load. The requested spelling and the
+    observed spelling of the same place must not read as a mismatch,
+    while a different scheme/host/path/query is still a mismatch.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    path = parts.path.rstrip("/") or "/"
+    return (scheme, host, port, path, parts.query)
+
+
+def _fields_match(requested: Any, observed: Any) -> bool:
+    """True when a requested field and its observed value agree.
+
+    URLs compare in canonical form; everything else compares exactly.
+    """
+    if requested == observed:
+        return True
+    left, right = _norm_url(requested), _norm_url(observed)
+    if left is not None and right is not None:
+        return left == right
+    return False
 
 
 class VerificationEngine:
@@ -124,7 +166,7 @@ class VerificationEngine:
 
         if isinstance(recorded, dict):
             for field, value in (action.parameters or {}).items():
-                if field in recorded and recorded[field] != value:
+                if field in recorded and not _fields_match(value, recorded[field]):
                     return "mismatch", f"observed {field!r} does not match what was requested"
 
         return "match", f"observed state matches: {self._summarise(observed)}"

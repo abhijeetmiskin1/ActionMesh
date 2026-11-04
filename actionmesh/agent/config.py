@@ -31,8 +31,11 @@ from actionmesh.agent.commands import DEFAULT_ALLOWED
 from actionmesh.agent.definitions import (
     CAPABILITIES,
     IMPLEMENTED,
+    REQUIRING_BROWSER,
     REQUIRING_DESKTOP,
     REQUIRING_FILE_ROOT,
+    REQUIRING_MEDIA,
+    REQUIRING_PAYMENT,
     REQUIRING_SHELL,
 )
 
@@ -42,6 +45,9 @@ ENV_DEVICE_NAME = "ACTIONMESH_DEVICE_NAME"
 ENV_WORKSPACE_ROOT = "ACTIONMESH_WORKSPACE_ROOT"
 ENV_ALLOW_SHELL = "ACTIONMESH_ALLOW_SHELL"
 ENV_ALLOW_DESKTOP = "ACTIONMESH_ALLOW_DESKTOP"
+ENV_ALLOW_BROWSER = "ACTIONMESH_ALLOW_BROWSER"
+ENV_ALLOW_MEDIA = "ACTIONMESH_ALLOW_MEDIA"
+ENV_ALLOW_PAYMENT = "ACTIONMESH_ALLOW_PAYMENT"
 ENV_HEARTBEAT_S = "ACTIONMESH_HEARTBEAT_S"
 ENV_ALLOWED_COMMANDS = "ACTIONMESH_ALLOWED_COMMANDS"
 ENV_DENIED_COMMANDS = "ACTIONMESH_DENIED_COMMANDS"
@@ -114,6 +120,25 @@ class AgentConfig:
     #: ACTIONMESH_ALLOW_SHELL would be a boundary that leaked. Even with this on, the
     #: OS screenshot portal still gates every capture, and policy still gates the action.
     allow_desktop: bool = False
+    #: Browser session (C42). Off by default: the controlled browser is a distinct
+    #: boundary from desktop or shell, and a machine that drives a website because a
+    #: stranger set ACTIONMESH_ALLOW_SHELL would be a boundary that leaked. Even with
+    #: this on, ``browser.click`` can never submit a booking — the engine has no
+    #: submit verb and the two CRITICAL submits sit behind ``allow_payment``.
+    allow_browser: bool = False
+    #: Local media player control (C42). Off by default: a headless agent must not
+    #: advertise a player it cannot reach, and media control is a distinct boundary
+    #: from shell/desktop/browser.
+    allow_media: bool = False
+    #: Consequential web submits — ``booking.submit`` and ``order.place`` (C42). Off by
+    #: default, and unlike the other two flags this one is not a capability *permission*:
+    #: it is the operator saying "a CRITICAL submit may be announced by this machine at
+    #: all". Turning it on does not create a submit backend, and the handler refuses
+    #: with ``PERMANENT`` when one is missing, so an agent that opens this boundary on a
+    #: deployment with no payment integration announces the capability and then honestly
+    #: declines to fabricate a booking. Policy still gates every call: these actions are
+    #: CRITICAL, so the policy engine forces an approval regardless of this flag.
+    allow_payment: bool = False
     heartbeat_s: float = DEFAULT_HEARTBEAT_S
     agent_version: str = __version__
     platform: str = field(default_factory=lambda: os.uname().sysname.lower())
@@ -224,6 +249,9 @@ class AgentConfig:
             workspace_root=os.path.abspath(root) if root else "",
             allow_shell=_truthy(get(ENV_ALLOW_SHELL)),
             allow_desktop=_truthy(get(ENV_ALLOW_DESKTOP)),
+            allow_browser=_truthy(get(ENV_ALLOW_BROWSER)),
+            allow_media=_truthy(get(ENV_ALLOW_MEDIA)),
+            allow_payment=_truthy(get(ENV_ALLOW_PAYMENT)),
             heartbeat_s=heartbeat,
             allowed_commands=listing(ENV_ALLOWED_COMMANDS),
             denied_commands=listing(ENV_DENIED_COMMANDS),
@@ -250,12 +278,14 @@ class AgentConfig:
     def advertise(self) -> tuple[str, ...]:
         """The capabilities this configuration actually supports.
 
-        Three gates, all of which must pass: the capability is a registered action
+        Five gates, all of which must pass: the capability is a registered action
         (:data:`CAPABILITIES`), the operator opened its boundary (root configured
-        for files, shell flag for execution), and this build can carry it out
-        (:data:`IMPLEMENTED`). A capability that passes the first two but not the
-        third would be advertised, approved, dispatched, and then fail — which is a
-        worse outcome than not offering it, because the user has already said yes.
+        for files, shell flag for execution, desktop flag plus a reachable session
+        for screen work, browser/media flags for the controlled browser and player,
+        and payment flag for the CRITICAL submits), and this build can
+        carry it out (:data:`IMPLEMENTED`). A capability that passes the first two but
+        not the third would be advertised, approved, dispatched, and then fail — which
+        is a worse outcome than not offering it, because the user has already said yes.
 
         ``DeviceRegistry.register`` re-checks every advertised name against the
         action registry, so a capability nobody registered cannot be announced.
@@ -268,14 +298,30 @@ class AgentConfig:
                 continue
             if capability in REQUIRING_SHELL and not self.allow_shell:
                 continue
-            if capability in REQUIRING_DESKTOP:
+            if capability in REQUIRING_DESKTOP and (
+                not self.allow_desktop or not self.desktop_reachable
+            ):
                 # Two gates: the operator opened the boundary, *and* the machine can
                 # actually reach a desktop. Checking reachability lazily here (not at
                 # import) means an agent on a headless server advertises no screen
                 # capability at all, rather than advertising one that would authorize
                 # and then fail to capture.
-                if not self.allow_desktop or not self.desktop_reachable:
-                    continue
+                continue
+            if capability in REQUIRING_BROWSER and not self.allow_browser:
+                # The controlled browser is unreachable without the bridge process
+                # and its hardened window; "announced but not servable" would be the
+                # same authorized-then-failed lie the other gates exist to prevent.
+                # media.open_url shares this gate because it drives the browser.
+                continue
+            if capability in REQUIRING_MEDIA and not self.allow_media:
+                # A headless agent must not advertise a player it cannot reach.
+                continue
+            if capability in REQUIRING_PAYMENT and not self.allow_payment:
+                # A CRITICAL submit is the one capability where "announced but not
+                # servable" is worst: the approval card would ask the user to approve a
+                # payment this machine cannot complete. Closed unless the operator
+                # opened it, and even then the handler refuses rather than pretending.
+                continue
             out.append(capability)
         return tuple(out)
 
@@ -320,6 +366,8 @@ class AgentConfig:
             "agent_version": self.agent_version,
             "workspace_root": self.workspace_root,
             "allow_shell": self.allow_shell,
+            "allow_browser": self.allow_browser,
+            "allow_media": self.allow_media,
             "heartbeat_s": self.heartbeat_s,
             "allowed_commands": list(self.allowed_commands or DEFAULT_ALLOWED),
             "denied_commands": list(self.denied_commands),
@@ -335,6 +383,8 @@ class AgentConfig:
 
 __all__ = [
     "DEFAULT_HEARTBEAT_S",
+    "ENV_ALLOW_BROWSER",
+    "ENV_ALLOW_MEDIA",
     "ENV_ALLOW_SHELL",
     "ENV_DEVICE_ID",
     "ENV_DEVICE_NAME",

@@ -17,6 +17,7 @@ import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
+from actionmesh.core.sqlite_guard import guarded, make_lock
 from actionmesh.voiceos.models import Conversation, TaskSession
 
 #: Bump by one with each migration appended below.
@@ -52,6 +53,7 @@ class VoiceOsStore:
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._lock = make_lock()
         self._open_schema()
 
     def _open_schema(self) -> None:
@@ -73,11 +75,13 @@ class VoiceOsStore:
     def _set_user_version(self, version: int) -> None:
         self.connection.execute(f"PRAGMA user_version={int(version)}")
 
+    @guarded
     def schema_version(self) -> int:
         return self._user_version()
 
     # -- sessions ----------------------------------------------------------
 
+    @guarded
     def save_session(self, session: TaskSession) -> None:
         self.connection.execute(
             "INSERT INTO voiceos_sessions (session_id, actor_id, updated_at, payload) "
@@ -92,12 +96,14 @@ class VoiceOsStore:
         )
         self.connection.commit()
 
+    @guarded
     def get_session(self, session_id: str) -> TaskSession | None:
         row = self.connection.execute(
             "SELECT payload FROM voiceos_sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
         return TaskSession.from_dict(json.loads(row[0])) if row else None
 
+    @guarded
     def list_sessions(self, actor_id: str | None, limit: int = 20) -> list[TaskSession]:
         """Most recent sessions. ``actor_id=None`` is the operator's unscoped view."""
         if actor_id is None:
@@ -115,6 +121,7 @@ class VoiceOsStore:
 
     # -- conversation ------------------------------------------------------
 
+    @guarded
     def get_conversation(self, actor_id: str) -> Conversation:
         row = self.connection.execute(
             "SELECT payload FROM voiceos_conversation WHERE actor_id = ?", (actor_id,)
@@ -123,6 +130,7 @@ class VoiceOsStore:
             return Conversation(actor_id=actor_id)
         return Conversation.from_dict(json.loads(row[0]))
 
+    @guarded
     def save_conversation(self, conversation: Conversation) -> None:
         conversation.updated_at = conversation.updated_at
         self.connection.execute(
@@ -137,12 +145,14 @@ class VoiceOsStore:
         )
         self.connection.commit()
 
+    @guarded
     def clear_conversation(self, actor_id: str) -> None:
         self.connection.execute(
             "DELETE FROM voiceos_conversation WHERE actor_id = ?", (actor_id,)
         )
         self.connection.commit()
 
+    @guarded
     def healthy(self) -> bool:
         try:
             self.connection.execute("SELECT 1").fetchone()
@@ -150,6 +160,7 @@ class VoiceOsStore:
             return False
         return True
 
+    @guarded
     def close(self) -> None:
         self.connection.close()
 

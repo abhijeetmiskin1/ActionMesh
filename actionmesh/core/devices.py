@@ -25,9 +25,11 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from actionmesh.core.identity import IdentityError, IdentityStore
 from actionmesh.core.permissions.risk import risk_rank
+from actionmesh.core.sqlite_guard import guarded, make_lock
 from actionmesh.protocol.models import DeviceInfo, DeviceKind, RiskLevel
 
 #: A device that has not been heard from for this long is treated as offline even
@@ -39,6 +41,56 @@ DEFAULT_STALE_AFTER_S = 45.0
 #: it does not run. Letting a phone register as an execution device would invert the
 #: control plane, so the role is checked rather than assumed.
 EXECUTION_KINDS: frozenset[DeviceKind] = frozenset({DeviceKind.LAPTOP, DeviceKind.SERVER})
+
+
+@runtime_checkable
+class PresenceForgetting(Protocol):
+    """The presence-side half of the forget-cascade (Agent 4 gap 1).
+
+    ``DeviceRegistry.forget`` drops the record and revokes the identity. That is
+    the registry's half. The agent process that owns the device holds its own
+    cached ``DeviceInfo`` (``_device``) and beats on it; without clearing that
+    cache the forgotten device could "resurrect" via a stale heartbeat — the
+    next ``heartbeat()`` would re-register it. This protocol is the narrow
+    surface the cascade calls, declared here so ``presence.py`` can satisfy it
+    without an import cycle (``presence`` imports ``devices``, not the reverse).
+
+    Duck-typed at runtime via ``isinstance`` and called defensively: a registry
+    with no agent wired to it (the common case in tests) simply has nothing to
+    cascade to.
+    """
+
+    def forget(self, device_id: str) -> bool:
+        """Clear any cached presence record for ``device_id``. True if one existed."""
+        ...
+
+    def forget_all(self) -> bool:
+        """Clear any cached presence record. True if one existed."""
+        ...
+
+
+@runtime_checkable
+class CredentialRevokeCascade(Protocol):
+    """The credential-side half of the forget-cascade (Phase 4 Agent 3 gap 1).
+
+    ``DeviceRegistry.forget`` drops the record and revokes the identity, but the
+    credential records bound to that identity stay ``is_active()`` until they
+    are revoked too — any consumer reading the store directly would still see
+    the forgotten device as live. ``CredentialStore.revoke_for_identity`` is
+    the narrow surface this cascade calls, declared here so ``devices`` can
+    reach the store without importing it: ``credentials`` already imports the
+    identity store, and a hard import of the credential store from devices
+    would risk a cycle (and tie a presence registry to the whole auth stack).
+
+    Optional and defensive, exactly like :class:`PresenceForgetting`: a
+    registry with no store wired forgets as it always has. This is *not* a
+    second credential store and *not* a second authority surface — it is a
+    revocation hook over the single canonical store.
+    """
+
+    def revoke_for_identity(self, identity_id: str, *, now: object = None) -> int:
+        """Revoke every live credential bound to one identity; return the count."""
+        ...
 
 
 def _utcnow() -> datetime:
@@ -77,6 +129,8 @@ class DeviceRegistry:
         identities: IdentityStore | None = None,
         stale_after_s: float = DEFAULT_STALE_AFTER_S,
         known_capability: Callable[[str], bool] | None = None,
+        presence: PresenceForgetting | None = None,
+        credentials: CredentialRevokeCascade | None = None,
     ) -> None:
         if stale_after_s <= 0:
             raise ValueError("stale_after_s must be positive")
@@ -85,8 +139,19 @@ class DeviceRegistry:
         self.stale_after_s = float(stale_after_s)
         #: Usually ``ActionRegistry.has`` — see :meth:`register`.
         self.known_capability = known_capability
+        #: The agent-side presence cache, if one is wired. ``forget`` cascades
+        #: into it so a forgotten device cannot resurrect via a stale heartbeat
+        #: from the agent process that still holds its ``DeviceInfo``.
+        self.presence = presence
+        #: The canonical credential store, if one is wired. ``forget`` cascades
+        #: into it so the live credentials bound to the forgotten device's
+        #: identity are revoked outright, not merely unreachable through
+        #: :meth:`IdentityStore.resolve`. Optional and defensive (see
+        #: :class:`CredentialRevokeCascade`); never a second store.
+        self.credentials = credentials
 
     # -- registration -----------------------------------------------------
+    @guarded
     def register(self, device: DeviceInfo) -> DeviceInfo:
         """Record a device, validating what it claims before it is listed.
 
@@ -139,6 +204,7 @@ class DeviceRegistry:
         self._write(device)
         return device
 
+    @guarded
     def enroll(
         self,
         *,
@@ -181,22 +247,91 @@ class DeviceRegistry:
             )
         )
 
+    @guarded
     def forget(self, device_id: str, *, now: datetime | None = None) -> bool:
         """Drop a device and revoke the identity bound to it.
 
         Removing the presence record alone would leave the credential live, so a
         "forgotten" laptop could still show up later under the same identity. Both
         halves go together or neither does.
+
+        When a credential store is wired, the cascade also revokes every live
+        credential bound to the identity (Phase 4 Agent 3 gap 1), so the
+        records themselves are dead — not only unreachable via
+        :meth:`IdentityStore.resolve`. The cascades are defensive
+        (``isinstance`` + suppression): a registry with no agent or no store
+        wired is not an error.
+
+        The cascade (Agent 4 gap 1) also clears the agent-side presence cache:
+        the owning ``LaptopAgent`` holds its own ``DeviceInfo`` and beats on it, so
+        a registry-only forget would let the stale heartbeat in that process
+        resurrect the device. Clearing ``_device`` forces the next heartbeat
+        through ``register()``, which re-checks identity resolution and refuses
+        the revoked identity — fail closed, never silently restoring revoked
+        authority. The cascade is defensive (``isinstance`` + ``suppress``): a
+        registry with no agent wired, or an agent that does not hold this device,
+        is not an error.
         """
         device = self.devices.pop(device_id, None)
         if device is None:
             return False
         if self.identities is not None and device.identity_id:
             self.identities.revoke(device.identity_id, now=now)
+        if device.identity_id:
+            self._cascade_credential_revoke(device.identity_id, now=now)
         self._drop(device_id)
+        self._cascade_presence_forget(device_id)
         return True
 
+    def _cascade_credential_revoke(
+        self, identity_id: str, *, now: datetime | None = None
+    ) -> int:
+        """Revoke the wired credential store's live credentials for one identity.
+
+        Returns the number revoked. Never raises: like the presence cascade,
+        this is best-effort hygiene on top of an already-successful forget, and
+        a misbehaving store must not turn a successful forget into a failure
+        that leaves the identity live. The store is duck-typed through
+        :class:`CredentialRevokeCascade` so the registry never imports the
+        credential stack.
+        """
+        store = self.credentials
+        if store is None or not isinstance(store, CredentialRevokeCascade):
+            return 0
+        try:
+            # ``revoke_for_identity`` accepts ``now`` in the canonical store;
+            # a narrower cascade target may not, so try the time-aware call
+            # first and fall back to the Protocol signature.
+            try:
+                return store.revoke_for_identity(identity_id, now=now)
+            except TypeError:
+                return store.revoke_for_identity(identity_id)
+        except Exception:  # cascade must not fail a forget
+            return 0
+
+    def _cascade_presence_forget(self, device_id: str) -> bool:
+        """Clear the wired agent's cached presence for ``device_id``.
+
+        Returns True when a cached record was cleared. Never raises: the cascade
+        is best-effort presence hygiene, and a misbehaving agent must not turn a
+        successful forget into a failure that leaves the identity live.
+        """
+        presence = self.presence
+        if presence is None or not isinstance(presence, PresenceForgetting):
+            return False
+        try:
+            # Prefer the targeted clear; fall back to the blunt one only when
+            # the targeted clear reports it held nothing (e.g. a test double
+            # that only implements the blunt surface).
+            cleared = presence.forget(device_id)
+            if cleared:
+                return True
+            return presence.forget_all()
+        except Exception:  # cascade must not fail a forget
+            return False
+
     # -- presence ---------------------------------------------------------
+    @guarded
     def heartbeat(
         self, device_id: str, *, online: bool = True, now: datetime | None = None
     ) -> DeviceInfo:
@@ -216,6 +351,7 @@ class DeviceRegistry:
         self._write(device)
         return device
 
+    @guarded
     def mark_connected(
         self, device_id: str, *, now: datetime | None = None
     ) -> DeviceInfo:
@@ -233,6 +369,7 @@ class DeviceRegistry:
         self._write(device)
         return device
 
+    @guarded
     def set_risk_ceiling(
         self, device_id: str, ceiling: RiskLevel, *, by: str = ""
     ) -> DeviceInfo:
@@ -260,12 +397,14 @@ class DeviceRegistry:
         self._write(device)
         return device
 
+    @guarded
     def ceiling_for(self, device_id: str) -> RiskLevel:
         device = self.devices.get(device_id)
         if device is None:
             raise KeyError(f"unknown device {device_id!r}")
         return device.risk_ceiling
 
+    @guarded
     def is_online(self, device: DeviceInfo, *, now: datetime | None = None) -> bool:
         """True only for a device seen recently. Everything else is offline."""
         if not device.online or device.last_seen is None:
@@ -274,6 +413,7 @@ class DeviceRegistry:
         age = (moment - device.last_seen).total_seconds()
         return age <= self.stale_after_s
 
+    @guarded
     def available(
         self,
         capability: str | None = None,
@@ -290,6 +430,7 @@ class DeviceRegistry:
             devices = [device for device in devices if capability in device.capabilities]
         return sorted(devices, key=lambda device: device.device_id)
 
+    @guarded
     def stale(self, *, now: datetime | None = None) -> list[DeviceInfo]:
         """Devices claiming to be online but not heard from in time.
 
@@ -305,6 +446,7 @@ class DeviceRegistry:
             key=lambda device: device.device_id,
         )
 
+    @guarded
     def require(
         self,
         device_id: str,
@@ -349,6 +491,7 @@ class DeviceRegistry:
             )
         return device
 
+    @guarded
     def all_devices(self) -> list[DeviceInfo]:
         """Every device on record, offline ones included.
 
@@ -440,6 +583,8 @@ class SQLiteDeviceRegistry(DeviceRegistry):
         identities: IdentityStore | None = None,
         stale_after_s: float = DEFAULT_STALE_AFTER_S,
         known_capability: Callable[[str], bool] | None = None,
+        presence: PresenceForgetting | None = None,
+        credentials: CredentialRevokeCascade | None = None,
     ) -> None:
         # A restored record may legitimately name a capability the current process
         # has not registered yet (an agent upgrade that adds one is not a reason to
@@ -449,8 +594,11 @@ class SQLiteDeviceRegistry(DeviceRegistry):
             identities=identities,
             stale_after_s=stale_after_s,
             known_capability=known_capability,
+            presence=presence,
+            credentials=credentials,
         )
         self.connection = sqlite3.connect(str(path), check_same_thread=False)
+        self._lock = make_lock()
         # The registry is shared by the agent's heartbeat thread and request handlers,
         # so it gets the same journal discipline as the execution store rather than
         # whatever the box happens to default to.
@@ -484,6 +632,7 @@ class SQLiteDeviceRegistry(DeviceRegistry):
         )
         self.connection.commit()
 
+    @guarded
     def close(self) -> None:
         self.connection.close()
 
@@ -493,5 +642,6 @@ __all__ = [
     "EXECUTION_KINDS",
     "DeviceRegistry",
     "DeviceUnavailable",
+    "PresenceForgetting",
     "SQLiteDeviceRegistry",
 ]

@@ -28,11 +28,17 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from actionmesh.core.permissions.context import PolicyContext
-from actionmesh.voiceos.automation_run import Runner, run_state_for, schedule_next, slot_for_schedule
+from actionmesh.voiceos.automation_run import (
+    Runner,
+    run_state_for,
+    schedule_next,
+    slot_for_schedule,
+)
 from actionmesh.voiceos.automation_store import AutomationStore
 from actionmesh.voiceos.models import _now
 from actionmesh.voiceos.workflows import (
@@ -120,10 +126,8 @@ class Scheduler:
         if task is None:
             return
         task.cancel()
-        try:
+        with suppress(asyncio.CancelledError, Exception):
             await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
 
     def reconcile(self) -> list[AutomationRun]:
         """Startup: mark abandoned claims ``missed``, and re-arm schedules.
@@ -157,7 +161,7 @@ class Scheduler:
                 await self.tick()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - one bad tick must not end the loop
+            except Exception:
                 # Deliberately swallowed: a scheduler that dies on the first error is
                 # indistinguishable from one that works, because nothing announces its
                 # silence. The next tick retries; the durable state is unchanged.

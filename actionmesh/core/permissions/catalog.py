@@ -86,6 +86,10 @@ _SCOPES: dict[str, Permission] = {
     # misc
     "search.web": Permission("search.web", "Perform a web search", RiskLevel.LOW),
     "reminder.write": Permission("reminder.write", "Create reminders", RiskLevel.LOW),
+    # browser (C42)
+    "browser.control": Permission("browser.control", "Control a browser session by element ref", RiskLevel.MEDIUM),
+    # media (C42)
+    "media.control": Permission("media.control", "Read and control local media playback state", RiskLevel.LOW),
 }
 
 #: Namespaces (the part before the dot) that are valid.

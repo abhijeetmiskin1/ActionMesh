@@ -18,7 +18,14 @@
 const fs = require('fs');
 const path = require('path');
 
-const SECRET_KEYS = ['externalApiKey', 'providerApiKey'];
+const SECRET_KEYS = [
+  'externalApiKey',
+  'providerApiKey',       // legacy; retained for compatibility
+  'chatApiKey',           // NEW - chat/reasoning text providers
+  'reasoningApiKey',      // NEW - reasoning-only providers (can alias chat)
+  'imageApiKey',          // NEW - image generation providers
+  'audioApiKey'           // NEW - audio/TTS providers
+];
 
 const DEFAULTS = {
   backendMode: 'managed', // 'managed' | 'external'
@@ -31,6 +38,12 @@ const DEFAULTS = {
   // "can run tests" — so one never turns on the other.
   allowDesktop: false,
   allowedCommands: ['python3', 'bash', 'sh'],
+  // C42: the browser drive and media controls each have their own consent
+  // boundary, exactly like shell and desktop. A browser on another person's
+  // machine is "can open pages", and media control is "can drive my player" —
+  // neither is what "can run tests" means — so none of them turns on another.
+  allowBrowser: false,
+  allowMedia: false,
   deviceId: 'laptop-1',
   deviceName: 'This laptop',
   voiceTasksFile: '',
@@ -42,8 +55,29 @@ const DEFAULTS = {
   providerModel: '',
   providerTimeout: 12,
   providerDefault: false,
+  // Per-purpose provider routing: chat, reasoning, image, audio. These are settings
+  // (not secrets): which provider, which model, which endpoint, how long to wait.
+  // `purpose_chat_*` is also the migration home for the legacy single provider.
+  purpose_chat_provider: '',
+  purpose_chat_model: '',
+  purpose_chat_endpoint: '',
+  purpose_chat_timeout: 12,
+  purpose_reasoning_provider: '',
+  purpose_reasoning_model: '',
+  purpose_reasoning_endpoint: '',
+  purpose_reasoning_timeout: 12,
+  purpose_image_provider: '',
+  purpose_image_model: '',
+  purpose_image_endpoint: '',
+  purpose_image_timeout: 12,
+  purpose_audio_provider: '',
+  purpose_audio_model: '',
+  purpose_audio_endpoint: '',
+  purpose_audio_timeout: 12,
   // Cached only so a choice survives a restart; never the key itself.
   lastActor: 'desktop-user',
+  // First-run onboarding (Agent 6). Never flipped silently — finish writes it once.
+  onboardingCompleted: false,
 };
 
 class SettingsStore {

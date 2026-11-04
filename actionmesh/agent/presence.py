@@ -164,6 +164,43 @@ class LaptopAgent:
             self._publish("device.connected", device)
         return device
 
+    def forget(self, device_id: str) -> bool:
+        """Drop this agent's cached presence record for ``device_id``.
+
+        The registry's own ``forget`` (devices.py) drops the record and revokes
+        the bound identity; this clears the agent-side cache so a forgotten device
+        cannot resurrect via a stale heartbeat. ``LaptopAgent.heartbeat`` would
+        otherwise keep beating on the cached ``DeviceInfo`` and ``devices.heartbeat``
+        would raise ``KeyError`` only after the fact — and ``register`` would
+        re-enroll. Clearing ``_device`` when it names the forgotten id makes the
+        next heartbeat go through ``register()``, which re-checks identity
+        resolution and refuses a revoked identity (fail closed, never silently
+        restoring revoked authority).
+
+        Returns True when this agent held a record for ``device_id``.
+        """
+        device = self._device
+        if device is None or device.device_id != device_id:
+            return False
+        self._device = None
+        return True
+
+    def forget_all(self) -> bool:
+        """Clear any cached presence record held by this agent.
+
+        Used when the registry drops this machine's record out-of-band (e.g. the
+        operator revokes the device via the API while the agent process is still
+        running). Prefer :meth:`forget` with the exact id; this is the blunt
+        version for the case where the caller does not know which id the agent
+        cached (in practice it is always ``config.device_id``).
+
+        Returns True when a record was cleared.
+        """
+        if self._device is None:
+            return False
+        self._device = None
+        return True
+
     def disconnect(self) -> None:
         """Announce the agent is going away, then go offline.
 

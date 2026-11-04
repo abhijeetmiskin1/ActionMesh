@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from actionmesh.core.sqlite_guard import guarded, make_lock
 from actionmesh.protocol.models import ActionState, ExecutionRecord, MeshEvent
 
 #: States a stored run may still be in. Kept here as the mirror of
@@ -135,6 +136,7 @@ class SQLiteStore:
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        self._lock = make_lock()
         self._open_schema()
 
     def _open_schema(self) -> None:
@@ -163,8 +165,17 @@ class SQLiteStore:
 
     @property
     def schema_version(self) -> int:
-        return self._user_version()
+        # Guarded: reads the single shared connection, so a concurrent writer
+        # interleaving between execute/fetchone would tear the result the same
+        # way an unguarded public method would. _open_schema already ran
+        # single-threaded in __init__, so this lock is only for post-init reads.
+        lock = getattr(self, "_lock", None)
+        if lock is None:  # pragma: no cover - construction-order misuse
+            return self._user_version()
+        with lock:
+            return self._user_version()
 
+    @guarded
     def save_record(self, record: ExecutionRecord) -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO execution_records(execution_id, payload, state, updated_at, "
@@ -181,12 +192,14 @@ class SQLiteStore:
         )
         self.connection.commit()
 
+    @guarded
     def get_record(self, execution_id: str) -> ExecutionRecord | None:
         row = self.connection.execute(
             "SELECT payload FROM execution_records WHERE execution_id = ?", (execution_id,)
         ).fetchone()
         return _record_from_payload(row[0]) if row else None
 
+    @guarded
     def list_non_terminal(self) -> list[ExecutionRecord]:
         """Every run this store believes is still going, oldest first.
 
@@ -201,6 +214,7 @@ class SQLiteStore:
         ).fetchall()
         return [_record_from_payload(row[0]) for row in rows]
 
+    @guarded
     def mark_cancel_requested(self, execution_id: str) -> bool:
         """Record a cancellation against the execution itself. True if it was recorded.
 
@@ -217,6 +231,7 @@ class SQLiteStore:
         self.save_record(record)
         return True
 
+    @guarded
     def list_recent(self, limit: int = 25) -> list[ExecutionRecord]:
         """The newest records this store holds, whichever process wrote them."""
         rows = self.connection.execute(
@@ -224,6 +239,7 @@ class SQLiteStore:
         ).fetchall()
         return [_record_from_payload(row[0]) for row in rows]
 
+    @guarded
     def release_leases(self, owner_id: str) -> int:
         """Give up the runs a departing process was watching. Returns how many.
 
@@ -246,6 +262,7 @@ class SQLiteStore:
         self.connection.commit()
         return len(rows)
 
+    @guarded
     def save_body(self, execution_id: str, graph_json: str, context_json: str) -> None:
         """Keep what a run is, so a later process can answer for it.
 
@@ -259,6 +276,7 @@ class SQLiteStore:
         )
         self.connection.commit()
 
+    @guarded
     def load_body(self, execution_id: str) -> tuple[str, str] | None:
         """The stored graph and context JSON, or ``None`` if no run was recorded.
 
@@ -271,10 +289,12 @@ class SQLiteStore:
         ).fetchone()
         return (row[0], row[1]) if row else None
 
+    @guarded
     def drop_body(self, execution_id: str) -> None:
         self.connection.execute("DELETE FROM execution_body WHERE execution_id = ?", (execution_id,))
         self.connection.commit()
 
+    @guarded
     def set_owner(self, execution_id: str, owner_id: str, lease_expires_at: datetime) -> None:
         self.connection.execute(
             "UPDATE execution_records SET owner_id = ?, lease_expires_at = ?, updated_at = ? "
@@ -285,6 +305,7 @@ class SQLiteStore:
 
 
     # -- dispatched work --------------------------------------------------
+    @guarded
     def save_dispatch(self, row: dict[str, Any]) -> None:
         """Record (or update) one piece of real work this agent started.
 
@@ -312,6 +333,7 @@ class SQLiteStore:
         )
         self.connection.commit()
 
+    @guarded
     def list_dispatch(self, execution_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT action_id, execution_id, process_id, kind, pid, pgid, state, "
@@ -323,6 +345,7 @@ class SQLiteStore:
             dict(zip(_DISPATCH_COLUMNS, row, strict=True)) for row in rows
         ]
 
+    @guarded
     def get_dispatch(self, action_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT action_id, execution_id, process_id, kind, pid, pgid, state, "
@@ -332,6 +355,7 @@ class SQLiteStore:
         ).fetchone()
         return dict(zip(_DISPATCH_COLUMNS, row, strict=True)) if row else None
 
+    @guarded
     def trim_dispatch(self, *, keep: int = 500) -> int:
         """Forget the oldest dispatched work, so a long-lived agent does not accumulate.
 
@@ -347,6 +371,7 @@ class SQLiteStore:
         self.connection.commit()
         return cursor.rowcount
 
+    @guarded
     def save_event(self, event: MeshEvent) -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO mesh_events(event_id, execution_id, payload) VALUES (?, ?, ?)",
@@ -354,6 +379,7 @@ class SQLiteStore:
         )
         self.connection.commit()
 
+    @guarded
     def list_events(
         self, execution_id: str | None = None, *, limit: int = 500
     ) -> list[MeshEvent]:
@@ -376,6 +402,7 @@ class SQLiteStore:
             ).fetchall()
         return [_event_from_payload(row[0]) for row in reversed(rows)]
 
+    @guarded
     def trim_events(self, *, keep: int = 5000) -> int:
         """Forget the oldest events, keeping the window a reconnect can actually use."""
         cursor = self.connection.execute(
@@ -386,6 +413,7 @@ class SQLiteStore:
         self.connection.commit()
         return cursor.rowcount
 
+    @guarded
     def event_count(self, execution_id: str | None = None) -> int:
         if execution_id is None:
             row = self.connection.execute("SELECT COUNT(*) FROM mesh_events").fetchone()
@@ -395,6 +423,7 @@ class SQLiteStore:
             ).fetchone()
         return int(row[0])
 
+    @guarded
     def healthy(self) -> bool:
         """A cheap readiness probe: can we still read our own schema version."""
         try:
@@ -403,6 +432,7 @@ class SQLiteStore:
         except sqlite3.Error:
             return False
 
+    @guarded
     def close(self) -> None:
         self.connection.close()
 
