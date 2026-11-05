@@ -1,0 +1,24 @@
+/* activity.css — Phase 6 Agent 1: Dashboard + Activity additions.
+   Light theme only. Reuses the tokens defined in styles.css; never redefines them. */
+
+.act-row { cursor: pointer; }
+.act-row:hover { background: var(--surface-2, #f2f5f1); }
+.act-row:focus-visible { outline: 2px solid var(--accent, #16834A); outline-offset: 2px; }
+
+.act-stat-value { font-variant-numeric: tabular-nums; }
+.act-stat-note { color: var(--muted, #6b7670); font-size: 0.85em; }
+
+.act-empty { color: var(--muted, #6b7670); }
+.act-error { color: var(--bad, #D94C4C); }
+.act-warn { color: var(--warn, #D99B16); }
+
+.act-quick { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.act-quick button[disabled] { opacity: 0.55; cursor: not-allowed; }
+
+.act-chip { font-size: 0.8em; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line, #E5EBE5); white-space: nowrap; }
+.act-chip-success { background: #e6f4ec; color: #0c5c31; }
+.act-chip-succeeded_unverified { background: #fdf3d7; color: #7a5b00; }
+.act-chip-failed, .act-chip-denied, .act-chip-timeout { background: #fde8e8; color: #8f1f1f; }
+.act-chip-executing, .act-chip-running, .act-chip-verifying { background: #e8f0fd; color: #1a3f7a; }
+.act-chip-waiting_permission, .act-chip-requires_user, .act-chip-awaiting_approval { background: #fdf3d7; color: #7a5b00; }
+.act-chip-cancelled, .act-chip-interrupted { background: #eef0ee; color: #4c5650; }

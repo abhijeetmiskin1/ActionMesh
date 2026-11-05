@@ -94,8 +94,12 @@ class PolicyContext(MeshModel):
         return self.now or _utcnow()
 
     def is_approved(self, action_id: str) -> bool:
+        moment = self.moment()
         return any(
-            a.action_id == action_id and a.status == "approved" for a in self.approvals
+            a.action_id == action_id
+            and a.status == "approved"
+            and not a.is_expired(moment)
+            for a in self.approvals
         )
 
 

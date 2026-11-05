@@ -703,7 +703,8 @@ class TestADraftCreatesNothing(unittest.TestCase):
     def test_the_body_a_draft_proposes_is_a_body_the_save_route_could_accept(self) -> None:
         out = draft("every day at 9am check the disk", templates=())
         body = draft_to_body(out)
-        self.assertEqual(set(body), {"name", "steps", "schedule"})
+        self.assertEqual(set(body), {"name", "steps", "schedule", "enabled"})
+        self.assertIs(body["enabled"], False, "a draft proposes a stored plan, never an armed one")
 
     def test_an_overlong_sentence_is_refused_not_truncated(self) -> None:
         out = draft("x" * 5000, templates=())

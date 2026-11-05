@@ -227,6 +227,8 @@ const VIEWS = {
   devices: { eyebrow: 'This laptop', title: 'Devices' },
   visual: { eyebrow: 'Seeing the screen', title: 'Visual Intelligence' },
   browser: { eyebrow: 'Web pages', title: 'Browser' },
+  workbench: { eyebrow: 'Execution', title: 'Action Workbench' },
+  connections: { eyebrow: 'Integrations', title: 'Connections' },
   settings: { eyebrow: 'Application', title: 'Settings' },
 };
 
@@ -247,6 +249,86 @@ function showView(name) {
   byId('viewEyebrow').textContent = VIEWS[name].eyebrow;
   byId('viewTitle').textContent = VIEWS[name].title;
   refreshCurrent();
+}
+
+/**
+ * The guided tour (onboarding_flow.js), opened from Settings.
+ *
+ * The module publishes a surface but performs no I/O until a button inside it is
+ * pressed, so mounting is cheap and safe to repeat. Re-opening reuses the controller
+ * already on screen: a second `renderFirstRun` would append a second copy of the
+ * panel to the same host, and a person who pressed "Guided tour" twice would be
+ * looking at two overlapping tours with two sets of controls.
+ *
+ * Everything drawn comes from the module; this function only owns the overlay and
+ * the three callbacks that let a tour step move the app underneath it — a step that
+ * says "open history" has to actually open history, or it is a dead button.
+ */
+let firstRunController = null;
+let firstRunDismiss = null;
+function openFirstRun() {
+  const mount = byId('firstRunMount');
+  if (!mount) {
+    toast('This build has no place to show the tour.', 'bad');
+    return null;
+  }
+  if (firstRunController) {
+    const root = firstRunController.element;
+    // The module's own Finish hides its root and the mount without telling us. A
+    // finished tour is not a live one: showing its stale panel again would show an
+    // empty overlay whose controls still belong to the last step.
+    const finished = root && (root.hidden === true || root.getAttribute('hidden') !== null);
+    if (!finished) {
+      mount.hidden = false;
+      return firstRunController;
+    }
+    closeFirstRun();
+  }
+  if (typeof ActionMeshFirstRun === 'undefined' || !ActionMeshFirstRun.renderFirstRun) {
+    toast('The guided tour is not in this build.', 'bad');
+    return null;
+  }
+  mount.hidden = false;
+  // The module offers Back / Skip this step / Next, and finishing writes
+  // `onboardingCompleted`. None of those is "go away without deciding", and an overlay
+  // that covers the whole window with no exit is a trap. Escape and a click on the
+  // backdrop close it, changing no setting: closing is not completing.
+  const dismiss = (event) => {
+    if (event && event.key !== undefined && event.key !== 'Escape') return;
+    if (event && event.type === 'click' && event.target !== mount) return;
+    closeFirstRun();
+  };
+  mount.addEventListener('click', dismiss);
+  document.addEventListener('keydown', dismiss);
+  firstRunDismiss = dismiss;
+  try {
+    firstRunController = ActionMeshFirstRun.renderFirstRun(mount, bridge, {
+      // Deliberately no `initiallyCompleted`: that option hides the panel for a
+      // returning user, which is right for a boot overlay and wrong for a button a
+      // person just pressed. The button IS the request, so the tour always starts at
+      // welcome. Its Finish is what records completion, and that stays the module's.
+      navigate: (view) => showView(view),
+      onOpenApprovals: () => showView('approvals'),
+    });
+  } catch (error) {
+    firstRunController = null;
+    mount.hidden = true;
+    toast(`The guided tour could not start: ${error.message}`, 'bad');
+    return null;
+  }
+  return firstRunController;
+}
+
+/** Put the overlay away without claiming anything was completed. */
+function closeFirstRun() {
+  const mount = byId('firstRunMount');
+  if (mount) mount.hidden = true;
+  if (firstRunDismiss) {
+    mount.removeEventListener('click', firstRunDismiss);
+    document.removeEventListener('keydown', firstRunDismiss);
+    firstRunDismiss = null;
+  }
+  firstRunController = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,10 +420,19 @@ async function refreshHome() {
     byId('homeApprovals').textContent = '—';
     replace(byId('homeExecutions'), el('li', { class: 'empty', text: 'Backend offline.' }));
     replace(byId('homeSessions'), el('li', { class: 'empty', text: 'Backend offline.' }));
+    // An unreadable ledger is not a healthy one: clear the audit card rather than
+    // leaving the previous "chain verified" standing while nothing can be checked.
+    const auditChipOffline = byId('homeAuditChain');
+    if (auditChipOffline) { auditChipOffline.textContent = 'backend offline'; auditChipOffline.className = 'chip warn'; }
+    const auditHeadOffline = byId('homeAuditHead');
+    if (auditHeadOffline) auditHeadOffline.textContent = 'The ledger cannot be read while the backend is down.';
+    const auditLogOffline = byId('homeAuditLog');
+    if (auditLogOffline) replace(auditLogOffline, el('li', { class: 'empty', text: 'Backend offline.' }));
     return;
   }
 
-  const [readyResult, devicesResult, approvalsResult, executionsResult, sessionsResult, automationsResult] =
+  const [readyResult, devicesResult, approvalsResult, executionsResult, sessionsResult, automationsResult,
+    auditResult, auditVerifyResult] =
     await Promise.allSettled([
       GET('/ready'),
       GET('/devices'),
@@ -349,6 +440,8 @@ async function refreshHome() {
       GET('/executions?limit=8'),
       GET('/voiceos/sessions?limit=8'),
       GET('/automations'),
+      GET('/audit?limit=8'),
+      GET('/audit/verify'),
     ]);
 
   // Connected computers: the number the backend asserts, and — just as important — the
@@ -416,6 +509,22 @@ async function refreshHome() {
       showView('tasks');
       loadTask(id);
     });
+  }
+
+  // Audit evidence. The ledger is fetched here and painted by activity.js, which
+  // owns and exports the renderer; this keeps one implementation of what an audit
+  // row may show (allowlisted fields only — never `payload`, which can carry an
+  // action's own result). Both reads are independent: a broken chain still lets
+  // the records list, and vice versa.
+  const auditData = {
+    audit: auditResult.status === 'fulfilled' ? auditResult.value : undefined,
+    auditVerify: auditVerifyResult.status === 'fulfilled' ? auditVerifyResult.value : undefined,
+  };
+  if (typeof ActionMeshActivity !== 'undefined' && ActionMeshActivity.renderAuditEvidence) {
+    ActionMeshActivity.renderAuditEvidence(auditData);
+  } else {
+    const chip = byId('homeAuditChain');
+    if (chip) { chip.textContent = 'unreadable'; chip.className = 'chip warn'; }
   }
 
   renderHomeProviderKv();
@@ -1904,8 +2013,9 @@ function renderDraft(draft) {
     parts.push(el('div', { class: 'btn-row' }, [save]));
     parts.push(el('p', {
       class: 'fine',
-      text: 'Saving grants nothing and starts nothing. The plan is stored; it is '
-        + 'authorised step by step each time it runs.',
+      text: 'Saving grants nothing and starts nothing. The plan is stored disarmed: '
+        + 'no schedule or event will start it until you arm it, and even then every '
+        + 'step is authorised again each time it runs.',
     }));
   } else {
     parts.push(el('p', {
@@ -4648,6 +4758,26 @@ function refreshCurrent() {
     case 'devices': return refreshDevices();
     case 'visual': return refreshVisual();
     case 'browser': return refreshBrowser();
+    case 'workbench':
+      // The module owns its own refresh and guards a missing host, so this
+      // only ever asks it to reload what it already knows how to read.
+      if (typeof ActionMeshWorkbench !== 'undefined' && ActionMeshWorkbench.refreshHistory) {
+        return Promise.allSettled([
+          ActionMeshWorkbench.refreshHistory(),
+          ActionMeshWorkbench.refreshPendingApprovals
+            ? ActionMeshWorkbench.refreshPendingApprovals() : Promise.resolve(),
+        ]);
+      }
+      return undefined;
+    case 'connections':
+      if (typeof actionmeshConnections !== 'undefined' && actionmeshConnections.loadConnections) {
+        return Promise.resolve(actionmeshConnections.loadConnections()).catch((error) => {
+          // The lane renderer already prints its own failure sentence; this
+          // keeps the rejection from surfacing as an unhandled promise.
+          toast(`Connections could not be read: ${error.message}`, 'bad');
+        });
+      }
+      return undefined;
     case 'settings': return refreshSettings();
     case 'voice': return refreshVoice();
     default: return undefined;
@@ -4745,6 +4875,7 @@ function wire() {
   // Settings
   on('settingsSave', 'click', (event) => { event.preventDefault(); saveSettings(); });
   on('settingsAbout', 'click', (event) => { event.preventDefault(); bridge.showAbout(); });
+  on('firstRunOpen', 'click', (event) => { event.preventDefault(); openFirstRun(); });
   on('backendRestart', 'click', () => backendAction('restart'));
   on('backendStop', 'click', () => backendAction('stop'));
   on('backendOpenData', 'click', async () => {
@@ -4828,10 +4959,45 @@ async function boot() {
   if (state.backendReady) {
     try { await bridge.startStream({}); } catch { /* the pill reports the failure */ }
   }
+  // Phase 6 modules own their own panels and bind their own controls. Each is
+  // initialised exactly once, here, inside its own guard: a module that is
+  // absent (older build), returns false (markup missing) or throws must cost
+  // only its own panel, never the whole shell. app.js is the single owner of
+  // the automations surface, so savedtasks.js is deliberately NOT initialised —
+  // calling it would bind a second handler to #automationDraftForm and clobber
+  // the renders app.js already owns.
+  const modules = [
+    ['Workbench', 'ActionMeshWorkbench', 'initWorkbench'],
+    ['Activity', 'ActionMeshActivity', 'initActivity'],
+    ['Connections', 'actionmeshConnections', 'initConnections'],
+  ];
+  for (const [label, globalName, initName] of modules) {
+    const module = window[globalName];
+    if (!module || typeof module[initName] !== 'function') continue;
+    try {
+      const result = module[initName]();
+      if (result && result.then) result.catch((error) => { toast(`${label}: ${error.message}`, 'bad'); });
+    } catch (error) {
+      toast(`${label} could not start: ${error.message}`, 'bad');
+    }
+  }
+
   showView('home');
   if (!state.backendReady) {
     toast('The backend is not running. Settings → Restart backend.', 'bad');
   }
 }
+
+// Cross-module navigation surface. activity.js reaches for window.ActionMeshApp
+// so a dashboard row can open the execution or task it names; without this the
+// rows render but do nothing. Exposed last so every referenced function exists.
+window.ActionMeshApp = {
+  showView,
+  loadExecution,
+  loadTask,
+  refreshCurrent,
+  openFirstRun,
+  closeFirstRun,
+};
 
 document.addEventListener('DOMContentLoaded', boot);

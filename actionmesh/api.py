@@ -9,7 +9,7 @@ import os
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1539,11 +1539,15 @@ def create_app(
                 raise HTTPException(
                     status_code=403, detail="that action is not yours to decide"
                 )
+        expires_at = (
+            datetime.now(UTC) + timedelta(minutes=10) if status == "approved" else None
+        )
         request = ApprovalRequest(
             action_id=action_id,
             action_type=str(payload.get("action_type", "")),
             summary=str(payload.get("summary", "")),
             status=status,
+            expires_at=expires_at,
         )
         recorded = engine.submit_approval(request)
         out: dict[str, Any] = recorded.model_dump()

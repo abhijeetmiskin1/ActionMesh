@@ -212,14 +212,44 @@ class TestAuthorizationGates(ExecutorCase):
         self.assertIs(result.state, ActionState.SUCCESS)
         self.assertEqual(len(self.provider.calls), 1)
 
-    def test_rejected_approval_still_blocks(self) -> None:
+    def test_rejected_approval_ends_the_run_as_a_refusal(self) -> None:
+        # A "no" is a decision. This used to assert WAITING_PERMISSION, which meant
+        # `POST /approvals {status: rejected}` re-evaluated to the same
+        # "requires approval", parked again, and left the execution waiting forever —
+        # listed as needing an answer that could never be given. The block is still
+        # absolute (the provider is never called); what changes is that the run now
+        # ends, and ends as DENIED rather than FAILED so a refusal cannot be confused
+        # with a provider breakdown.
         action, graph = single_graph(Action(type="message.send", parameters={"message": "hi"}))
         self.exec_engine.submit_approval(
             ApprovalRequest(action_id=action.action_id, status="rejected")
         )
         result = run(self.exec_engine.execute(graph, context(["message.send"])))
-        self.assertIs(result.state, ActionState.WAITING_PERMISSION)
-        self.assertEqual(self.provider.calls, [])
+        self.assertIs(result.state, ActionState.DENIED)
+        self.assertEqual(self.provider.calls, [], "a rejected action must never be dispatched")
+        self.assertIn("rejected by the user", result.error)
+
+    def test_rejecting_a_parked_run_resumes_it_to_denied(self) -> None:
+        # The path a person actually takes: run it, see it stop for approval, reject.
+        # `resume` must retire the waiting execution — otherwise it stays in
+        # `awaiting_approval()` forever and the UI keeps offering a decision that has
+        # already been made.
+        action, graph = single_graph(Action(type="message.send", parameters={"message": "hi"}))
+        parked = run(self.exec_engine.execute(graph, context(["message.send"])))
+        self.assertIs(parked.state, ActionState.WAITING_PERMISSION)
+        self.assertEqual(len(self.exec_engine.awaiting_approval()), 1)
+
+        self.exec_engine.submit_approval(
+            ApprovalRequest(action_id=action.action_id, status="rejected")
+        )
+        resumed = run(self.exec_engine.resume(parked.execution_id))
+        self.assertIsNotNone(resumed)
+        self.assertIs(resumed.state, ActionState.DENIED)
+        self.assertEqual(self.provider.calls, [], "rejection runs nothing")
+        self.assertEqual(
+            self.exec_engine.awaiting_approval(), [],
+            "a rejected execution must not be offered for decision again",
+        )
 
     def test_approval_for_other_action_does_not_unblock(self) -> None:
         _, graph = single_graph(Action(type="message.send", parameters={"message": "hi"}))

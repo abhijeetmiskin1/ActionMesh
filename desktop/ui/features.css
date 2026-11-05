@@ -1,0 +1,258 @@
+/* ---------------------------------------------------------------
+   features.css — styles for the Phase 6 feature surfaces
+   (Connections lanes, the first-run guide, Workbench approvals).
+
+   Light theme only. Every colour below is a token from styles.css
+   or a one-off tint that matches the existing notice/chip palette,
+   so this file introduces no second visual system.
+   --------------------------------------------------------------- */
+
+/* --------------------------------------------------- Connections */
+.connections-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.connections-heading {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 620;
+  color: var(--ink);
+}
+
+.connections-intro {
+  margin: 0;
+  max-width: 76ch;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-soft);
+}
+
+.connections-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.connections-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+}
+.connections-btn:hover:not(:disabled) { background: #F7FAF7; border-color: #D3DED5; }
+.connections-btn:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.connections-btn:disabled { color: var(--ink-dim); background: #F3F6F3; cursor: not-allowed; opacity: 0.85; }
+.connections-btn-primary { background: var(--green); border-color: var(--green); color: #FFFFFF; }
+.connections-btn-primary:hover:not(:disabled) { background: var(--green-dark); border-color: var(--green-dark); }
+
+.connections-select {
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.connections-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.connections-lane {
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.connections-lane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: 6px;
+}
+
+.connections-lane-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 620;
+  color: var(--ink);
+}
+
+.connections-reason {
+  margin: 0 0 var(--sp-2);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-soft);
+}
+
+.connections-kv {
+  display: flex;
+  flex-direction: column;
+  margin: 0 0 var(--sp-2);
+  border-top: 1px solid var(--line);
+}
+
+.connections-kv-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+}
+.connections-kv-row:last-child { border-bottom: 0; }
+.connections-kv-row dt { color: var(--ink-soft); }
+.connections-kv-row dd { margin: 0; text-align: right; word-break: break-word; }
+
+.connections-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #F5F8F5;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.connections-chip.connected,
+.connections-chip.ready { background: var(--green-soft); border-color: #CDE7D6; color: var(--green); }
+.connections-chip.unavailable,
+.connections-chip.not_configured { background: #F3F6F3; color: var(--ink-dim); }
+.connections-chip.error { background: #FDECEC; border-color: #F5D2D2; color: #B23C3C; }
+.connections-chip.needs_authorization { background: var(--yellow-soft); border-color: #F2E3B0; color: var(--warn-ink); }
+
+.connections-hint {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+}
+
+.connections-action-result {
+  font-size: 11.5px;
+  color: var(--warn-ink);
+}
+
+.connections-pairing {
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px dashed var(--line);
+}
+.connections-pairing .connections-lane-title { margin-bottom: 4px; }
+
+.connections-pair-out { margin-top: var(--sp-2); }
+
+.connections-code {
+  display: inline-block;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: #F5F8F5;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+}
+
+/* ---------------------------------------------------- First-run guide */
+.first-run {
+  margin: 0 auto;
+  max-width: 760px;
+  padding: var(--sp-5);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.first-run-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  list-style: none;
+  counter-reset: first-run-step;
+}
+
+.first-run-step {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #F5F8F5;
+  color: var(--ink-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.first-run-step.current {
+  border-color: #CDE7D6;
+  background: var(--green-soft);
+  color: var(--green-dark);
+}
+
+.first-run-panel { display: flex; flex-direction: column; gap: var(--sp-3); }
+
+.first-run-title { margin: 0; font-size: 15px; font-weight: 620; color: var(--ink); }
+
+.first-run-blurb {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+
+.first-run-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+.first-run-controls .btn:last-child { margin-left: auto; }
+
+/* --------------------------------------------------- Workbench approvals */
+.approval {
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--line);
+}
+.approval:last-child { border-bottom: 0; padding-bottom: 0; }
+
+.approval-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: 6px;
+}
+
+.approval-title { font-size: 13px; font-weight: 620; color: var(--ink); }
+
+.action-block {
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: #FBFDFB;
+}
+.action-block pre { margin: 6px 0 0; }

@@ -7,6 +7,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VoiceOS</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="activity.css">
+<link rel="stylesheet" href="features.css">
 </head>
 <body>
 <div class="app shell" id="app">
@@ -37,6 +39,9 @@
         <span class="nav-glyph" aria-hidden="true">⧉</span><span class="nav-label">Browser</span>
         <span class="nav-badge live" data-badge="browser" hidden></span>
       </button>
+      <button class="nav-item" data-view="workbench" type="button" title="Action Workbench">
+        <span class="nav-glyph" aria-hidden="true">⚒</span><span class="nav-label">Workbench</span>
+      </button>
       <button class="nav-item" data-view="tasks" type="button" title="Tasks">
         <span class="nav-glyph" aria-hidden="true">✦</span><span class="nav-label">Tasks</span>
         <span class="nav-badge" data-badge="tasks" hidden></span>
@@ -44,6 +49,9 @@
       <button class="nav-item" data-view="automations" type="button" title="Automations">
         <span class="nav-glyph" aria-hidden="true">↻</span><span class="nav-label">Automations</span>
         <span class="nav-badge" data-badge="automations" hidden></span>
+      </button>
+      <button class="nav-item" data-view="connections" type="button" title="Connections">
+        <span class="nav-glyph" aria-hidden="true">⇄</span><span class="nav-label">Connections</span>
       </button>
       <button class="nav-item" data-view="devices" type="button" title="Devices">
         <span class="nav-glyph" aria-hidden="true">⌂</span><span class="nav-label">Devices</span>
@@ -194,6 +202,22 @@
         </article>
       </div>
 
+      <!-- AUDIT EVIDENCE. The hash-chained ledger is the record of what actually
+           happened; this card proves it exists and that the chain is intact. It
+           renders only allowlisted fields (seq, event, actor, subject, time) —
+           never `payload`, which can carry action results. -->
+      <article class="card">
+        <div class="card-head">
+          <h2 class="card-title">Audit evidence</h2>
+          <div class="btn-row">
+            <span class="chip" id="homeAuditChain">checking…</span>
+            <button class="btn ghost small" data-goto="history" type="button">History →</button>
+          </div>
+        </div>
+        <p class="card-note" id="homeAuditHead">Reading the ledger…</p>
+        <ul class="rows" id="homeAuditLog"><li class="empty">Loading…</li></ul>
+      </article>
+
       <article class="card">
         <div class="card-head">
           <h2 class="card-title">Provider lanes</h2>
@@ -210,6 +234,106 @@
         </p>
         <div class="purpose-lanes" id="homeProviderKv"></div>
       </article>
+    </section>
+
+    <!-- ACTION WORKBENCH ------------------------------------------------ -->
+    <section class="view" data-view="workbench" hidden>
+      <div class="page-header">
+        <div>
+          <h2 class="page-title">Action Workbench</h2>
+          <p class="page-sub">
+            Type an instruction, review the plan the planner actually returned, then run it.
+            Asking proposes only — nothing runs until you press Execute, and any action the
+            policy marks risky waits for its own approval.
+          </p>
+        </div>
+        <div class="btn-row">
+          <button class="btn ghost small" id="wbHistoryRefresh" type="button">Refresh history</button>
+        </div>
+      </div>
+
+      <article class="card">
+        <h2 class="card-title">Instruction</h2>
+        <form class="ask" id="wbAsk">
+          <input id="wbAskText" autocomplete="off" spellcheck="false"
+                 placeholder="e.g. search the web for the ActionMesh repository">
+          <button class="btn primary" id="wbAskSend" type="button">Propose plan</button>
+        </form>
+        <p class="fine" id="wbStatus" role="status" aria-live="polite" aria-atomic="true">
+          Idle. Nothing has been proposed yet.
+        </p>
+        <p class="fine" id="wbError" role="alert" hidden></p>
+      </article>
+
+      <article class="card" id="wbPlan" hidden>
+        <div class="card-head">
+          <h2 class="card-title">Plan</h2>
+          <span class="chip">proposed</span>
+        </div>
+        <p class="card-note">
+          This is the backend's plan, unedited. A plan is a proposal: it authorises nothing
+          and nothing has run.
+        </p>
+        <ol class="rows compact" id="wbPlanList"></ol>
+        <p class="card-note" id="wbPlanNotes"></p>
+        <div class="btn-row">
+          <button class="btn primary" id="wbExecute" type="button" disabled>Execute plan</button>
+          <button class="btn ghost" id="wbCancel" type="button" disabled>Cancel run</button>
+        </div>
+      </article>
+
+      <article class="card" id="wbApprovalsCard" hidden>
+        <h2 class="card-title">Waiting for your approval</h2>
+        <p class="card-note">
+          A critical action never runs on a plan alone. Approving here applies to this one
+          action, for ten minutes — never to the step in general.
+        </p>
+        <div id="wbApprovals"></div>
+      </article>
+
+      <article class="card" id="wbResultCard" hidden>
+        <h2 class="card-title">Result</h2>
+        <div id="wbResult"></div>
+      </article>
+
+      <div class="split">
+        <aside class="card list-card">
+          <div class="card-head">
+            <h2 class="card-title">Recent executions</h2>
+            <span class="chip">history</span>
+          </div>
+          <ul class="rows selectable" id="wbHistoryList"><li class="empty">Loading…</li></ul>
+        </aside>
+        <article class="card detail-card">
+          <h2 class="card-title">Execution detail</h2>
+          <div id="wbHistoryDetail"><p class="empty">Choose an execution to see its record.</p></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- CONNECTIONS ------------------------------------------------------ -->
+    <section class="view" data-view="connections" hidden>
+      <div class="page-header">
+        <div>
+          <h2 class="page-title">Connections</h2>
+          <p class="page-sub">What this machine can actually reach right now — providers, the browser
+            window, media, and paired devices. Every lane reports a fact the app just read; a lane
+            with no answer says so rather than showing a green word it did not earn.</p>
+        </div>
+      </div>
+      <section id="connectionsCenter" class="connections-wrap">
+        <h2 class="connections-heading">Live status</h2>
+        <p class="connections-intro">Nothing on this page is guessed. Press Refresh after changing a
+          provider key or pairing a device.</p>
+        <div class="connections-actions">
+          <button id="connectionsRefresh" class="connections-btn" type="button">Refresh</button>
+        </div>
+        <div id="connectionsNote"></div>
+        <div id="connectionsProviderKv" class="connections-rows"></div>
+        <div id="connectionsBrowserKv" class="connections-rows"></div>
+        <div id="connectionsMediaKv" class="connections-rows"></div>
+        <div id="connectionsDevicesKv" class="connections-rows"></div>
+      </section>
     </section>
 
     <!-- VOICE COMMANDS --------------------------------------------------- -->
@@ -727,8 +851,13 @@
               <button class="btn primary" id="settingsSave" type="button">Save settings</button>
               <button class="btn ghost" id="settingsReset" type="button">Reset</button>
               <button class="btn ghost" id="settingsAbout" type="button">About VoiceOS</button>
+              <button class="btn ghost" id="firstRunOpen" type="button">Guided tour</button>
             </div>
             <p class="fine" id="settingsSaved"></p>
+            <p class="fine">
+              The guided tour walks the real screens — draft a task, see the plan, save it,
+              run it, find the audit record. It grants nothing and can be closed at any step.
+            </p>
           </form>
         </article>
 
@@ -812,10 +941,18 @@
 </div>
 
 <div id="onboardingMount" hidden></div>
+<!-- The guided tour (onboarding_flow.js) gets its own mount: onboarding.js above owns
+     the boot overlay, and two fixed overlays would stack on first launch. -->
+<div id="firstRunMount" hidden></div>
 
 <script src="voice.js"></script>
 <script src="onboarding.js"></script>
 <script src="history.js"></script>
+<script src="activity.js"></script>
+<script src="workbench.js"></script>
+<script src="connections.js"></script>
+<script src="savedtasks.js"></script>
+<script src="onboarding_flow.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

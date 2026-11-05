@@ -49,7 +49,16 @@
  * node:test, no jsdom). When loaded in the browser they attach to
  * window.ActionMeshHistory. The DOM entry points tolerate a missing bridge
  * or missing hosts and render an honest empty/error state instead of throwing.
+ *
+ * Wrapped in an IIFE because index.html loads this file as a classic script,
+ * and classic scripts share one global lexical scope. A top-level `const` or
+ * `function` here that another script also declares is not a shadowing bug —
+ * it is a SyntaxError that stops that script from loading at all. This module
+ * already collided with app.js (`isTerminal`); everything it offers the page
+ * is reached through window.ActionMeshHistory, so nothing needs to be global.
  */
+(function registerHistory() {
+  'use strict';
 
 // ---------------------------------------------------------------------------
 // Lifecycle mapping — the no-fake-success table.
@@ -468,3 +477,4 @@ if (typeof module !== 'undefined' && module.exports) {
 if (typeof window !== 'undefined') {
   window.ActionMeshHistory = api;
 }
+})();
