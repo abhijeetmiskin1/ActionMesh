@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
@@ -291,6 +291,17 @@ class ApprovalRequest(MeshModel):
     details: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"  # pending | approved | rejected | expired
     created_at: datetime = field(default_factory=_utcnow)
+    #: Approval window: after this moment the approval no longer authorizes.
+    #: Mirrors PermissionGrant.expires_at; None means the legacy default TTL.
+    expires_at: datetime | None = None
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        if self.status == "expired":
+            return True
+        if self.expires_at is not None:
+            return (now or _utcnow()) >= self.expires_at
+        # Legacy/test approvals without expires_at: 24h window from creation.
+        return (now or _utcnow()) >= self.created_at + timedelta(hours=24)
 
 
 @dataclass

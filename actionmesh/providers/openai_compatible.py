@@ -237,7 +237,13 @@ class OpenAICompatibleProvider(RealProviderBase):
         try:
             resp = opener(req, timeout=self._timeout_s)
         except ProviderError:
-            raise
+            # Never let an opener's message reach the caller either: it can
+            # quote the request/credential as readily as a generic error can.
+            # The seam is test-only; the real (execute) path calls no opener.
+            raise ProviderError(
+                "the OpenAI-compatible provider could not be reached",
+                FailureKind.NETWORK,
+            ) from None
         except Exception as exc:
             # Never echo an injected opener's error body: it can quote the
             # request and the credential.

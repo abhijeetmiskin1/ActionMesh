@@ -750,7 +750,9 @@ class CredentialStore:
                     ),
                 )
             approved = any(
-                approval.action_id == action_id and approval.status == "approved"
+                approval.action_id == action_id
+                and approval.status == "approved"
+                and not approval.is_expired(moment)
                 for approval in approvals
             )
             if not approved:

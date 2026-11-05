@@ -319,8 +319,17 @@ def draft(
 
 
 def draft_to_body(d: Draft) -> dict[str, Any]:
-    """The shape ``POST /automations`` accepts. Empty fields are omitted."""
-    body: dict[str, Any] = {"name": d.name, "steps": list(d.steps)}
+    """The shape ``POST /automations`` accepts. Empty fields are omitted.
+
+    ``enabled`` is stated, and stated as ``False``. It is not omitted, because
+    the save route's default is ``True`` — a plan arriving without the field is
+    a plan whose owner meant to arm it — and a draft is the one body that was
+    never authored by anyone who saw a trigger. A sentence may have named a
+    schedule; inheriting "armed" from that is how pressing "save" on a reading
+    of your own words would start firing at nine with nobody having switched it
+    on. Saving stores the plan; arming is the next, separate act.
+    """
+    body: dict[str, Any] = {"name": d.name, "steps": list(d.steps), "enabled": False}
     if d.description:
         body["description"] = d.description
     if d.schedule:

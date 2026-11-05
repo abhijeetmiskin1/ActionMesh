@@ -2404,6 +2404,25 @@ summary:focus-visible,
   display: none;
 }
 
+/* The guided tour (onboarding_flow.js), opened from Settings rather than at boot.
+   Same overlay treatment as the first-run wizard so the two read as one family; it
+   sits one level higher only so that, on a fresh install where both could be on
+   screen, the tour a person just asked for is the one they can reach. */
+#firstRunMount {
+  position: fixed;
+  inset: 0;
+  z-index: 41;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(247, 249, 245, .92);
+  padding: var(--sp-5);
+}
+
+#firstRunMount[hidden] {
+  display: none;
+}
+
 .onboarding-panel {
   background: var(--surface);
   border: 1px solid var(--line);

@@ -1319,6 +1319,38 @@ class ExecutionEngine:
 
         # --- authorization re-check at dispatch time ---------------------
 
+        # A recorded rejection is a decision, not the absence of one. Without this
+        # the run re-evaluates to the same "requires approval", parks again, and
+        # `POST /approvals {status: rejected}` becomes a no-op that leaves the
+        # execution waiting forever — listed as needing an answer nobody can give.
+        # Rejecting must end the run at that node, the same way a DENY does.
+        rejection = self._approvals.get(resolved.action.action_id)
+        if rejection is not None and rejection.status == "rejected":
+            # A user's refusal is a decision, so the node reads DENIED. Marking it
+            # FAILED would also put it in the retry/escalation path, which is the
+            # opposite of what "no" means: nothing is retried, nothing is escalated.
+            outcome.state = ActionState.DENIED
+            outcome.error = "rejected by the user"
+            outcome.failure_kind = FailureKind.AUTHORIZATION
+            self.events.publish(
+                MeshEvent(
+                    event_type="authorization.decided",
+                    execution_id=execution_id,
+                    action_id=resolved.action.action_id,
+                    actor=self._actor.id if self._actor else "system",
+                    payload={
+                        "node_id": node.node_id,
+                        "action_type": resolved.action.type,
+                        "decision": "deny",
+                        "authorizes_execution": False,
+                        "requires_approval": False,
+                        "effective_risk": resolved.effective_risk.value,
+                        "reasons": ["rejected by the user"],
+                    },
+                )
+            )
+            return outcome
+
         approvals = [a for a in self._approvals.values() if a.status == "approved"]
         verdict = self.engine.evaluate(
             build_context(
@@ -2012,7 +2044,27 @@ class ExecutionEngine:
 
         blocked = [n for n in outcomes if n.state is ActionState.DENIED]
         if blocked:
-            result.error = f"denied: {', '.join(sorted(n.node_id for n in blocked))}"
+            # Prefer the node's own reason when it has one. A rejection is recorded as
+            # DENIED with "rejected by the user"; overwriting that with "denied: a1"
+            # would erase the only part of the record that says *who* refused and why.
+            reasons = [n.error for n in blocked if n.error]
+            result.error = "; ".join(reasons) if reasons else (
+                f"denied: {', '.join(sorted(n.node_id for n in blocked))}"
+            )
+            return ActionState.DENIED
+
+        # A rejection is a decision to refuse, and it has to read as one. Scoped to
+        # the exact sentence a rejection produces: an AUTHORIZATION-kind failure is
+        # not automatically a refusal — a laptop refusing a command it will not run
+        # (`rm`, say) is a capability refusal, and re-labelling that DENIED would
+        # collapse "the human said no" into "the machine could not", the distinction
+        # this platform exists to keep.
+        refused = [
+            n for n in outcomes
+            if n.state is ActionState.FAILED and n.error == "rejected by the user"
+        ]
+        if refused:
+            result.error = refused[0].error
             return ActionState.DENIED
 
         failed = [n for n in outcomes if n.state is ActionState.FAILED]
