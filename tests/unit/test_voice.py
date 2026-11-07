@@ -18,7 +18,7 @@ Concretely:
   side effect of running;
 * spoken success comes from the authoritative record's verified nodes, and a parked run is
   never reported as an outcome;
-* the microphone is still one tap for one utterance, and there is still no audio path.
+* microphone audio is explicitly bounded and reviewed before proposing anything.
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ ALLOWED_TARGETS = {
     "/events/stream-ticket",
     "/executions/",
     "/voiceos/messages",
+    "/voiceos/audio/status",
+    "/voiceos/audio/transcribe",
     "/voiceos/conversation",
     "/voiceos/sessions",
     "/voiceos/sessions/",
@@ -187,7 +189,7 @@ class TestRunningNeedsItsOwnPress(unittest.TestCase):
 
     def test_recognition_never_reaches_execution(self) -> None:
         segment = _segment(self.html, "// -- push to talk --", "</script>")
-        self.assertIn("sendMessage(", segment)
+        self.assertNotIn("sendMessage(", segment)
         self.assertNotIn("runTask", segment)
         self.assertNotIn("/run", segment)
 
@@ -289,33 +291,29 @@ class TestSpeechReportsOnlyWhatTheRecordSays(unittest.TestCase):
         self.assertGreaterEqual(self.html.count("isTerminal("), 3)
 
 
-class TestNoAudioIsCollected(unittest.TestCase):
+class TestExplicitCloudAudioBoundary(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.html = page()
 
-    def test_no_audio_capture_or_upload_primitive_appears(self) -> None:
-        for forbidden in (
-            "MediaRecorder",
-            "getUserMedia",
-            "mediaDevices",
-            "FormData",
-            "application/octet-stream",
-            "base64",
-        ):
-            self.assertNotIn(forbidden, self.html)
-
-    def test_only_text_reaches_the_server(self) -> None:
-        self.assertNotIn("blob:", self.html)
-        self.assertNotIn("ArrayBuffer", self.html)
+    def test_cloud_capture_is_bounded_and_cannot_execute(self) -> None:
+        self.assertIn("const MAX_BYTES = 128 * 1024", self.html)
+        self.assertIn("const MAX_MS = 30000", self.html)
+        self.assertIn("audio: true, video: false", self.html)
+        transcript = _segment(self.html, "onTranscript: (heard)", "const SPEECH_ADAPTERS")
+        self.assertNotIn("sendMessage(", transcript)
+        self.assertNotIn("runTask(", transcript)
+        self.assertIn("dictationRevision !== recordingRevision", transcript)
 
     def test_nothing_is_persisted_beyond_the_tab_credential(self) -> None:
         self.assertNotIn("localStorage", self.html)
         self.assertIn("sessionStorage.getItem(tokenKey)", self.html)
 
-    def test_it_discloses_where_the_audio_actually_goes(self) -> None:
-        self.assertIn("your browser's own speech service", self.html)
-        self.assertIn("ActionMesh receives text", self.html)
+    def test_it_discloses_the_provider_and_the_manual_review_boundary(self) -> None:
+        self.assertIn("Audio provider configured", self.html)
+        self.assertIn("ActionMesh keeps no audio recording", self.html)
+        self.assertIn("dictation alone creates no task and runs nothing", self.html)
+        self.assertIn("cancelDictation", self.html)
 
 
 class TestListeningIsUserInitiatedAndBounded(unittest.TestCase):

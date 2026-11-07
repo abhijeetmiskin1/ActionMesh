@@ -37,6 +37,8 @@ principal checks are server-side.*
 | GET | `/consents` | List consents | `api.py:1594` |
 | GET | `/audit` | Audit records | `api.py:1640` |
 | GET | `/audit/verify` | Verify the hash chain | `api.py:1662` |
+| GET | `/voiceos/audio/status` | Cloud dictation configuration metadata | `api.py:voiceos_audio_status` |
+| POST | `/voiceos/audio/transcribe` | Bounded transient audio → editable text; never executes | `api.py:voiceos_audio_transcribe` |
 | POST | `/voiceos/messages` | VoiceOS message turn | `api.py:1801` |
 | POST | `/voiceos/guide` | Command guide/help | `api.py:1881` |
 | GET | `/voiceos/status` | Provider/planner status | `api.py:1946` |

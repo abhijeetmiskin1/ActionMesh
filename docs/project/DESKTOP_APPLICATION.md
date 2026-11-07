@@ -85,8 +85,11 @@ theme without an explicit requirement.
 ## Dead controls / incomplete screens
 
 - No dark-mode toggle exists (light theme is the only theme).
-- The `image`/`audio` purpose lanes exist in the provider UI but depend
-  on the configured provider's capabilities.
+- Image generation and speech input have compatible 9router adapters. The Home
+  image card previews a bounded raster; microphone buttons share Audio capture.
+  Other listed media vendors remain unavailable until an adapter exists.
+- Window analysis explicitly submits accessibility labels to Reasoning; capture
+  details are metadata only, with no pixel preview or pixel analysis.
 - `about.html` is minimal (app info only).
 - Screen completeness was not live-verified in this pass; test coverage
   for the renderer is fixture-based (`desktop/test/ui_render.test.js`).
@@ -98,3 +101,25 @@ app/provider_bridge.test.js`): `pipeline.test.js`,
 `backend_claim.test.js`, `purpose_ipc.test.js`,
 `purpose_legacy.test.js`, `ui_render.test.js` + stubs. Historical C42
 report: **106 passed** — see [TESTING_AND_ACCEPTANCE.md](TESTING_AND_ACCEPTANCE.md).
+
+
+## Settings navigation and keyboard behavior
+
+AI Providers has its own sidebar page, with independent Chat, Reasoning, Audio,
+and Image cards. Each has a provider, endpoint, model and encrypted key. Chat or
+Reasoning can be chosen for VoiceOS planning; media purposes cannot supply plans.
+Settings is divided into App & permissions, Backend, and About & web pages. Arrow keys, Home and End move between the settings tabs. Unsaved app fields
+survive background refresh and tab changes; Save settings persists them and Discard
+changes restores the saved values. A provider marked Not tested is configured but
+has no successful connection probe in this process.
+
+The provider dialog contains focus, makes the underlying app inert, and closes on
+Escape or its close button, returning focus to the opener. Short windows scroll the
+form while keeping its actions reachable. The light palette and reduced-motion
+preference apply throughout.
+
+Live UI acceptance (uses an isolated profile and does not execute tasks):
+
+```bash
+ACTIONMESH_LIVE_UI=1 .venv/bin/python -m pytest tests/e2e/test_desktop_ui_live.py -q
+```

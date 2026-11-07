@@ -233,6 +233,7 @@ class PageFacts:
     title: str = ""
     epoch: int = 0
     loading: bool = False
+    requested_url: str = ""
 
 
 class BrowserDriver:
@@ -571,7 +572,8 @@ class BridgeDriver(BrowserDriver):
     def _facts(self, result: CommandResult) -> PageFacts:
         if result.epoch is not None:
             self._element_epoch = result.epoch
-        return PageFacts(url=result.url, title=result.title, epoch=self._element_epoch)
+        return PageFacts(url=result.url, title=result.title, epoch=self._element_epoch,
+                         loading=result.loading, requested_url=result.requested_url)
 
     async def open(self, url: str) -> PageFacts:
         return self._facts(await self._drive(OpenCommand(url=url, request_id="open")))
@@ -885,6 +887,23 @@ class BrowserEngine:
             return result
         results = _search_results(records, facts.url)
         return {"status": STATUS_OK, "url": _redact(facts.url, limit=2048), "results": results}
+
+    async def observe(self, *, elements: bool = False) -> dict[str, Any]:
+        """Read bounded page facts without navigation, ref rebuilding, or output."""
+        try:
+            facts = await self._driver.state()
+            count = 0
+            if elements:
+                epoch, records = await self._driver.snapshot_elements(MAX_SNAPSHOT_ELEMENTS)
+                if epoch != facts.epoch:
+                    return {"status": STATUS_UNAVAILABLE}
+                count = len(records)
+        except Exception:
+            return {"status": STATUS_UNAVAILABLE}
+        return {"status": STATUS_OK, "url": _redact(facts.url, limit=2048),
+                "title": _redact(facts.title), "loading": facts.loading,
+                "requested_url": _redact(facts.requested_url, limit=2048),
+                "element_count": count, "count": count}
 
     async def inspect(self) -> dict[str, Any]:
         """Bounded page summary; the full (redacted) element document goes to

@@ -318,6 +318,14 @@ class TestWholeDocumentStreams(unittest.TestCase):
         # The claim under test: what the reader receives parses as a list.
         self.assertEqual(len(json.loads(got[0].payload["chunk"])), 1600)
 
+    def test_browser_elements_arrive_as_a_complete_document(self) -> None:
+        hub = EventHub()
+        document = json.dumps({"elements": [{"ref": i, "name": "item" * 10} for i in range(150)]})
+        self.assertGreater(len(document), MAX_CHUNK_BYTES)
+        got = self._emit_and_receive(hub, self._publisher(hub), "browser.elements", document)
+        self.assertFalse(got[0].payload["truncated"])
+        self.assertEqual(len(json.loads(got[0].payload["chunk"])["elements"]), 150)
+
     def test_a_document_over_its_ceiling_is_refused_rather_than_cut(self) -> None:
         hub = EventHub()
         publisher = self._publisher(hub, max_document_bytes=64)
@@ -344,10 +352,10 @@ class TestWholeDocumentStreams(unittest.TestCase):
         self.assertEqual(len(got[0].payload["chunk"]), MAX_CHUNK_BYTES)
         self.assertTrue(got[0].payload["truncated"])
 
-    def test_only_the_element_stream_is_framed_as_a_document(self) -> None:
+    def test_element_documents_are_framed_whole(self) -> None:
         # The rule is a set, not a special case buried in a branch: this pins membership
         # so adding a stream to it is a deliberate act with a test to match.
-        self.assertEqual(WHOLE_DOCUMENT_STREAMS, frozenset({"elements"}))
+        self.assertEqual(WHOLE_DOCUMENT_STREAMS, frozenset({"elements", "browser.elements"}))
 
 
 class TestContextVarSeam(unittest.TestCase):

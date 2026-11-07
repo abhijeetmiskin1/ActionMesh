@@ -5,7 +5,7 @@ layer that was missing the effect journal: every ``browser.*``, ``device.files.*
 and ``media.*`` action dispatched through ``LaptopProvider.execute`` records its
 read-back via the provider-owned ``_effects`` map, persists it through the one
 existing ``_journal_effect`` ledger write, and is recovered by ``observe()``
-without a second browser page request or a second MPRIS query.
+with fresh, read-only browser and MPRIS observations.
 
 Behavioural contract (all assertions here are about observable outcomes, never
 about which line recorded them):
@@ -102,7 +102,7 @@ def _ledger_row(store: SQLiteStore, action: Action) -> dict:
 
 
 # =============================================================================
-# Registration: the 33 C42 operations are in IMPLEMENTED, gated, and advertised
+# Registration: browser, file and media operations are implemented and advertised
 # =============================================================================
 
 class TestC42Registration(unittest.TestCase):
@@ -111,12 +111,12 @@ class TestC42Registration(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         self.provider = LaptopProvider(Workspace(self.root))
 
-    def test_the_33_operations_are_registered_and_supported(self) -> None:
+    def test_browser_file_and_media_operations_are_registered_and_supported(self) -> None:
         browser = {c for c in CAPABILITIES if c.startswith("browser.")}
         files = {c for c in CAPABILITIES if c.startswith("device.files.")}
         media = {c for c in CAPABILITIES if c.startswith("media.")}
         self.assertEqual(len(browser), 14, browser)
-        self.assertEqual(len(files), 11, files)
+        self.assertEqual(len(files), 12, files)
         self.assertEqual(len(media), 8, media)
         for capability in browser | files | media:
             self.assertIn(capability, IMPLEMENTED, capability)
@@ -189,6 +189,18 @@ class TestBrowserThroughProvider(unittest.TestCase):
         self.assertIsNotNone(observed)
         self.assertIn("element_count", observed["state"])
 
+    def test_click_accepts_the_registry_string_ref(self) -> None:
+        _run(_action("browser.open", url="https://search.test/?q=pizza"), self.provider)
+        snap = _run(_action("browser.snapshot"), self.provider)
+        ref = str(snap.data["refs"][0])
+        result = _run(_action("browser.click", ref=ref), self.provider)
+        self.assertEqual(result.data["status"], "ok")
+
+    def test_click_rejects_selectors_and_non_handles(self) -> None:
+        for ref in [True, -1, "1.5", "button", "1;code", "0", "999999999999999999999999"]:
+            with self.subTest(ref=ref), self.assertRaises(ProviderError):
+                _run(_action("browser.click", ref=ref), self.provider)
+
     def test_click_after_navigation_with_a_stale_ref_records_nothing(self) -> None:
         _run(_action("browser.open", url="https://search.test/?q=pizza"), self.provider)
         snap = _run(_action("browser.snapshot"), self.provider)
@@ -257,7 +269,7 @@ class TestBrowserThroughProvider(unittest.TestCase):
         self.assertEqual(result.data["status"], "ok")
         observed = self.provider.observe(action)
         self.assertIsNotNone(observed)
-        self.assertIn("results", observed["state"])
+        self.assertTrue(observed["state"]["page_available"])
         # Search navigated; it never clicked.
         new_kinds = [a["action"] for a in drv.actions[len(before):]]
         self.assertNotIn("click", new_kinds)
@@ -412,8 +424,8 @@ class TestMediaThroughProvider(unittest.TestCase):
         result = _run(action, self.provider)
         self.assertEqual(result.data["status"], "ok")
         observed = self.provider.observe(action)
-        self.assertIsNotNone(observed)
-        self.assertTrue(observed["state"]["opened"])
+        # The launcher receipt cannot prove which track a player opened.
+        self.assertFalse(observed["postcondition_observed"])
 
 
 # =============================================================================
@@ -458,13 +470,12 @@ class TestFilesThroughProvider(unittest.TestCase):
         self.assertIn(action.action_id, self.provider._effects)
         self.assertTrue(os.path.exists(os.path.join(self.root, "new.txt")))
 
-    def test_rename_move_copy_edit_trash_record_effects(self) -> None:
+    def test_rename_move_copy_edit_record_effects(self) -> None:
         cases = (
             ("device.files.rename", {"path": "hello.txt", "to": "renamed.txt"}),
             ("device.files.copy", {"path": "renamed.txt", "to": "copied.txt"}),
             ("device.files.edit", {"path": "copied.txt", "find": "hello", "replace": "goodbye"}),
             ("device.files.move", {"path": "copied.txt", "to": "moved.txt"}),
-            ("device.files.trash", {"path": "moved.txt"}),
         )
         for op, params in cases:
             action, result = self._exec(op, **params)
@@ -509,15 +520,14 @@ class TestEffectJournal(unittest.TestCase):
         _run(action, provider)
         self.assertIsNone(store.get_dispatch(action.action_id))
 
-    def test_observe_after_restart_recovers_from_the_ledger(self) -> None:
+    def test_observe_after_restart_does_not_confirm_a_historical_browser_receipt(self) -> None:
         store = SQLiteStore()
         provider = _browser_provider(ledger=store)
         action = _action("browser.open", url="https://search.test/?q=pizza")
         _run(action, provider)
         fresh = _browser_provider(ledger=store)
         recovered = fresh.observe(action)
-        self.assertIsNotNone(recovered)
-        self.assertEqual(recovered["parameters"]["url"], "https://search.test/?q=pizza")
+        self.assertIsNone(recovered)
 
     def test_journal_never_carries_page_content_or_credentials(self) -> None:
         store = SQLiteStore()

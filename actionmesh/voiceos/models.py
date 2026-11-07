@@ -64,6 +64,7 @@ class TaskStep:
     state: str = "pending"
     execution_id: str = ""
     verified: bool | None = None
+    simulated: bool | None = None
     observed: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     #: C36 — the computer this step is addressed to, resolved when the plan was made.
@@ -123,6 +124,7 @@ class TaskStep:
             "state": self.state,
             "execution_id": self.execution_id,
             "verified": self.verified,
+            "simulated": self.simulated,
             "observed": dict(self.observed),
             "error": self.error,
             "device_id": self.device_id,
@@ -152,6 +154,7 @@ class TaskStep:
             state=str(raw.get("state") or "pending"),
             execution_id=str(raw.get("execution_id") or ""),
             verified=raw.get("verified"),
+            simulated=raw.get("simulated") if isinstance(raw.get("simulated"), bool) else None,
             observed=dict(raw.get("observed") or {}),
             error=str(raw.get("error") or ""),
             device_id=str(raw.get("device_id") or ""),

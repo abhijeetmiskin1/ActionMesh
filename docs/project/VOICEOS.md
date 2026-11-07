@@ -5,11 +5,16 @@ the same API, planner, consent, and approval machinery — with **no engine
 of its own**. "VoiceOS presses; it does not decide." (Source:
 `docs/voiceos.md`, `PROJECT.md`.)
 
+Current conversational behavior: the configured model can answer questions and ask
+for missing details without creating a session. The same validated plan response
+carries a bounded optional `reply`; actions still travel through the pipeline below.
+Only up to three prior user messages are sent as context, never assistant observations.
+
 ## The route from a spoken command to an executed operation
 
 ```text
 1. Speech recognition (renderer, desktop/ui/voice.js)
-   — browser speech API; transcript is editable; text fallback
+   — configured Audio provider through private IPC; editable transcript; text fallback
 2. POST /voiceos/messages  (api.py)
 3. Task template match — voiceos/tasks.py::match_template
    OR LLM plan — voiceos/llm.py::LlmPlanner.plan (untrusted)
@@ -30,7 +35,7 @@ of its own**. "VoiceOS presses; it does not decide." (Source:
 
 | Concern | Implementation |
 |---|---|
-| Voice input / speech recognition | `desktop/ui/voice.js` (browser SpeechRecognition; microphone text is the only thing sent — there is **no audio-capture path** to the backend) |
+| Voice input / speech recognition | `desktop/ui/voice.js` (Audio-provider capture through main IPC); web `/voice` uses bounded transient cloud dictation through the existing private provider bridge |
 | Transcript editing | Editable textarea in the Voice view (`#voiceTranscript`); "Send Transcript" button |
 | Text fallback | The same textarea + command input on Home/Tasks; quick-grid commands (`#quickGrid`) |
 | Spoken feedback | Renderer speech synthesis; `#voiceStopSpeaking` |
@@ -75,11 +80,12 @@ the full ActionMesh pipeline, diagnose failures (`POST
 /automations/draft`), run/cancel sessions, speak results.
 
 **Cannot:** grant permissions, lower risk, bypass approval, reach the
-consent surface, send audio to the backend, or invent parameters/steps
+consent surface, persist microphone recordings, or invent parameters/steps
 outside registered definitions. There is no second execution engine.
 
 ## API surface (VoiceOS)
 
+`GET /voiceos/audio/status`, `POST /voiceos/audio/transcribe`,
 `POST /voiceos/messages`, `POST /voiceos/guide`, `GET /voiceos/status`,
 `GET /voiceos/conversation`, `GET /voiceos/sessions`,
 `GET /voiceos/sessions/{session_id}`, `POST

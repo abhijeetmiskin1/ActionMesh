@@ -622,15 +622,17 @@ def _food_query_from(text: str) -> str:
 
 
 _FOOD_ORDER_RX = re.compile(
-    r"\b(?:order|buy|place an order for|get me)\b[^.]{0,60}", re.I
+    r"^(?:please\s+)?(?:order|buy|place an order for|get me)\b", re.I
 )
 _FOOD_DISCOVER_RX = re.compile(
-    r"(?:\b(?:show|find|search|discover|look for|looking for|browse)\b[^.]{0,60}"
-    r"|\bshow me\b[^.]{0,60}"
-    r"|(?:^|\s)(?:open|launch|start|go to|visit|check)\s+(?:the\s+)?"
-    r"(?:zomato|swiggy|uber\s*eats|door\s*dash|deliveroo|food\s+\w+|food delivery)\b)",
-    re.I,
+    r"^(?:please\s+)?(?:show|find|search|discover|look for|looking for|browse|"
+    r"open|launch|start|go to|visit|check)\b", re.I
 )
+_FOOD_TOPIC_RX = re.compile(
+    r"\b(?:zomato|restaurants?|food(?: delivery)?|pizza|burgers?|biryani|sushi|"
+    r"sandwich(?:es)?|noodles|tacos?|dosa|momos|takeout|takeaway)\b", re.I
+)
+_LOCAL_TOPIC_RX = re.compile(r"\b(?:files?|folders?|documents?|receipts?|logs?|disk space)\b", re.I)
 _TRAIN_BOOK_RX = re.compile(
     r"\b(?:book|reserve|purchase)\b[^.]{0,24}?\b(?:train|trains|ticket)s?\b", re.I
 )
@@ -641,12 +643,8 @@ _TRAIN_SEARCH_RX = re.compile(
     re.I,
 )
 _BOOK_TRIGGERS = ("book", "booking", "reserve", "ticket")
-# Explicit-web wording only. A bare "search for X" / "look up X" is NOT a web
-# template on its own: "search for <food>" has always been food discovery, and
-# a generic "look up X" belongs to the LLM planner (which proposes the
-# registered ``search.web`` action through the normal policy path). Routing
-# those here would shadow both — see the pinned regressions in
-# tests/unit/test_phase4_templates.py::TestWebIntentDoesNotShadow.
+# Bare search wording belongs to the planner unless it names a supported food
+# topic or website. Explicit web search is checked before food intent.
 _WEB_SEARCH_RX = re.compile(
     r"\b(?:search the web for|search the internet for|web search for|"
     r"browse the web for|google)\s+(.+?)\s*$",
@@ -678,21 +676,20 @@ def _web_query_from(text: str) -> str:
 def match_website_intent(text: str) -> str | None:
     """The website template a sentence maps to, or ``None`` when none matches.
 
-    Consequential intents are tested first: an ordering verb anywhere in the
-    request maps to ``food.order`` (never ``food.discover``), and a booking verb
-    near "train" maps to ``train.book``. ``None`` means the caller must not
-    reach for a browser template here at all.
+    Food discovery and ordering require a food topic or supported site.
+    ``None`` means the caller must not choose a browser template here.
     """
     cleaned = " ".join(text.lower().split())
-    if _FOOD_ORDER_RX.search(cleaned) and _food_query_from(cleaned):
+    if _WEB_SEARCH_RX.match(cleaned):
+        return "web.search"
+    food = _FOOD_TOPIC_RX.search(cleaned) and not _LOCAL_TOPIC_RX.search(cleaned)
+    if food and _FOOD_ORDER_RX.match(cleaned) and _food_query_from(cleaned):
         return "food.order"
     if _TRAIN_BOOK_RX.search(cleaned):
         return "train.book"
     if _TRAIN_SEARCH_RX.search(cleaned):
         return "train.search"
-    if _WEB_SEARCH_RX.search(cleaned):
-        return "web.search"
-    if _FOOD_DISCOVER_RX.search(cleaned):
+    if food and _FOOD_DISCOVER_RX.match(cleaned):
         return "food.discover"
     return None
 

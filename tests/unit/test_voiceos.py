@@ -28,6 +28,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
+from actionmesh.agent.definitions import register_device_actions
 from actionmesh.api import create_app
 from actionmesh.core.devices import DeviceRegistry
 from actionmesh.core.identity import IdentityStore
@@ -144,6 +145,30 @@ class _PairedApp(unittest.TestCase):
 
 
 class TestAMessageIsNotAPress(_PairedApp):
+    def test_website_navigation_requires_review_even_for_explicit_search(self) -> None:
+        register_device_actions(self.app.state.engine.registry)
+        answer = self.tell(self.local, "Search the web for pizza")
+        self.assertEqual(answer["kind"], "task")
+        before = len(self.local.get("/executions").json())
+        result = self.local.post(
+            f"/voiceos/sessions/{answer['session_id']}/run",
+            json={"actor": {"id": "voiceos-local"}, "hands_free": True},
+        ).json()
+        self.assertTrue(result["review_required"])
+        self.assertEqual(len(self.local.get("/executions").json()), before)
+
+    def test_hands_free_keeps_unlisted_actions_in_review(self) -> None:
+        before = len(self.local.get("/executions").json())
+        answer = self.tell(self.local, "tell mom I'll be late")
+        response = self.local.post(
+            f"/voiceos/sessions/{answer['session_id']}/run",
+            json={"actor": {"id": "voiceos-local"}, "hands_free": True},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["review_required"])
+        self.assertEqual(response.json()["steps"][0]["state"], "pending")
+        self.assertEqual(len(self.local.get("/executions").json()), before)
+
     def test_understanding_creates_no_execution(self) -> None:
         before = len(self.local.get("/executions").json())
         answer = self.tell(self.local, "tell mom I'll be late")

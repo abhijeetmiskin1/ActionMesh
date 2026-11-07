@@ -63,7 +63,7 @@ class TestNlToTemplateIntent(unittest.TestCase):
         self.assertEqual(session.steps[1].parameters.get("query"), "pizza")
 
     def test_search_speed_render_asks_for_the_query(self) -> None:
-        text = "search for speed render near me"
+        text = "search Zomato for speed render near me"
         self.assertEqual(match_website_intent(text), "food.discover")
         self.assertEqual(extract_website_fields(text, "food.discover"), {"food.query": "speed render"})
 
@@ -204,3 +204,19 @@ class TestNoInventedFields(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestFoodIntentRequiresACue(unittest.TestCase):
+    def test_local_and_ambiguous_searches_do_not_plan_external_actions(self) -> None:
+        for text in (
+            "Find my tax files", "Show my disk space", "Find the Python docs",
+            "Buy a laptop", "Find my restaurant receipts", "Search for speed render near me",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(match_website_intent(text))
+
+    def test_explicit_food_discovery_is_preserved(self) -> None:
+        self.assertEqual(match_website_intent("Show me pizza near me"), "food.discover")
+        self.assertEqual(match_website_intent("Open Zomato and show me pizza"), "food.discover")
+        self.assertEqual(match_website_intent("Order pizza"), "food.order")
+        self.assertEqual(match_website_intent("Search the web for pizza"), "web.search")

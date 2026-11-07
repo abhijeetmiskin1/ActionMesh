@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hmac
 import json
 import os
 import sqlite3
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
@@ -26,6 +29,7 @@ from actionmesh.agent.provider import LaptopProvider
 from actionmesh.agent.runner import CommandRunner
 from actionmesh.agent.verification import register_device_strategies
 from actionmesh.core.audit import AuditLog, FileAuditAnchor, SqliteAuditBackend
+from actionmesh.core.concurrency import BoundedWorkers, RequestBusy, RequestGate
 from actionmesh.core.config import AppConfig
 from actionmesh.core.credentials import Credential, CredentialError, CredentialStore
 from actionmesh.core.devices import DeviceRegistry, SQLiteDeviceRegistry
@@ -571,15 +575,21 @@ def create_app(
     if not voiceos_db and app_config.audit_db:
         voiceos_db = str(Path(str(app_config.audit_db)).with_name("voiceos.db"))
 
+    state_init_lock = threading.RLock()
+    voice_turns = RequestGate(max_active=8)
+    voice_workers = BoundedWorkers(limit=8)
+    audio_workers = BoundedWorkers(limit=2)
+
     def _voiceos_store() -> VoiceOsStore:
-        # Opened on first VoiceOS turn, not on import: a server that never serves one
-        # should not be holding a database handle, and a handle nobody owns is how a
-        # suite stops being warning-clean.
-        opened = getattr(app.state, "voiceos_store_instance", None)
-        if opened is None:
-            opened = VoiceOsStore(voiceos_db or ":memory:")
-            app.state.voiceos_store_instance = opened
-        return opened
+        with state_init_lock:
+            # Opened on first VoiceOS turn, not on import: a server that never serves one
+            # should not be holding a database handle, and a handle nobody owns is how a
+            # suite stops being warning-clean.
+            opened = getattr(app.state, "voiceos_store_instance", None)
+            if opened is None:
+                opened = VoiceOsStore(voiceos_db or ":memory:")
+                app.state.voiceos_store_instance = opened
+            return opened
     app.state.voiceos_orchestrator = Orchestrator(engine=engine)
     #: C39 — automations. A sixth store family, beside the VoiceOS one and opened the
     #: same lazy way: a process that never touches an automation should not be holding
@@ -592,47 +602,50 @@ def create_app(
         automations_db = str(Path(str(app_config.audit_db)).with_name("automations.db"))
 
     def _automation_store() -> AutomationStore:
-        opened = getattr(app.state, "automation_store_instance", None)
-        if opened is None:
-            try:
-                opened = AutomationStore(automations_db or ":memory:")
-            except sqlite3.Error as exc:
-                # An unwritable automation file must not stop the service. Refusing to
-                # start would take the whole product down over a feature nobody used
-                # yet; falling back to memory means automations do not survive a
-                # restart, which the store's own `mode` says out loud.
-                app.state.automation_store_note = (
-                    f"automations are not durable: {automations_db} could not be "
-                    f"opened ({exc}); this process keeps them in memory only"
-                )
-                opened = AutomationStore(":memory:")
-            else:
-                app.state.automation_store_note = (
-                    "" if automations_db else
-                    "automations are not durable: no database path is configured, "
-                    "so this process keeps them in memory only"
-                )
-            app.state.automation_store_instance = opened
-        return opened
+        with state_init_lock:
+            opened = getattr(app.state, "automation_store_instance", None)
+            if opened is None:
+                try:
+                    opened = AutomationStore(automations_db or ":memory:")
+                except sqlite3.Error as exc:
+                    # An unwritable automation file must not stop the service. Refusing to
+                    # start would take the whole product down over a feature nobody used
+                    # yet; falling back to memory means automations do not survive a
+                    # restart, which the store's own `mode` says out loud.
+                    app.state.automation_store_note = (
+                        f"automations are not durable: {automations_db} could not be "
+                        f"opened ({exc}); this process keeps them in memory only"
+                    )
+                    opened = AutomationStore(":memory:")
+                else:
+                    app.state.automation_store_note = (
+                        "" if automations_db else
+                        "automations are not durable: no database path is configured, "
+                        "so this process keeps them in memory only"
+                    )
+                app.state.automation_store_instance = opened
+            return opened
 
     app.state.automation_store_note = ""
 
     def _automation_runner() -> Runner:
-        runner = getattr(app.state, "automation_runner_instance", None)
-        if runner is None:
-            runner = Runner(
-                orchestrator=app.state.voiceos_orchestrator,
-                save_session=_voiceos_store().save_session,
-            )
-            app.state.automation_runner_instance = runner
-        return runner
+        with state_init_lock:
+            runner = getattr(app.state, "automation_runner_instance", None)
+            if runner is None:
+                runner = Runner(
+                    orchestrator=app.state.voiceos_orchestrator,
+                    save_session=_voiceos_store().save_session,
+                )
+                app.state.automation_runner_instance = runner
+            return runner
 
     def _automation_scheduler() -> Scheduler:
-        scheduler = getattr(app.state, "automation_scheduler_instance", None)
-        if scheduler is None:
-            scheduler = Scheduler(store=_automation_store(), runner=_automation_runner())
-            app.state.automation_scheduler_instance = scheduler
-        return scheduler
+        with state_init_lock:
+            scheduler = getattr(app.state, "automation_scheduler_instance", None)
+            if scheduler is None:
+                scheduler = Scheduler(store=_automation_store(), runner=_automation_runner())
+                app.state.automation_scheduler_instance = scheduler
+            return scheduler
 
     app.state.automation_scheduler = _automation_scheduler
 
@@ -855,7 +868,7 @@ def create_app(
     #: says so, so a request is never silently answered by a machine that stayed
     #: quiet. A deployment with no provider gets the rules alone, unchanged.
     voiceos_planner = build_planner(
-        voiceos_provider, app.state.planner, engine.registry.has
+        voiceos_provider, app.state.planner, engine.registry.has, registry=engine.registry
     )
     app.state.voiceos_planner = voiceos_planner
     #: C36 — the analyst, the object that explains a log the system actually read.
@@ -1833,6 +1846,54 @@ def create_app(
             )
         return out
 
+    @app.get("/voiceos/audio/status")
+    async def voiceos_audio_status(request: Request) -> dict[str, Any]:
+        _voiceos_actor(request, {})
+        _throttle("voiceos", _credential_key(request))
+        config = bridge_config_from_env()
+        if not config.configured:
+            return {"configured": False, "max_bytes": model_bridge.MAX_WEB_AUDIO_BYTES}
+        try:
+            return await audio_workers.run(model_bridge.audio_status, config)
+        except (BridgeError, BridgeUnavailable):
+            return {"configured": False, "max_bytes": model_bridge.MAX_WEB_AUDIO_BYTES}
+        except RequestBusy as exc:
+            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "2"}) from exc
+
+    @app.post("/voiceos/audio/transcribe")
+    async def voiceos_audio_transcribe(request: Request) -> dict[str, Any]:
+        # Audio is transient input, never a task, event, audit row or execution.
+        _voiceos_actor(request, {})
+        _throttle("voiceos", _credential_key(request))
+        if request.headers.get("content-type", "").split(";")[0] != "application/json":
+            raise HTTPException(status_code=415, detail="Send the recording as JSON.")
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > 180_000:
+                raise HTTPException(status_code=413, detail="The recording exceeds the web audio limit.")
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict) or set(payload) != {"audio"} or not isinstance(payload["audio"], str):
+                raise ValueError("invalid fields")
+            audio = base64.b64decode(payload["audio"], validate=True)
+            if not audio or len(audio) > model_bridge.MAX_WEB_AUDIO_BYTES:
+                raise ValueError("invalid size")
+        except (ValueError, binascii.Error, UnicodeDecodeError, RecursionError) as exc:
+            raise HTTPException(status_code=400, detail="The recording is invalid or too large.") from exc
+        config = bridge_config_from_env()
+        if not config.configured:
+            raise HTTPException(status_code=503, detail="Configure the desktop Audio provider for cloud transcription.")
+        try:
+            text = await audio_workers.run(model_bridge.transcribe, config, audio)
+        except RequestBusy as exc:
+            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "2"}) from exc
+        except (BridgeError, BridgeUnavailable) as exc:
+            raise HTTPException(status_code=503, detail="Cloud transcription failed; check the Audio provider.") from exc
+        if not text:
+            raise HTTPException(status_code=422, detail="No speech was detected.")
+        return {"text": text, "ran": False, "stored": False}
+
     @app.post("/voiceos/messages")
     async def voiceos_message(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
         """One conversational turn. It understands and proposes; it never runs."""
@@ -1841,6 +1902,13 @@ def create_app(
         if not isinstance(text, str) or not text.strip():
             raise HTTPException(status_code=400, detail="text must be a non-empty string")
         actor = _voiceos_actor(request, payload)
+        try:
+            with voice_turns.claim(actor):
+                return await _voiceos_turn(actor, text)
+        except RequestBusy as exc:
+            raise HTTPException(status_code=503 if exc.capacity else 409, detail=str(exc)) from exc
+
+    async def _voiceos_turn(actor: str, text: str) -> dict[str, Any]:
         store: VoiceOsStore = _voiceos_store()
         conversation = store.get_conversation(actor)
         conversation.active_session = (
@@ -1862,7 +1930,7 @@ def create_app(
         # thread. `plan` refuses to dial on a loop thread and falls back with a note,
         # which means this offload is the difference between a working model and a
         # stated non-answer rather than a silent stall.
-        understanding = await asyncio.to_thread(reasoner.understand, text, conversation)
+        understanding = await voice_workers.run(reasoner.understand, text, conversation)
         reply = understanding.reply
         if understanding.kind == "clear":
             store.clear_conversation(actor)
@@ -2145,6 +2213,15 @@ def create_app(
         credential = getattr(request.state, "credential", None)
         _throttle("voiceos", _credential_key(request))
         session = _voiceos_load(session_id, _record_scope(request))
+        if payload.get("hands_free") is True and (
+            credential is not None
+            or session.actor_id != "voiceos-local"
+            or _voiceos_actor(request, payload) != session.actor_id
+            or not app.state.voiceos_orchestrator.can_start_from_voice(
+                session, _voiceos_local_device_id()
+            )
+        ):
+            return {**session.to_dict(), "review_required": True}
         context = _context(
             payload,
             app.state.consent_store,
@@ -2155,9 +2232,14 @@ def create_app(
         # Write the name of each execution to the step *before* awaiting it. If this
         # request dies mid-step, the session on disk still points at the run, and the
         # next reader can ask the durable record what became of it instead of guessing.
-        outcome = await app.state.voiceos_orchestrator.advance(
-            session, context, checkpoint=store.save_session
-        )
+        from actionmesh.voiceos.orchestrator import SessionBusyError
+
+        try:
+            outcome = await app.state.voiceos_orchestrator.advance(
+                session, context, checkpoint=store.save_session
+            )
+        except SessionBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         updated: TaskSession = outcome["session"]
         store.save_session(updated)
         conversation = store.get_conversation(updated.actor_id)
@@ -2237,15 +2319,18 @@ def create_app(
         question = str(meta.get("question") or session.request or "").strip()
         computer = str(meta.get("computer") or session.device_id or "")
         # The analyst makes one blocking HTTPS call; this must not happen on the loop.
-        result = await asyncio.to_thread(
-            analyze,
-            question=question,
-            excerpt=excerpt,
-            analyst=app.state.voiceos_analyst,
-            analyst_note=str(app.state.voiceos_analyst_note or ""),
-            computer=computer,
-            source=step.label,
-        )
+        try:
+            result = await voice_workers.run(
+                analyze,
+                question=question,
+                excerpt=excerpt,
+                analyst=app.state.voiceos_analyst,
+                analyst_note=str(app.state.voiceos_analyst_note or ""),
+                computer=computer,
+                source=step.label,
+            )
+        except RequestBusy as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         body = _diagnosis_body(result, computer=computer, step=step)
         if asked is not None and result.status == "diagnosed":
             # The analysis step counts as answered only when a *cause or fix* was

@@ -16,6 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const store = {
+  commandLineSwitches: new Set(),
   handlers: new Map(),
   invoked: [],
   windows: [],
@@ -143,6 +144,7 @@ const appState = {
 };
 
 const app = {
+  commandLine: { appendSwitch(name) { store.commandLineSwitches.add(name); } },
   isPackaged: false,
   getPath(name) {
     if (name === 'userData') return userData;

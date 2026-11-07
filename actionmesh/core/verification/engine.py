@@ -14,6 +14,7 @@ An action type with no registered strategy is reported ``UNSUPPORTED`` — not
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -156,6 +157,8 @@ class VerificationEngine:
         if observed.get("action_type") not in (None, action.type):
             return "mismatch", f"observed state is for a different action than {action.type!r}"
 
+        if observed.get("postcondition_observed") is False:
+            return "uninformative", "the requested effect has no independent read-back"
         key = observed.get("idempotency_key")
         recorded = observed.get("parameters")
         if key is None and not isinstance(recorded, dict):
@@ -169,6 +172,25 @@ class VerificationEngine:
                 if field in recorded and not _fields_match(value, recorded[field]):
                     return "mismatch", f"observed {field!r} does not match what was requested"
 
+        if key is None and (
+            not action.parameters or not isinstance(recorded, dict)
+            or any(field not in recorded for field in action.parameters)
+        ):
+            return "uninformative", "observation lacks request identity or complete identifying fields"
+        matched_fields = isinstance(recorded, dict) and any(
+            field in recorded for field in (action.parameters or {})
+        )
+        state = observed.get("state")
+        if not matched_fields and not (key and isinstance(state, dict) and state):
+            return "uninformative", "observation contains no identifying postcondition"
+        if action.type in {"device.file.write", "device.files.create"}:
+            content = action.parameters.get("content")
+            if isinstance(content, str):
+                digest = state.get("sha256") if isinstance(state, dict) else None
+                if digest is None:
+                    return "uninformative", "write observation has no content digest"
+                if digest != hashlib.sha256(content.encode("utf-8")).hexdigest():
+                    return "mismatch", "observed file digest does not match requested content"
         return "match", f"observed state matches: {self._summarise(observed)}"
 
     def _summarise(self, observed: dict[str, Any]) -> str:

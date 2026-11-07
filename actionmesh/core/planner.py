@@ -59,6 +59,8 @@ class Plan:
     intent: str
     actions: tuple[ProposedAction, ...] = ()
     notes: tuple[str, ...] = ()
+    # Advisory text only; never consumed by graph construction or the executor.
+    reply: str = ""
 
     @property
     def empty(self) -> bool:

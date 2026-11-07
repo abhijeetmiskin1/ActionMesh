@@ -6,16 +6,38 @@ front of the pipeline that already exists, and inherits every decision that pipe
 makes.
 
 ```text
-SPEECH → TRANSCRIPT → CONVERSATION → TASK SESSION → [press] → STEP (execute → approve
+SPEECH → TRANSCRIPT → CONVERSATION → TASK SESSION → START → STEP (execute → approve
         → verify) → observed result → next step or stop → summary → VOICE
   VoiceOS drives the interaction; ActionMesh makes every one of those decisions.
 ```
 
-**Status: C32 + C33 + C34.** `GET /voice` is a conversation: push-to-talk → transcript →
-a proposed **task session** → a press that advances one authorised step → the existing
-approval gate → SSE → verification → spoken result, with conditional next steps and
-references to what was just observed. A real LLM provider is **not** wired up (see *Why
-no model is called*), and neither is a device picker — see *What is not built*.
+Cloud recording finishes after a short pause following speech (about one second),
+with manual Stop and a 30-second maximum as fallbacks. Eight seconds without detected
+speech cancels without upload. Audio level monitoring is local and exists only during
+an explicit recording. On desktop, the final spoken transcript is submitted
+automatically. Eligible tasks for the local laptop start through the normal task
+runner, and VoiceOS reads out the result. Typed requests and other plans stay in
+review. The web Voice page retains its separate review flow.
+
+**Current status (2026-11-07):** cloud dictation uses the configured Audio lane;
+editable transcripts reach `/voiceos/messages`. The model can answer ordinary questions,
+ask clarifications, or propose task steps. Every execution still goes through policy
+checks and any required approval. Earlier slice-1 limitations below describe the web
+Voice page and historical desktop behavior.
+
+The tested desktop configuration uses 9router at `http://127.0.0.1:20128/api/v1`:
+Chat and Reasoning use `groq/openai/gpt-oss-120b`; Audio uses
+`groq/whisper-large-v3-turbo`. No model training is required. A bounded JSON schema is
+included in compatible-endpoint prompts; model replies are at most 4,000 characters.
+Only the current message, up to three prior **user** messages (1,000 characters each),
+and registered action names/descriptions with static input names/types enter planning. Assistant diagnostics, file
+contents and observed device state are excluded from this conversational context.
+Clear conversation also clears the remembered requests.
+
+Ordinary replies and clarifications create no task and run nothing. A dropped or invalid
+action cannot be disguised as a conversational success. Model answers are advisory;
+they do not establish facts about the live computer. The catalogue budget now includes
+all 76 definitions in the full test registry, rather than silently clipping at 60.
 
 ---
 
@@ -45,45 +67,37 @@ matters:
 5. **Nothing here is a second authority.** No new endpoint that grants, approves, revokes
    or executes was added. `/voice` serves a document.
 
-## Microphone: how it is opened, and what it costs
+## Microphone and cloud dictation (2026-11-07)
 
-**User-initiated only.** One tap on the microphone opens it for **one utterance**. It is
-never started on page load, `continuous` is explicitly `false`, `onend` deliberately does
-not restart it (an `onend` that re-opens the recognizer turns one deliberate tap into
-permanent listening), and the page stops recognition when it goes to the background. The
-control stays clickable while it is listening, because the second tap is how you stop.
+Recording starts only from an explicit microphone press. The web Voice page uses
+WebM/Opus capture when available: at most 30 seconds / 128 KiB at 32 kbit/s. A
+second press stops capture; Cancel dictation or hiding the page cancels the local
+session and discards late answers. Microphone tracks stop before uploading.
 
-**No audio is collected by this product.** The page contains no `getUserMedia`, no
-`mediaDevices`, no `MediaRecorder`, no `FormData`, no base64, no `ArrayBuffer` and no
-`blob:` — pinned by tests. What leaves the browser is the recognizer's **text result**, and
-that text is the only thing the page can send. Nothing is recorded, nothing is stored on
-the device, and there is no `localStorage`; the pairing token lives in `sessionStorage` for
-the tab, as in the control room.
+The authenticated audio endpoints forward transient audio through the existing
+AF_UNIX provider bridge. Only Electron main reads the stored Audio API key and
+calls the configured transcription provider. Python and the page never receive
+that credential. Audio is not stored, audited, added to a conversation, or treated
+as an action. Uploaded audio cannot be recalled after cancellation. The page
+explains this boundary before recording.
 
-**The honest part.** Browser-native speech recognition is *the browser vendor's* service.
-On desktop Chrome the audio goes to Google's speech servers; on Android it is handled by
-Google's speech service; a WebView or a browser without the API has **no** microphone path
-at all and falls back to typing. This is stated on the page itself, not buried here,
-because "voice, but private" would be a false claim. The ActionMesh server never sees the
-audio — but the vendor may.
+Dictation inserts editable text. A manual edit made while transcription is pending
+is preserved. Pressing Ask VoiceOS is still required to propose anything; running
+and approvals remain separate per-action presses. Neither cloud nor native
+recognition auto-submits the transcript. Browser-native recognition is a fallback
+when capture APIs are absent, using the browser vendor's speech service. Typing
+always remains available. Secure-context and platform microphone permissions are
+required; Android WebView/physical-device acceptance is not implied.
 
-## Why browser-native recognition, and not the alternatives
+The desktop's web-page session grants audio-only microphone access only to the
+current backend's Voice page. Camera, other origins and other pages are refused.
+The session attaches its API header only to the exact backend origin and port.
 
-The charter asks for an evaluation *before* enabling speech, so this is the record:
+## Historical slice-1 omissions (superseded)
 
-| Option | What it would mean | Verdict |
-| --- | --- | --- |
-| `SpeechRecognition` (Web Speech API) | Zero dependencies, zero new server surface, no audio leaves the ActionMesh host. Privacy boundary moves to the browser vendor. Not available in a plain Android WebView, and Chrome-desktop-only in practice. | **Chosen**, with the vendor disclosure above and a text path that is always usable. |
-| Server-side STT (a cloud transcription API) | Outbound network calls from the server, an audio upload path, a credential in the deployment, and ActionMesh becoming the thing that hears you. The repository bans outbound-network imports outside an explicitly reviewed allowlist. | **Refused** for now. It contradicts "no credentials in source", the outbound-network guard, and the privacy posture the dashboard currently has. |
-| On-device model (WASM/whisper.cpp binding) | A real dependency or a binary, plus a build step and a memory cost on a phone. | **Refused** for slice 1: "do not introduce unnecessary frameworks or dependencies." Revisit only with a product reason. |
-| `MediaRecorder` + a recording button | Would capture audio ourselves and store or forward it. | **Refused**: the charter forbids storing audio by default, and a recorder is a new sensitive capability with no need in this slice. |
+The following paragraphs record the original slice-1 design, not current provider
+or device support. See CURRENT_STATUS.md for current acceptance evidence.
 
-The adapter seam exists precisely so this choice is reversible: `SPEECH_ADAPTERS` is a list
-of `{name, create}` providers consulted in order, and `createRecognizer()` is the only place
-that knows which one answered. A future recognizer — a WebView bridge, an approved cloud
-adapter — is one entry in that list, not a rewrite of the page.
-
-## What is not built (and is not pretending to be)
 
 * **No real LLM provider.** The seam exists (`actionmesh/voiceos/llm.py`), the
   configuration exists, and the answer is a visible note rather than a call — see *Why no
@@ -101,7 +115,7 @@ adapter — is one entry in that list, not a rewrite of the page.
   it and sees "Service unreachable" — the microphone still works locally, the planner does
   not.
 
-## Why no model is called
+## Historical slice-1 model decision (superseded)
 
 VoiceOS has an LLM provider seam (`actionmesh/voiceos/llm.py`), configuration for it
 (`ACTIONMESH_VOICEOS_LLM_PROVIDER`, `..._MODEL`, `..._TIMEOUT_S`), and validation of

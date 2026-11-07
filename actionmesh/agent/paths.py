@@ -76,6 +76,8 @@ DENIED_BASENAMES: frozenset[str] = frozenset(
 #: Denied as a root-relative prefix. These are the directories that hold a signed-in
 #: session someone can steal, rather than a key someone typed.
 DENIED_RELATIVE_PREFIXES: tuple[str, ...] = (
+    ".config/actionmesh",  # Credentials, private IPC, execution/audit databases.
+    ".9router",  # Upstream provider credentials and authenticated router state.
     ".ssh",
     ".aws",
     ".gnupg",
@@ -264,7 +266,7 @@ class Workspace:
             if part in (os.curdir, os.pardir) or part.startswith("/"):
                 raise PathEscape(f"unsafe component {part!r}")
 
-        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             for index, part in enumerate(parts):
                 if index == len(parts) - 1:
@@ -323,7 +325,7 @@ class Workspace:
                 "this platform cannot refuse symlinks while opening; refusing to "
                 "walk a path that cannot be checked"
             )
-        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             for part in parts:
                 if part in (os.curdir, os.pardir) or part.startswith("/"):

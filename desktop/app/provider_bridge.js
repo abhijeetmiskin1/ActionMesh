@@ -31,6 +31,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const net = require('net');
+const { createSpeechHandler } = require('./speech_bridge');
 
 const MAX_FRAME_BYTES = 256 * 1024;
 const IDLE_TIMEOUT_MS = 30_000;
@@ -161,6 +162,7 @@ async function startBridge(options) {
 
   // Compared on every request; held as bytes so the compare is on equal units.
   const expectedToken = Buffer.from(token, 'utf8');
+  const speech = createSpeechHandler({ settings, providers });
 
   const sockets = new Set();
   const counters = {
@@ -466,6 +468,7 @@ async function startBridge(options) {
     sockets.add(socket);
 
     let settled = false;
+    let processing = false;
     let buffer = Buffer.alloc(0);
     let idleTimer = setTimeout(onIdle, IDLE_TIMEOUT_MS);
 
@@ -538,6 +541,14 @@ async function startBridge(options) {
         return;
       }
 
+      if (request.op === 'audio_status' || request.op === 'transcribe') {
+        clearIdle();
+        idleTimer = setTimeout(onIdle, 65_000);
+        const frame = await speech(request);
+        if (!settled) { counters.served += 1; finish(frame); }
+        return;
+      }
+
       if (request.op === 'status') {
         const frame = await statusFrame();
         if (settled) return;
@@ -558,7 +569,7 @@ async function startBridge(options) {
     }
 
     socket.on('data', (chunk) => {
-      if (settled) return;
+      if (settled || processing) return;
       resetIdle();
 
       // Check before concatenating so a hostile peer cannot make us allocate without
@@ -585,6 +596,7 @@ async function startBridge(options) {
         return;
       }
       // One request per connection: everything after the first newline is discarded.
+      processing = true;
       handleFrame(line).catch(() => {
         counters.malformed += 1;
         finish({ ok: false, state: 'malformed', detail: MALFORMED_FRAME_DETAIL });

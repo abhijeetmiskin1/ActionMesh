@@ -151,8 +151,14 @@ class TestTrainSearch(unittest.TestCase):
             done = out["session"]
             self.assertEqual(done.status, "completed")
             for step in done.steps:
-                self.assertEqual(step.state, "succeeded", step)
-                self.assertTrue(step.verified, step)
+                if step.action_type == "browser.type":
+                    # The driver exposes character counts, not an independent
+                    # read-back of the field text. Dispatch is not proof.
+                    self.assertEqual(step.state, "succeeded_unverified", step)
+                    self.assertFalse(step.verified, step)
+                else:
+                    self.assertEqual(step.state, "succeeded", step)
+                    self.assertTrue(step.verified, step)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

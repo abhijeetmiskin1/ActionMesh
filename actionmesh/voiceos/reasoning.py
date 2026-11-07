@@ -44,9 +44,21 @@ _ORDINAL_WORDS = {
     "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "last": -1,
     "1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5,
 }
-_STATUS = re.compile(r"^\s*(?:what(?:'s| is) )?(?:the |my |our )?status\b|^\s*what are you doing", re.I)
-_STOP = re.compile(r"^\s*(?:stop|cancel|abort)\b", re.I)
-_CLEAR = re.compile(r"^\s*(?:clear|forget|reset)\b[^.]{0,40}\b(?:history|conversation|context|memory)\b", re.I)
+_STATUS = re.compile(
+    r"(?:what(?:'s| is) )?(?:(?:the |my |our )?status|(?:my |the )?task status)"
+    r"|what are you doing",
+    re.I,
+)
+_STOP = re.compile(
+    r"(?:stop|cancel|abort)(?: (?:it|(?:the |my |this |current |active )*task))?", re.I,
+)
+_STOP_PREFIX = re.compile(r"^(?:stop|cancel|abort)\b", re.I)
+_CLEAR = re.compile(
+    r"(?:clear|forget|reset) (?:the |my |this |our )?"
+    r"(?:conversation(?: history)?|history|context|memory)", re.I,
+)
+# Remove only discourse markers before matching; never edit nouns, paths or payloads.
+_LEAD_IN = re.compile(r"^(?:(?:i said|hey voiceos|please)[, ]+)+", re.I)
 #: "switch to my Mac", "use the Linux workstation". The trailing span is a device
 #: name and is resolved by :mod:`actionmesh.voiceos.targeting`; this pattern only
 #: decides that the sentence *is* a switch, not that it names a real computer.
@@ -158,6 +170,75 @@ _NOT_A_SERVICE_NAME = frozenset(
 )
 
 
+_SCREENSHOT_COMMANDS = frozenset({
+    "screenshot", "take a screenshot", "take screenshot", "capture the screen",
+    "स्क्रीनशॉट लो", "स्क्रीनशॉट ले लो", "स्क्रीनशॉट लेना", "स्क्रीन शॉट लो",
+    "स्क्रीनशॉट", "टेक स्क्रीनशॉट", "टेक क्रिंशोट",
+})
+_FILE_LIST_COMMANDS = frozenset({
+    "list files", "list my files", "list the files", "show my files", "show me my files",
+    "मेरी फाइलें दिखाओ", "मेरी फ़ाइलें दिखाओ",
+})
+_APP_NAMES = {
+    "browser": "browser",
+    "web browser": "browser",
+    "calculator": "calculator",
+    "chrome": "google-chrome",
+    "google chrome": "google-chrome",
+    "firefox": "firefox",
+    "file manager": "nautilus",
+    "text editor": "gnome-text-editor",
+    "vs code": "code",
+}
+_APP_REQUEST = re.compile(r"^(?:open|launch|start) (?:the )?(?:app )?(?P<name>[\w -]+)$")
+_MEDIA_COMMANDS = {
+    "play music": ("media.play", "Play music"),
+    "resume music": ("media.play", "Resume music"),
+    "pause music": ("media.pause", "Pause music"),
+    "गाना चलाओ": ("media.play", "Play music"),
+    "गाना रोक दो": ("media.pause", "Pause music"),
+}
+_FILE_SEARCH_REQUEST = re.compile(
+    r"^(?:find|search for) (?:my )?files? named (?P<name>.+?)"
+    r"(?: in folder (?P<folder>.+))?$",
+    re.I,
+)
+_FILE_SEARCH_LITERAL = str.maketrans({"[": "[[]", "*": "[*]", "?": "[?]"})
+_LARGEST_FILES_REQUEST = re.compile(
+    r"^(?:(?:i want (?:a )?list(?: of)?|show(?: me)?(?: a list of)?|find|list|give me) )?"
+    r"(?:the )?(?:top (?P<limit>\d{1,3}) )?(?:largest|biggest|highest storage) files"
+    r"(?: in (?:folder )?(?P<folder>.+))?$",
+    re.I,
+)
+_LARGEST_FILES_QUESTION = re.compile(
+    r"^(?:which files (?:take up|use|are using|consume) (?:the )?most (?:disk )?(?:space|storage)"
+    r"|what(?: is|'s) (?:taking up|using) (?:all )?my (?:disk space|storage))$"
+)
+_STORAGE_TOPIC = re.compile(
+    r"\b(?:my (?:storage|disk|hard drive)|storage (?:usage|space|details|capacity)|"
+    r"disk (?:space|usage|capacity)|(?:free|available) storage|hard drive space|workspace filesystem)\b"
+)
+_STORAGE_QUERY = re.compile(r"^(?:please )?(?:show|tell|give|check|report|what|how (?:much|full))\b")
+_STORAGE_OTHER = re.compile(
+    r"\b(?:cloud|remote|google|onedrive|icloud|dropbox|phone|files?|folders?|database|"
+    r"delete|remove|clean|clear|free up|open|upload|send|not|never|if|then)\b|[;]"
+)
+
+
+def _asks_about_storage(command: str) -> bool:
+    """Recognize a local capacity question even when surrounding words are noisy."""
+    if command in {"storage overview", "storage details", "disk space", "disk usage"}:
+        return True
+    if _STORAGE_OTHER.search(command):
+        return False
+    return bool(_STORAGE_QUERY.match(command) and _STORAGE_TOPIC.search(command)) or bool(
+        re.fullmatch(
+            r"how much (?:free )?(?:space|storage) (?:do i have(?: left)?|is left|is available|is free)",
+            command,
+        )
+    )
+
+
 class Reasoner:
     """Turns a sentence and a conversation into an intent and, sometimes, a task."""
 
@@ -189,14 +270,18 @@ class Reasoner:
         request = " ".join(text.split())
         if not request:
             return Understanding(kind="answer", reply="Say something first — or type it.")
-        if _CLEAR.match(request):
+        request = _LEAD_IN.sub("", request).strip() or request
+        command = request.rstrip(".!?। ")
+        if _CLEAR.fullmatch(command):
             return Understanding(
                 kind="clear",
                 reply="Conversation cleared. I have forgotten the references; nothing else changed.",
             )
-        if _STATUS.match(request):
+        if _STATUS.fullmatch(command):
             return self._status(conversation)
-        if _STOP.match(request):
+        if _STOP.fullmatch(command) or (
+            _STOP_PREFIX.match(command) and _REFERENCE_ORDINAL.search(command)
+        ):
             return self._stop(request, conversation)
         diagnosed = self._diagnose(request, conversation)
         if diagnosed is not None:
@@ -422,7 +507,52 @@ class Reasoner:
 
     # -- task decomposition ------------------------------------------------
 
+    def _direct_task(
+        self, request: str, conversation: Conversation, action_type: str, label: str,
+        **parameters: str | int,
+    ) -> Understanding:
+        if not self.known_action(action_type):
+            return Understanding(
+                kind="answer", reply=f"{label} is unavailable on the selected computer."
+            )
+        step = TaskStep(index=0, label=label, action_type=action_type, parameters=parameters)
+        session = self._session(request, [step], conversation)
+        return Understanding(
+            kind="task",
+            reply=f"{label} on {self._current_device(conversation)}. Select Run to continue.",
+            session=session,
+            device_id=session.device_id,
+        )
+
     def _task(self, request: str, conversation: Conversation) -> Understanding:
+        command = request.casefold().rstrip(".!?। ")
+        if command in _SCREENSHOT_COMMANDS:
+            return self._direct_task(request, conversation, "device.screen.capture", "Take screenshot")
+        if command in _FILE_LIST_COMMANDS:
+            return self._direct_task(request, conversation, "device.file.list", "List files")
+        largest = _LARGEST_FILES_REQUEST.fullmatch(request.rstrip(".!?। "))
+        if largest or _LARGEST_FILES_QUESTION.fullmatch(command):
+            return self._direct_task(
+                request, conversation, "device.files.search", "Rank largest files",
+                path=(largest["folder"] if largest else None) or ".", pattern="*", sort_by="size",
+                limit=max(1, min(20, int(largest["limit"] if largest and largest["limit"] else "10"))),
+            )
+        search = _FILE_SEARCH_REQUEST.fullmatch(request.rstrip(".!। "))
+        if search:
+            name = search["name"].strip().strip('"`').strip()
+            if not name or len(name) > 120 or any(char in name for char in "/\\"):
+                return Understanding(
+                    kind="answer", reply="Which filename should I look for in your workspace?"
+                )
+            return self._direct_task(
+                request, conversation, "device.files.search", "Find files by name",
+                path=search["folder"] or ".", pattern=f"*{name.translate(_FILE_SEARCH_LITERAL)}*",
+            )
+        if _asks_about_storage(command):
+            return self._direct_task(request, conversation, "device.files.storage", "Check storage")
+        media = _MEDIA_COMMANDS.get(command)
+        if media:
+            return self._direct_task(request, conversation, *media)
         step = self._reference_step(request, conversation)
         if step is not None:
             session = self._session(request, [step], conversation)
@@ -463,7 +593,24 @@ class Reasoner:
         website = self._website_step(request, conversation)
         if website is not None:
             return website
-        plan = self.planner.plan(request)
+        app_request = _APP_REQUEST.fullmatch(command)
+        if app_request:
+            name = app_request["name"]
+            if name in _APP_NAMES:
+                return self._direct_task(
+                    request, conversation, "device.app.open", f"Open {name}", app=_APP_NAMES[name]
+                )
+        conversational_plan = getattr(self.planner, "plan_with_context", None)
+        if callable(conversational_plan):
+            previous = [item["text"] for item in conversation.history if item.get("role") == "user"]
+            plan = conversational_plan(request, previous)
+        else:
+            plan = self.planner.plan(request)
+        if not plan.actions and plan.reply:
+            return Understanding(
+                kind="answer", reply=plan.reply + "\n\nNo device action has run.",
+                notes=tuple(plan.notes),
+            )
         if plan.actions:
             steps = [
                 TaskStep(
@@ -665,7 +812,9 @@ def describe_session(session: TaskSession) -> str:
         parts.append(f"Target computer: {session.device_id}.")
     for step in session.steps:
         evidence = ""
-        if step.verified is True:
+        if step.simulated is True:
+            evidence = " · simulation only (no real-world effects)"
+        elif step.verified is True:
             evidence = " · verified"
         elif step.verified is False:
             evidence = " · NOT verified"

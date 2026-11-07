@@ -22,6 +22,7 @@
     </div>
 
     <nav class="nav" aria-label="Primary">
+      <div class="nav-group-label">WORKSPACE</div>
       <button class="nav-item" data-view="home" type="button" title="Home">
         <span class="nav-glyph" aria-hidden="true">◈</span><span class="nav-label">Home</span>
       </button>
@@ -41,14 +42,12 @@
         <span class="nav-glyph" aria-hidden="true">✦</span><span class="nav-label">Tasks</span>
         <span class="nav-badge" data-badge="tasks" hidden></span>
       </button>
+      <div class="nav-group-label">ACTIVITY</div>
       <button class="nav-item" data-view="automations" type="button" title="Automations">
         <span class="nav-glyph" aria-hidden="true">↻</span><span class="nav-label">Automations</span>
         <span class="nav-badge" data-badge="automations" hidden></span>
       </button>
-      <button class="nav-item" data-view="devices" type="button" title="Devices">
-        <span class="nav-glyph" aria-hidden="true">⌂</span><span class="nav-label">Devices</span>
-        <span class="nav-badge" data-badge="devices" hidden></span>
-      </button>
+
       <button class="nav-item" data-view="live" type="button" title="Live Control">
         <span class="nav-glyph" aria-hidden="true">◐</span><span class="nav-label">Live Control</span>
         <span class="nav-badge live" data-badge="live" hidden></span>
@@ -59,6 +58,14 @@
       </button>
       <button class="nav-item" data-view="history" type="button" title="History">
         <span class="nav-glyph" aria-hidden="true">≡</span><span class="nav-label">History</span>
+      </button>
+      <div class="nav-group-label">MANAGE</div>
+      <button class="nav-item" data-view="devices" type="button" title="Devices">
+        <span class="nav-glyph" aria-hidden="true">⌂</span><span class="nav-label">Devices</span>
+        <span class="nav-badge" data-badge="devices" hidden></span>
+      </button>
+      <button class="nav-item" data-view="providers" type="button" title="AI Providers">
+        <span class="nav-glyph" aria-hidden="true">◇</span><span class="nav-label">AI Providers</span>
       </button>
       <button class="nav-item" data-view="settings" type="button" title="Settings">
         <span class="nav-glyph" aria-hidden="true">⚙</span><span class="nav-label">Settings</span>
@@ -83,7 +90,7 @@
     <!-- HEADER --------------------------------------------------------- -->
     <header class="headerbar topbar">
       <div class="header-left">
-        <button class="icon-btn sidebar-toggle" id="sidebarToggle" type="button"
+        <button class="icon-btn sidebar-toggle" id="sidebarToggle" type="button" aria-expanded="true" aria-controls="sidebar"
                 title="Collapse sidebar" aria-label="Collapse sidebar">☰</button>
         <div>
           <div class="eyebrow" id="viewEyebrow">Control plane</div>
@@ -99,19 +106,11 @@
       </div>
 
       <div class="header-right">
-        <div class="provider-bar" data-purpose="chat">
-          <label class="provider-field">
-            <span class="provider-caption">CHAT</span>
-            <select class="purpose-provider-select" data-purpose="chat" title="Chat provider"></select>
-          </label>
-          <label class="provider-field">
-            <span class="provider-caption">MODEL</span>
-            <select class="purpose-model-select" data-purpose="chat" title="Chat model"></select>
-          </label>
-          <span class="provider-caption">CONNECTION</span>
+        <div class="provider-bar provider-shortcut" data-purpose="chat">
+          <span class="provider-caption">Chat</span>
           <span class="provider-status" id="providerStatus" data-state="not_configured">Not configured</span>
           <span class="stream-pill" id="streamPill" data-state="closed">stream …</span>
-          <button class="btn ghost small" id="providerConfigure" type="button" data-configure-purpose="chat">CONFIGURE</button>
+          <button class="btn ghost small" id="providerConfigure" type="button">AI Providers</button>
         </div>
         <button class="icon-btn" id="notifyBtn" type="button" title="Notifications" aria-label="Notifications">
           <span aria-hidden="true">🔔</span>
@@ -163,7 +162,7 @@
       </div>
 
       <article class="card">
-        <h2 class="card-title">Ask for something</h2>
+        <h2 class="card-title">Ask VoiceOS</h2>
         <p class="card-note">
           Type it or hold the microphone. Asking only <em>proposes</em> a plan — nothing runs
           until you press Run on a step, and any action the policy marks risky waits for a
@@ -171,7 +170,7 @@
         </p>
         <form class="ask" id="homeAsk">
           <input id="homeAskText" placeholder="e.g. run the long job" autocomplete="off" spellcheck="false">
-          <button class="btn primary" id="homeAskSend" type="button">Propose</button>
+          <button class="btn primary" id="homeAskSend" type="button">Ask VoiceOS</button>
           <button class="btn mic" id="homeAskMic" type="button" title="Hold to talk">◉</button>
         </form>
         <div class="reply" id="homeReply" hidden></div>
@@ -196,19 +195,28 @@
 
       <article class="card">
         <div class="card-head">
-          <h2 class="card-title">Provider lanes</h2>
+          <h2 class="card-title">AI connections</h2>
           <div class="btn-row">
             <button class="btn ghost small" id="homeProviderConfigure" type="button">Configure chat</button>
             <button class="btn ghost small" id="homeProviderDefault" type="button" disabled>Set default</button>
           </div>
         </div>
-        <p class="card-note">
-          Four separate jobs, four separate keys in the OS keyring. A lane is “connected”
-          only after its own Test Connection passes. Image and audio adapters are not
-          implemented in this build — their lanes exist so a key is never stored for
-          a surface that cannot use it.
-        </p>
+        <p class="card-note">Your models at a glance. Manage API keys, endpoints, and models in AI Providers.</p>
+        <button class="btn ghost small" type="button" data-goto="providers">Manage AI providers →</button>
         <div class="purpose-lanes" id="homeProviderKv"></div>
+      </article>
+      <article class="card">
+        <h2 class="card-title">Generate an image</h2>
+        <p class="card-note">Uses the Image provider configured in AI Providers. Each request may be billed by that provider. The result stays in this view; nothing is saved or executed.</p>
+        <label class="field">Image description
+          <textarea id="imagePrompt" rows="3" maxlength="4000" placeholder="Describe the image you want"></textarea>
+        </label>
+        <div class="btn-row">
+          <button class="btn primary" id="imageGenerate" type="button">Generate image</button>
+          <button class="btn" id="imageClear" type="button">Clear</button>
+        </div>
+        <p class="fine" id="imageStatus" role="status">Configure the Image lane to begin.</p>
+        <div id="imagePreview" class="visual-preview"></div>
       </article>
     </section>
 
@@ -221,14 +229,40 @@
                     aria-label="Start listening">🎙</button>
             <div class="mic-state" id="voiceState" data-state="idle" role="status" aria-live="polite" aria-atomic="true">Idle</div>
             <p class="mic-hint" id="voiceHint">
-              Microphone access starts only when you press the button.
+              Tap the microphone, speak, then pause. Eligible commands run automatically.
             </p>
           </div>
-          <p class="mic-transcript-label">Transcript — edit it before sending if you like</p>
+          <label class="field" for="voiceLanguage">
+            <span>Voice input language</span>
+            <select class="select" id="voiceLanguage" aria-describedby="voiceLanguageHint">
+              <option value="en-US" selected>English</option>
+              <option value="en-IN">English (India)</option>
+              <option value="hi-IN">हिन्दी (Hindi)</option>
+              <option value="mr-IN">मराठी (Marathi)</option>
+              <option value="ta-IN">தமிழ் (Tamil)</option>
+              <option value="te-IN">తెలుగు (Telugu)</option>
+              <option value="es-ES">Español (Spanish)</option>
+              <option value="fr-FR">Français (French)</option>
+              <option value="de-DE">Deutsch (German)</option>
+              <option value="tr-TR">Türkçe (Turkish)</option>
+              <option value="auto">Auto-detect (cloud)</option>
+            </select>
+            <small id="voiceLanguageHint" class="fine">Applies to the next recording.</small>
+          </label>
+          <label class="check">
+            <input id="voiceFollowUp" type="checkbox">
+            Listen for up to two follow-up commands after I speak a reply
+          </label>
+          <label class="check">
+            <input id="voiceReviewTranscript" type="checkbox">
+            Review my transcript before sending it
+          </label>
+          <p class="mic-transcript-label">Spoken transcript or typed request</p>
           <textarea class="textarea" id="voiceTranscript" rows="3"
                     placeholder="What would you like VoiceOS to do?"></textarea>
           <div class="btn-row">
-            <button class="btn primary" id="voiceSend" type="button">Send Transcript</button>
+            <button class="btn primary" id="voiceSend" type="button">Ask VoiceOS</button>
+            <button class="btn ghost" id="voiceServices" type="button">Services</button>
             <button class="btn ghost" id="voiceStopListening" type="button" disabled>Stop Listening</button>
             <button class="btn ghost" id="voiceStopSpeaking" type="button" disabled>Stop Speaking</button>
             <button class="btn subtle" id="voiceClear" type="button">Clear</button>
@@ -239,8 +273,17 @@
                the answer is the deterministic planner rather than a model. -->
           <p class="fine" id="voiceModel" data-mode="deterministic">Checking which planner will answer…</p>
           <p class="fine" id="voiceSupport"></p>
-          <div class="reply" id="voiceReply" hidden></div>
         </article>
+
+        <article class="card voice-results" aria-labelledby="voiceResultsTitle">
+          <div class="card-head">
+            <h2 class="card-title" id="voiceResultsTitle">Results</h2>
+            <span class="chip">VoiceOS</span>
+          </div>
+          <p class="card-note" id="voiceResultsEmpty">Try “Show the largest files in folder Documents.”</p>
+          <div id="voiceReply" aria-live="polite" hidden></div>
+        </article>
+      </div>
 
         <article class="card">
           <div class="card-head">
@@ -254,7 +297,6 @@
           </p>
           <div class="quick-grid" id="quickGrid"></div>
         </article>
-      </div>
 
       <article class="card">
         <h2 class="card-title">Command guide</h2>
@@ -273,7 +315,7 @@
         <h2 class="card-title">New task</h2>
         <form class="ask" id="taskAsk">
           <input id="taskAskText" placeholder="What should happen?" autocomplete="off" spellcheck="false">
-          <button class="btn primary" id="taskAskSend" type="button">Propose</button>
+          <button class="btn primary" id="taskAskSend" type="button">Ask VoiceOS</button>
           <button class="btn mic" id="taskAskMic" type="button" title="Hold to talk">◉</button>
         </form>
         <p class="card-note" id="taskNotes"></p>
@@ -405,8 +447,8 @@
           <div class="btn-row column">
             <button class="btn primary" id="visualCapture" type="button">Capture Screen</button>
             <button class="btn" id="visualInspect" type="button">Inspect Active Window</button>
-            <button class="btn" id="visualAsk" type="button">Ask About Screen</button>
-            <button class="btn danger" id="visualStop" type="button" disabled>Stop Sharing</button>
+            <button class="btn" id="visualAsk" type="button">Ask about inspected window</button>
+            <button class="btn danger" id="visualStop" type="button" disabled>Clear observation</button>
           </div>
 
           <label class="field" id="visualWindowWrap">Window to inspect (leave empty for every top-level window)
@@ -414,7 +456,7 @@
                    placeholder="e.g. gtk_target.py">
           </label>
 
-          <label class="field" id="visualAskWrap" hidden>Question about the screen
+          <label class="field" id="visualAskWrap" hidden>Question (sends inspected labels to the Reasoning provider)
             <input id="visualQuestion" autocomplete="off" spellcheck="false"
                    placeholder="e.g. What does this error mean?">
           </label>
@@ -427,15 +469,15 @@
 
         <article class="card visual-center">
           <div class="card-head">
-            <h2 class="card-title">Live preview</h2>
+            <h2 class="card-title">Capture details</h2>
             <span class="chip" id="visualSessionChip">—</span>
           </div>
           <div id="visualPreview" class="visual-preview">
             <div class="empty-state">
-              <p>No screen frame is being held.</p>
+              <p>No capture has been requested.</p>
               <p class="fine">
-                This panel shows a capture only if the OS granted one, and only until you
-                stop sharing or capture again.
+                This panel reports capture metadata when the OS grants a request. Screenshot
+                pixels are not displayed or sent to a model.
               </p>
             </div>
           </div>
@@ -449,9 +491,8 @@
           </div>
           <div id="visualAnalysis" class="visual-analysis">
             <p class="fine">
-              AI analysis of the screen is unavailable: no multimodal model credential is
-              configured, so no visual interpretation is produced. Capture and
-              accessibility inspection below are real.
+              Inspect a window, then ask about its displayed element labels using the
+              Reasoning provider. No screenshot pixels are uploaded.
             </p>
           </div>
 
@@ -532,7 +573,7 @@
             <button class="btn" id="browserForward" type="button">Forward</button>
             <button class="btn" id="browserRefresh" type="button">Refresh</button>
             <button class="btn" id="browserWait" type="button">Wait</button>
-            <button class="btn danger" id="browserStop" type="button">Stop</button>
+            <button class="btn danger" id="browserStop" type="button">Stop backend</button>
           </div>
           <label class="field">Element ref (from the list, e.g. 3)
             <input id="browserRef" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="3">
@@ -666,49 +707,43 @@
       </div>
     </section>
 
-    <!-- SETTINGS --------------------------------------------------------- -->
-    <section class="view" data-view="settings" hidden>
-      <div class="grid two">
-        <article class="card" id="settingsProviderCard">
+    <section class="view" data-view="providers" hidden>
+      <div class="provider-page-intro">
+        <span class="eyebrow">YOUR MODELS, BY PURPOSE</span>
+        <h2>Give each job the right AI.</h2>
+        <p>Use a different provider, API endpoint, key, and model for each purpose. Changes here stay separate from your workspace permissions.</p>
+      </div>
+      <div class="provider-routing-note" id="providerRoutingNote" role="status"></div>
+      <article class="card" id="settingsProviderCard">
           <h2 class="card-title">AI providers</h2>
-          <p class="card-note">
-            A provider only ever <em>proposes</em>; policy, consent and approval decide what
-            happens. Each purpose has its own key, stored in the operating system's keyring
-            by the main process and never sent back to this page.
-          </p>
+          <p class="card-note">Choose models for conversations, planning, images, and speech. API keys are protected by your system keyring.</p>
           <div class="purpose-lanes" id="settingsProviderKv"></div>
           <p class="fine" id="settingsProviderNote"></p>
         </article>
+    </section>
 
-        <article class="card">
-          <h2 class="card-title">Backend</h2>
-          <p class="card-note">
-            The window starts the real control plane on a loopback port it chooses. The
-            key it uses exists only in this process's memory.
-          </p>
-          <dl class="kv" id="backendKv"></dl>
-          <div class="btn-row">
-            <button class="btn primary" id="backendRestart" type="button">Restart backend</button>
-            <button class="btn ghost" id="backendStop" type="button">Stop</button>
-            <button class="btn ghost" id="backendOpenData" type="button">Open data folder</button>
-          </div>
-          <details class="logs">
-            <summary>Backend log (tail)</summary>
-            <pre id="backendLog"></pre>
-          </details>
-        </article>
+    <!-- SETTINGS --------------------------------------------------------- -->
+    <section class="view" data-view="settings" hidden>
+      <p class="section-intro">Manage workspace permissions, app preferences, and the local backend.</p>
+      <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+
+        <button type="button" class="settings-tab" role="tab" id="settings-tab-app" aria-controls="settings-panel-app" aria-selected="true" tabindex="0" data-settings-tab="app">App & permissions</button>
+        <button type="button" class="settings-tab" role="tab" id="settings-tab-backend" aria-controls="settings-panel-backend" aria-selected="false" tabindex="-1" data-settings-tab="backend">Backend</button>
+        <button type="button" class="settings-tab" role="tab" id="settings-tab-about" aria-controls="settings-panel-about" aria-selected="false" tabindex="-1" data-settings-tab="about">About & web pages</button>
       </div>
 
-      <div class="grid two">
-        <article class="card">
-          <h2 class="card-title">App</h2>
+      <div role="tabpanel" id="settings-panel-app" aria-labelledby="settings-tab-app" tabindex="0" data-settings-panel="app"><article class="card">
+          <h2 class="card-title">App preferences & permissions</h2>
           <form id="settingsForm" class="settings-form">
+            <fieldset class="settings-group"><legend>Preferences</legend>
             <label class="field">Global shortcut
               <input id="setShortcut" autocomplete="off" spellcheck="false">
             </label>
             <p class="fine" id="shortcutStatus"></p>
             <label class="check"><input type="checkbox" id="setShortcutEnabled"> Enable global shortcut</label>
             <label class="check"><input type="checkbox" id="setNotifications"> Native notifications</label>
+            </fieldset>
+            <fieldset class="settings-group"><legend>Device & access</legend>
             <label class="check"><input type="checkbox" id="setAgent"> Run the laptop agent in this app</label>
             <label class="field">Device name
               <input id="setDeviceName" autocomplete="off">
@@ -723,20 +758,36 @@
             <label class="field">Allowed programs (comma separated)
               <input id="setAllowedCommands" autocomplete="off" spellcheck="false">
             </label>
+            </fieldset>
             <div class="btn-row">
               <button class="btn primary" id="settingsSave" type="button">Save settings</button>
-              <button class="btn ghost" id="settingsReset" type="button">Reset</button>
+              <button class="btn ghost" id="settingsReset" type="button">Discard changes</button>
               <button class="btn ghost" id="settingsAbout" type="button">About VoiceOS</button>
             </div>
             <p class="fine" id="settingsSaved"></p>
           </form>
-        </article>
-
-        <article class="card">
-          <h2 class="card-title">The original pages</h2>
+        </article></div>
+      <div role="tabpanel" id="settings-panel-backend" aria-labelledby="settings-tab-backend" tabindex="0" data-settings-panel="backend" hidden><article class="card">
+          <h2 class="card-title">Backend</h2>
           <p class="card-note">
-            The browser dashboard and VoiceOS are still part of this app; they open in their
-            own hardened window, signed in by the main process rather than by page script.
+            The window starts the real control plane on a loopback port it chooses. The
+            key it uses exists only in this process's memory.
+          </p>
+          <dl class="kv" id="backendKv"></dl>
+          <div class="btn-row">
+            <button class="btn primary" id="backendRestart" type="button">Restart backend</button>
+            <button class="btn ghost" id="backendStop" type="button">Stop backend</button>
+            <button class="btn ghost" id="backendOpenData" type="button">Open data folder</button>
+          </div>
+          <details class="logs">
+            <summary>Backend log (tail)</summary>
+            <pre id="backendLog"></pre>
+          </details>
+        </article></div>
+      <div role="tabpanel" id="settings-panel-about" aria-labelledby="settings-tab-about" tabindex="0" data-settings-panel="about" hidden><article class="card">
+          <h2 class="card-title">Web pages</h2>
+          <p class="card-note">
+            Open the web dashboard or the dedicated voice page in a separate window.
           </p>
           <div class="btn-row column">
             <button class="btn ghost" id="openDashboard" type="button">Open dashboard</button>
@@ -745,8 +796,8 @@
           </div>
           <h2 class="card-title spaced">About</h2>
           <dl class="kv" id="aboutKv"></dl>
-        </article>
-      </div>
+        </article></div>
+
     </section>
 
     </div><!-- /main-scroll -->
@@ -755,9 +806,9 @@
     <div class="command-bar" id="commandBar">
       <button class="command-mic" id="commandMic" type="button" title="Speak" aria-label="Speak">🎙</button>
       <input id="commandInput" autocomplete="off" spellcheck="false"
-             placeholder="What would you like VoiceOS to do?" aria-label="Command">
+             placeholder="Ask a question or describe a task…" aria-label="Ask VoiceOS">
       <span class="command-status" id="commandStatus" data-state="idle">Idle</span>
-      <button class="btn primary" id="commandSend" type="button">Send</button>
+      <button class="btn primary" id="commandSend" type="button">Ask VoiceOS</button>
       <button class="btn subtle" id="commandClear" type="button">Clear</button>
     </div>
   </main>
@@ -784,8 +835,8 @@
     </label>
 
     <label class="form-row" id="cfgBaseUrlRow" hidden>
-      <span class="form-label">Base URL (https)</span>
-      <input class="form-input" id="cfgBaseUrl" placeholder="https://your-endpoint/v1" autocomplete="off" spellcheck="false">
+      <span class="form-label">Base URL (HTTPS or local HTTP)</span>
+      <input class="form-input" id="cfgBaseUrl" placeholder="https://your-endpoint/v1 or http://localhost:20128/api/v1" autocomplete="off" spellcheck="false">
     </label>
 
     <label class="form-row">
@@ -800,10 +851,10 @@
       <input class="form-input" id="cfgTimeout" type="number" min="1" max="60" value="12">
     </label>
 
-    <div class="cfg-status" id="cfgStatus" data-state="idle">Not checked yet.</div>
+    <div class="cfg-status" id="cfgStatus" role="status" aria-live="polite" data-state="idle">Not checked yet.</div>
 
     <div class="btn-row modal-actions">
-      <button class="btn primary" id="cfgTest" type="button">Test Connection</button>
+      <button class="btn primary" id="cfgTest" type="button">Test connection</button>
       <button class="btn" id="cfgSave" type="button">Save configuration</button>
       <button class="btn ghost" id="cfgDefault" type="button">Set as default</button>
       <button class="btn danger ghost" id="cfgRemove" type="button">Remove credentials</button>

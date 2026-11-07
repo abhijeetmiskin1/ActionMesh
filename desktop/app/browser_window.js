@@ -26,8 +26,8 @@
  * The lead wires the NDJSON bridge (desktop/app/browser_bridge.js) to
  * `handleDrive()` and installs an observation sink via `setObservationSink()`.
  * main.js does both: it starts the bridge with a per-launch token, and
- * registerBrowserIpc (browser_channel.js) forwards observations to the UI
- * through preload's onBrowserEvent.
+ * registerBrowserIpc (browser_channel.js) submits renderer controls through the
+ * backend execution pipeline. Its redacted output stream supplies observations.
  */
 
 'use strict';
@@ -235,6 +235,7 @@ let loading = false;
 // in open/navigate so a DNS/connection failure is surfaced instead of being
 // collapsed to the generic "drive failed" in handleDrive.
 let failedLoad = null;
+let navigationRequest = null;
 
 function prefs() {
   return {
@@ -315,6 +316,18 @@ function ensureWindow() {
   return win;
 }
 
+// Host-owned navigation provenance, never page-authored content. A later page
+// change invalidates it by epoch/URL, including a redirect after load completion.
+async function loadRequestedUrl(wc, url) {
+  const request = { requestedUrl: new URL(url).href, finalUrl: '', epoch: -1 };
+  navigationRequest = request;
+  await wc.loadURL(url);
+  if (navigationRequest === request && !failedLoad && !loading) {
+    request.finalUrl = wc.getURL();
+    request.epoch = navEpoch;
+  }
+}
+
 function isHttpUrl(url) {
   try {
     const parsed = new URL(url);
@@ -384,6 +397,30 @@ function validId(raw) {
 // actionmesh/agent/browser.py.
 // ---------------------------------------------------------------------------
 
+function waitForNavigation(wc, navigate, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      wc.removeListener('did-stop-loading', loaded);
+      wc.removeListener('destroyed', destroyed);
+    };
+    const loaded = () => { cleanup(); resolve(true); };
+    const destroyed = () => { cleanup(); resolve(false); };
+    wc.once('did-stop-loading', loaded);
+    wc.once('destroyed', destroyed);
+    timer = setTimeout(destroyed, timeoutMs);
+    try { navigate(); } catch (error) { cleanup(); reject(error); }
+  });
+}
+
+async function navigateAndRead(wc, navigate) {
+  failedLoad = null;
+  if (!await waitForNavigation(wc, navigate)) return { status: 'error', note: 'navigation did not finish' };
+  if (failedLoad) return { status: 'error', note: 'navigation failed to load' };
+  return result({ url: wc.getURL(), title: wc.getTitle(), epoch: navEpoch });
+}
+
 const handlers = {
   async open({ url }) {
     if (!isHttpUrl(url)) return { status: 'error', note: 'url must be absolute http(s)' };
@@ -391,7 +428,7 @@ const handlers = {
     win.show(); // a prior stop() hides it
     failedLoad = null;
     try {
-      await win.loadURL(url);
+      await loadRequestedUrl(win.webContents, url);
     } catch {
       // loadURL rejects on ERR_* network failures; did-fail-load carries the
       // browser-authored name. Fall through to the failedLoad check below.
@@ -407,7 +444,7 @@ const handlers = {
     if (!isHttpUrl(url)) return { status: 'error', note: 'url must be absolute http(s)' };
     failedLoad = null;
     try {
-      await win.loadURL(url);
+      await loadRequestedUrl(win.webContents, url);
     } catch {
       // See open(): did-fail-load is the source of truth.
     }
@@ -419,20 +456,19 @@ const handlers = {
 
   async back() {
     const wc = requireSession();
-    if (wc.canGoBack()) wc.goBack();
+    if (wc.canGoBack()) return navigateAndRead(wc, () => wc.goBack());
     return result({ url: wc.getURL(), title: wc.getTitle(), epoch: navEpoch });
   },
 
   async forward() {
     const wc = requireSession();
-    if (wc.canGoForward()) wc.goForward();
+    if (wc.canGoForward()) return navigateAndRead(wc, () => wc.goForward());
     return result({ url: wc.getURL(), title: wc.getTitle(), epoch: navEpoch });
   },
 
   async refresh() {
     const wc = requireSession();
-    wc.reload();
-    return result({ url: wc.getURL(), title: wc.getTitle(), epoch: navEpoch });
+    return navigateAndRead(wc, () => wc.reload());
   },
 
   async snapshot({ max_elements }) {
@@ -555,7 +591,10 @@ const handlers = {
 
   async state() {
     const wc = requireSession();
-    return result({ url: wc.getURL(), title: wc.getTitle(), epoch: navEpoch, loading });
+    const requestedUrl = !loading && navigationRequest && navigationRequest.epoch === navEpoch
+      && navigationRequest.finalUrl === wc.getURL() ? navigationRequest.requestedUrl : '';
+    return result({ url: wc.getURL(), title: wc.getTitle(), epoch: navEpoch, loading,
+      requested_url: requestedUrl });
   },
 
   async page_text({ limit }) {
@@ -612,5 +651,6 @@ module.exports = {
   readPageText,
   setObservationSink,
   // Introspection for the lead's wiring tests.
+  _waitForNavigation: waitForNavigation,
   _windowState: () => ({ hasWindow: !!win && !win.isDestroyed(), loading, epoch: navEpoch }),
 };

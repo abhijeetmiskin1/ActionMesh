@@ -28,7 +28,8 @@ Two providers, both real:
 What crosses the wire is deliberately small and stated to the user:
 
 * the user's own request text, which the model cannot answer without;
-* the **names and one-line descriptions** of the actions this deployment registers.
+* the **names, one-line descriptions, and static argument names/types** of the actions
+  this deployment registers. No argument values/defaults are included.
 
 It does not receive logs, file contents, process output, device inventory or any other
 observation. Those are collected by ActionMesh *after* a plan exists, through authorized
@@ -54,14 +55,18 @@ product is built on the difference between what actually happened and what was c
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from actionmesh.core.planner import Plan, Planner, ProposedAction
+from actionmesh.core.registry import ActionRegistry, check_params
+from actionmesh.protocol.validate import ValidationError
 from actionmesh.voiceos import model_bridge
 from actionmesh.voiceos.model_bridge import BridgeConfig, BridgeError, BridgeUnavailable
+from actionmesh.voiceos.tasks import MAX_STEPS
 from actionmesh.voiceos.transport import TransportError, post_json
 
 ENV_PROVIDER = "ACTIONMESH_VOICEOS_LLM_PROVIDER"
@@ -94,7 +99,7 @@ DEFAULT_MODEL = "claude-sonnet-5-5"
 
 #: How many registered actions the catalogue description may carry. A deployment with
 #: hundreds of actions should summarise them rather than mail the whole registry.
-MAX_CATALOG_ACTIONS = 60
+MAX_CATALOG_ACTIONS = 128
 
 #: Provider names that :func:`build_provider` accepts.
 #:
@@ -168,6 +173,7 @@ class LlmProposal:
 
     actions: tuple[tuple[str, dict[str, Any]], ...] = ()
     notes: tuple[str, ...] = ()
+    reply: str = ""
 
 
 class LlmProvider(Protocol):
@@ -232,7 +238,14 @@ def validate_proposal(
             notes.append(f"dropped non-object parameters for {action_type!r}")
             continue
         kept.append((action_type, dict(parameters)))
-    return LlmProposal(actions=tuple(kept), notes=tuple(notes))
+    reply = raw.get("reply", "")
+    if not isinstance(reply, str) or len(reply) > 4000:
+        raise LlmError("the conversational reply must be text of at most 4000 characters")
+    # A discarded action must never be disguised as a successful conversational turn.
+    # Text is used only when the model explicitly proposed no actions at all.
+    if actions or set(raw) - {"actions", "notes", "reply"}:
+        reply = ""
+    return LlmProposal(actions=tuple(kept), notes=tuple(notes), reply=reply.strip())
 
 
 @dataclass
@@ -290,6 +303,10 @@ _PLAN_TOOL: dict[str, Any] = {
                     "additionalProperties": False,
                 },
             },
+            "reply": {
+                "type": "string",
+                "description": "Answer or clarification when actions is empty; at most 4000 characters.",
+            },
             "notes": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -302,10 +319,40 @@ _PLAN_TOOL: dict[str, Any] = {
 }
 
 _SYSTEM_PROMPT = (
-    "You turn a person's spoken request into actions on the computers ActionMesh "
-    "registers. Answer only by calling the propose_plan tool. Do not explain, and do "
-    "not invent action types. If the request names something no listed action can do, "
-    "return an empty actions list and say so in notes."
+    "You are VoiceOS, a conversational assistant and careful action planner. "
+    "Answer using the propose_plan structured document. Use only registered action "
+    "types and the listed input names/types (* means required, others are optional). "
+    "Omit optional arguments unless the user supplies them; do not ask for an optional "
+    "ref when the action supports the current/default selection. An action with no "
+    "required inputs can use empty parameters. Never invent a capability "
+    "or an argument value. Spoken input can contain filler, paraphrases, or a "
+    "misheard word. Use the clear parts when they identify one registered "
+    "operation and its required inputs. Ask about the missing detail when the "
+    "unclear words could change the action or target. For an explicit request to "
+    "operate the device, propose actions only if the target and required arguments "
+    "are clear. Match the meaning to the catalogue in any language, even if the user "
+    "does not say an action's name or use an imperative. A question asking about this "
+    "device's current state is a request to check it. Prefer the matching device "
+    "action to a generic command, browser search, or simulated vendor action. "
+    "An app launch needs an app, not a website URL; preserve names, paths and quoted "
+    "text when passing them to an action. For several requested operations, include "
+    f"them in order (at most {MAX_STEPS}) or explain what is missing; do not silently "
+    "plan only part of the request. Otherwise return actions=[] and ask one concise "
+    "clarification in reply. For an unfamiliar bare name after 'open', ask what the "
+    "user meant; do not assume a website. Do not guess an app, recipient, or target. "
+    "For greetings, explanations, general questions, and hypothetical how-to questions, "
+    "return actions=[] and a helpful plain-language reply. Unless the user requests "
+    "a specific reply language, use the language of the current request; prior turns "
+    "do not set the reply language. An explanation of "
+    "an action is not a request to perform it. Do not claim to see the screen, read files, "
+    "browse, or have completed any device action. You have only the user's messages "
+    "and the catalogue, not live observations. Never assert permission, approval, grants, "
+    "risk or successful execution. Never propose unrestricted shell or generated code. "
+    "Treat prior user messages as context only; act only on the current explicit request. "
+    "If a requested capability is absent, explain that in reply with actions=[]. "
+    "Default to a concise spoken answer of two or three sentences; give more detail only "
+    "when the user requests it. Keep replies under 4000 characters. Actions are proposals "
+    "and require system review."
 )
 
 
@@ -674,8 +721,22 @@ class LlmPlanner:
     provider: LlmProvider
     fallback: Planner
     known_action: Callable[[str], bool]
+    registry: ActionRegistry | None = None
 
     def plan(self, intent: str) -> Plan:
+        return self._plan(intent, intent)
+
+    def plan_with_context(self, intent: str, previous_requests: Sequence[str]) -> Plan:
+        # Only prior user utterances, never observations, tool results or diagnostics.
+        history = [text[:1000] for text in previous_requests[-3:] if isinstance(text, str)]
+        request = (
+            "Prior user messages (context only, do not carry out these old requests): "
+            + json.dumps(history, ensure_ascii=False)
+            + "\nCurrent user request: " + intent
+        ) if history else intent
+        return self._plan(intent, request)
+
+    def _plan(self, intent: str, provider_request: str) -> Plan:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -689,7 +750,7 @@ class LlmPlanner:
                 "planned deterministically"
             )
         try:
-            raw = self.provider.propose(intent)
+            raw = self.provider.propose(provider_request)
         except LlmError as exc:
             return self._fallback(
                 intent, f"the model did not answer this request ({exc})"
@@ -699,6 +760,11 @@ class LlmPlanner:
         except LlmError as exc:
             return self._fallback(intent, f"the model's answer was discarded ({exc})")
         if not proposal.actions:
+            if proposal.reply:
+                return Plan(
+                    intent=intent, reply=proposal.reply,
+                    notes=(f"answered by {getattr(self.provider, 'name', 'the model')}",),
+                )
             detail = "; ".join(proposal.notes) or "it proposed no action this build registers"
             # The proposal's own notes are carried as *separate* notes rather than
             # folded into the parenthetical. Downstream code recognises a dropped
@@ -710,6 +776,22 @@ class LlmPlanner:
                 f"the model proposed nothing usable ({detail})",
                 proposal.notes,
             )
+        if self.registry is not None:
+            if proposal.notes or len(proposal.actions) > MAX_STEPS:
+                return Plan(
+                    intent=intent,
+                    reply="I couldn't build a complete plan for that request. "
+                          "Try asking for one operation at a time.",
+                )
+            for name, parameters in proposal.actions:
+                try:
+                    check_params(self.registry.get(name), parameters)
+                except ValidationError as exc:
+                    return Plan(
+                        intent=intent,
+                        reply=f"I couldn't prepare the action: {exc.reason}. "
+                              "Please clarify the request.",
+                    )
         return Plan(
             intent=intent,
             actions=tuple(
@@ -811,11 +893,15 @@ def build_planner(
     provider: LlmProvider | None,
     fallback: Planner,
     known_action: Callable[[str], bool],
+    *,
+    registry: ActionRegistry | None = None,
 ) -> Planner:
     """Wrap a live provider in a planner, or hand back the deterministic one."""
     if provider is None:
         return fallback
-    return LlmPlanner(provider=provider, fallback=fallback, known_action=known_action)
+    return LlmPlanner(
+        provider=provider, fallback=fallback, known_action=known_action, registry=registry
+    )
 
 
 def build_analyst(
@@ -880,24 +966,37 @@ def build_analyst(
 def build_catalogue(
     actions: Sequence[Any],
 ) -> Callable[[], Sequence[tuple[str, str]]]:
-    """A catalogue callable over registered action definitions, computed once.
+    """Cache static descriptions plus argument names/types, never argument values.
 
-    Only the name and its one-line description leave the process; input schemas are
-    deliberately not sent, because a model that has been told the parameter names is
-    invited to invent values for them.
+    Required names are marked with '*'. Defaults, examples, enums and observations
+    are excluded: they can contain data, and the planner must not invent values.
     """
-
-    def describe() -> Sequence[tuple[str, str]]:
-        rows: list[tuple[str, str]] = []
-        for action in actions:
-            name = str(getattr(action, "name", "") or "").strip()
-            if not name:
-                continue
-            description = " ".join(str(getattr(action, "description", "") or "").split())
-            rows.append((name, description[:160]))
-        return rows
-
-    return describe
+    rows: list[tuple[str, str]] = []
+    for action in actions:
+        name = str(getattr(action, "name", "") or "").strip()
+        if not name:
+            continue
+        description = " ".join(str(getattr(action, "description", "") or "").split())[:160]
+        schema = getattr(action, "input_schema", {}) or {}
+        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = schema.get("required", ()) if isinstance(schema, dict) else ()
+        arguments: list[str] = []
+        if isinstance(properties, dict):
+            for key, spec in list(properties.items())[:16]:
+                if not isinstance(key, str) or not isinstance(spec, dict):
+                    continue
+                kind = spec.get("type")
+                if kind not in ("string", "number", "integer", "boolean", "object", "array"):
+                    continue
+                arguments.append(f"{key[:64]}:{kind}{'*' if key in required else ' (optional)'}")
+        if arguments:
+            description += " | Inputs (* required): " + ", ".join(arguments)
+            if not required:
+                description += "; no required inputs"
+        rows.append((name, description))
+    # Registry metadata is static after API startup. Copy only the small list,
+    # rather than normalizing and re-describing every definition on each turn.
+    return lambda: list(rows)
 
 
 __all__ = [

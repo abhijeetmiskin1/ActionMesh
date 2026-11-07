@@ -1,4 +1,5 @@
 'use strict';
+(function () {
 /**
  * Execution history / timeline (Agent 5).
  *
@@ -468,3 +469,5 @@ if (typeof module !== 'undefined' && module.exports) {
 if (typeof window !== 'undefined') {
   window.ActionMeshHistory = api;
 }
+
+})();

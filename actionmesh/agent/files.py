@@ -53,6 +53,7 @@ MAX_READ_BYTES = 256 * 1024
 MAX_WRITE_BYTES = 1024 * 1024
 #: Ceiling on one listing or search.
 MAX_LIST_ENTRIES = 500
+MAX_RANKED_SCAN_ENTRIES = 5000
 
 #: The opener binary this module will invoke, discovered on PATH. A fixed name, never a
 #: model-named program and never a shell string.
@@ -161,6 +162,25 @@ class FilesEngine:
         self.workspace = workspace
 
     # -- public API: one method per device.files.X --------------------------------
+    def storage(self) -> dict[str, int]:
+        """Read capacity for the filesystem containing the pinned workspace root."""
+        if not hasattr(os, "fstatvfs"):
+            raise ProviderError("storage reporting is unavailable on this platform", FailureKind.PERMANENT)
+        try:
+            fd = self.workspace.walk_fd()
+            try:
+                stats = os.fstatvfs(fd)
+            finally:
+                os.close(fd)
+        except (OSError, PathEscape) as exc:
+            raise ProviderError("could not read workspace filesystem capacity", FailureKind.PERMANENT) from exc
+        block_size = stats.f_frsize or stats.f_bsize
+        return {
+            "total_bytes": stats.f_blocks * block_size,
+            "used_bytes": (stats.f_blocks - stats.f_bfree) * block_size,
+            "available_bytes": stats.f_bavail * block_size,
+        }
+
     def list_(self, path: str, limit: int | None = None) -> dict[str, Any]:
         """One directory level, reused from ``Workspace.list`` (never re-implemented)."""
         raw = "" if path in ("", ".") else str(path or "")
@@ -180,41 +200,52 @@ class FilesEngine:
         }
 
     def search(
-        self, path: str, pattern: str, limit: int | None = None
+        self, path: str, pattern: str, limit: int | None = None, *, sort_by: str = "name"
     ) -> dict[str, Any]:
         """Entries whose *name* matches a glob, found below one confined directory.
 
         The walk goes through a descriptor (:meth:`Workspace.walk_fd`) at every level,
         so the pattern cannot reach a file the lexical check would not have allowed:
         an escaping symlink is hidden and never descended, and no file body is opened
-        while searching. Bounded by ``MAX_LIST_ENTRIES`` names examined so a search
-        cannot become a whole-filesystem enumeration.
+        while searching. Size ranking includes regular files only and examines
+        more entries before taking the top results. Both scans are bounded.
         """
         if not isinstance(pattern, str) or not pattern.strip():
             raise ProviderError(
                 "pattern must be a non-empty string", FailureKind.INVALID_INPUT
             )
         raw = "" if path in ("", ".") else str(path or "")
+        if sort_by not in ("name", "size"):
+            raise ProviderError("sort_by must be name or size", FailureKind.INVALID_INPUT)
+        ranked = sort_by == "size"
+        scan_limit = MAX_RANKED_SCAN_ENTRIES if ranked else MAX_LIST_ENTRIES
         capped = _validate_limit(limit)
         target = _directory(self.workspace, raw)
         matches: list[dict[str, Any]] = []
         examined = 0
         truncated = False
-        stack: list[tuple[int, str]] = [(self.workspace.walk_fd(raw), target.relative)]
+        stack = [target.relative]
         try:
             while stack and not truncated:
-                directory_fd, prefix = stack.pop()
+                prefix = stack.pop()
                 base_absolute = self.workspace.root if not prefix else os.path.join(
                     self.workspace.root, *prefix.split("/")
                 )
                 try:
+                    directory_fd = self.workspace.walk_fd(prefix)
+                except (OSError, PathNotFound) as exc:
+                    if prefix == target.relative:
+                        raise ProviderError(str(exc), FailureKind.INVALID_INPUT) from exc
+                    truncated = True
+                    break
+                try:
                     with os.scandir(directory_fd) as scan:
                         for entry in scan:
                             examined += 1
-                            if examined > MAX_LIST_ENTRIES:
+                            if examined > scan_limit:
                                 truncated = True
                                 break
-                            if len(matches) >= capped:
+                            if not ranked and len(matches) >= capped:
                                 truncated = True
                                 break
                             try:
@@ -224,13 +255,21 @@ class FilesEngine:
                             is_dir = stat.S_ISDIR(info.st_mode)
                             is_link = stat.S_ISLNK(info.st_mode)
                             relative = f"{prefix}/{entry.name}" if prefix else entry.name
-                            if is_link and not self.workspace._contains(
-                                os.path.realpath(os.path.join(base_absolute, entry.name))
-                            ):
-                                # Resolve the link target only to *ask* whether it stays
-                                # inside; a link out of the root is hidden, never opened.
+                            absolute = os.path.join(base_absolute, entry.name)
+                            try:
+                                self.workspace._check_denied(absolute, relative.split("/"), relative)
+                                if is_link:
+                                    target_path = os.path.realpath(absolute)
+                                    if not self.workspace._contains(target_path):
+                                        continue
+                                    target_parts = os.path.relpath(
+                                        target_path, self.workspace.root
+                                    ).split(os.sep)
+                                    self.workspace._check_denied(target_path, target_parts, relative)
+                            except PathEscape:
+                                # Protected entries are outside the searchable inventory.
                                 continue
-                            if fnmatch.fnmatch(entry.name, pattern):
+                            if (not ranked or stat.S_ISREG(info.st_mode)) and fnmatch.fnmatch(entry.name, pattern):
                                 matches.append(
                                     {
                                         "name": entry.name,
@@ -244,7 +283,7 @@ class FilesEngine:
                                 )
                             if is_dir and not is_link:
                                 # Descend through a walked descriptor, never a name.
-                                stack.append((self.workspace.walk_fd(relative), relative))
+                                stack.append(relative)
                 except OSError:
                     # A directory that vanished or is unreadable mid-walk stops the walk;
                     # the search reports what it reached rather than pretending it saw all.
@@ -253,12 +292,15 @@ class FilesEngine:
                     os.close(directory_fd)
         except PathEscape as exc:
             raise ProviderError(str(exc), _classify(exc)) from exc
-        matches.sort(key=lambda item: str(item["path"]))
+        if ranked:
+            matches.sort(key=lambda item: (-int(item["size"]), str(item["path"])))
+        else:
+            matches.sort(key=lambda item: str(item["path"]))
         return {
             "path": target.relative or ".",
             "matches": matches[:capped],
             "count": min(len(matches), capped),
-            "truncated": truncated or len(matches) > capped,
+            "truncated": truncated or (not ranked and len(matches) > capped),
         }
 
     def read(self, path: str) -> dict[str, Any]:
@@ -350,8 +392,11 @@ class FilesEngine:
                 FailureKind.INVALID_INPUT,
             )
         resolved = _resolve(self.workspace, path)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = _open_fd(self.workspace, resolved, flags)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = _open_fd(self.workspace, resolved, flags)
+        except FileExistsError as exc:
+            raise ProviderError(f"{path!r} already exists; create refuses to overwrite", FailureKind.INVALID_INPUT) from exc
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(body)
@@ -444,8 +489,14 @@ class FilesEngine:
                 f"{path!r} is not a regular file; this capability copies files",
                 FailureKind.INVALID_INPUT,
             )
+        if src_stat.st_size > MAX_WRITE_BYTES:
+            raise ProviderError(f"{path!r} exceeds the copy limit", FailureKind.INVALID_INPUT)
         read_fd = _open_fd(self.workspace, src, os.O_RDONLY)
-        write_fd = _open_fd(self.workspace, dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        try:
+            write_fd = _open_fd(self.workspace, dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except OSError:
+            os.close(read_fd)
+            raise
         copied = 0
         try:
             with os.fdopen(read_fd, "rb") as source, os.fdopen(write_fd, "wb") as dest:

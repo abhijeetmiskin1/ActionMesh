@@ -191,8 +191,140 @@ async function bootPage({ beforeLoad } = {}) {
   return { ...page, app, bridge };
 }
 
+test('image generation renders a real adapter answer and clears it without saving', async () => {
+  let calls = 0;
+  const { document } = await bootPage({ beforeLoad(bridge) {
+    bridge.generateImage = async ({ prompt }) => {
+      calls++;
+      assert.equal(prompt, 'a blue square');
+      return { ok: true, model: 'image-model', dataUrl: 'data:image/png;base64,fixture' };
+    };
+  } });
+  document.getElementById('imagePrompt').value = 'a blue square';
+  document.getElementById('imageGenerate').click();
+  await new Promise(setImmediate);
+  assert.equal(calls, 1);
+  assert.equal(document.querySelector('#imagePreview img').getAttribute('src'), 'data:image/png;base64,fixture');
+  assert.match(document.getElementById('imageStatus').textContent, /no file was saved/);
+  document.getElementById('imageClear').click();
+  assert.equal(document.querySelector('#imagePreview img'), null);
+});
+
+test('clearing an image request discards a late provider response', async () => {
+  let finish;
+  const { document } = await bootPage({ beforeLoad(bridge) {
+    bridge.generateImage = () => new Promise((resolve) => { finish = resolve; });
+  } });
+  document.getElementById('imagePrompt').value = 'a blue square';
+  document.getElementById('imageGenerate').click();
+  document.getElementById('imageClear').click();
+  finish({ ok: true, model: 'image-model', dataUrl: 'data:image/png;base64,fixture' });
+  await new Promise(setImmediate);
+  assert.equal(document.querySelector('#imagePreview img'), null);
+  assert.match(document.getElementById('imageStatus').textContent, /cleared/);
+  assert.equal(document.getElementById('imageGenerate').disabled, false);
+});
+
+test('observation analysis needs an inspection before sending any content', async () => {
+  let calls = 0;
+  const { document } = await bootPage({ beforeLoad(bridge) {
+    bridge.analyzeObservation = async () => { calls++; };
+  } });
+  document.getElementById('visualAsk').click();
+  assert.equal(document.getElementById('visualAskWrap').hidden, false);
+  document.getElementById('visualQuestion').value = 'What is this?';
+  document.getElementById('visualAsk').click();
+  await new Promise(setImmediate);
+  assert.equal(calls, 0);
+});
+
+test('inspection labels can be explicitly analyzed and a cleared observation rejects a late answer', async () => {
+  let emit;
+  let finish;
+  let analysisCalls = 0;
+  const page = await bootPage({ beforeLoad(bridge) {
+    const state = bridge.state;
+    bridge.state = async () => ({ ...await state(), backend: { status: 'ready' } });
+    bridge.request = async (request) => {
+      if (request.path === '/ready') return { ok: true, body: { local_device_id: 'laptop-test' } };
+      if (request.path === '/execute') {
+        emit({ type: 'execution.output', data: { event_type: 'execution.output', execution_id: 'inspect-test',
+          payload: { node_id: 'screen', stream: 'elements', chunk: JSON.stringify([{ role: 'button', name: 'Save', enabled: true }]) } } });
+        return { ok: true, body: { execution_id: 'inspect-test', state: 'success',
+          nodes: { screen: { node_type: 'action', verified: true, result: { status: 'ok', element_count: 1 } } } } };
+      }
+      return { ok: true, body: [] };
+    };
+    bridge.analyzeObservation = async (payload) => {
+      analysisCalls++;
+      assert.equal(payload.elements[0].name, 'Save');
+      if (analysisCalls === 1) return { ok: true, text: 'A Save button.', model: 'power' };
+      return new Promise((resolve) => { finish = resolve; });
+    };
+  } });
+  emit = page.app.handleStreamEvent;
+  const { document } = page;
+  document.querySelector('.nav-item[data-view="visual"]').click();
+  await new Promise(setImmediate);
+  document.getElementById('visualInspect').click();
+  await new Promise(setImmediate);
+  document.getElementById('visualAsk').click();
+  document.getElementById('visualQuestion').value = 'Explain this';
+  document.getElementById('visualAsk').click();
+  await new Promise(setImmediate);
+  assert.equal(analysisCalls, 1);
+  assert.match(document.getElementById('visualAnalysis').textContent, /A Save button/);
+  document.getElementById('visualAsk').click();
+  await new Promise(setImmediate);
+  assert.equal(document.getElementById('visualStop').disabled, false);
+  document.getElementById('visualStop').click();
+  finish({ ok: true, text: 'This stale answer must be discarded.', model: 'power' });
+  await new Promise(setImmediate);
+  assert.doesNotMatch(document.getElementById('visualAnalysis').textContent, /stale answer/);
+  assert.equal(document.getElementById('visualElementCount').textContent, '0');
+});
+
+test('an unverified GUI dispatch is shown as applied without independent confirmation', async () => {
+  let emit;
+  const page = await bootPage({ beforeLoad(bridge) {
+    const state = bridge.state;
+    bridge.state = async () => ({ ...await state(), backend: { status: 'ready' } });
+    bridge.request = async (request) => {
+      if (request.path === '/ready') return { ok: true, body: { local_device_id: 'laptop-test' } };
+      if (request.path === '/execute') {
+        const kind = request.body.graph.nodes[0].action.type;
+        if (kind === 'device.gui.click') return { ok: true, body: { state: 'requires_user',
+          execution_id: 'click-test', nodes: { screen: { node_type: 'action', state: 'requires_user',
+            action_type: kind, result: { dispatched: true }, verification: { verified: false } } } } };
+        emit({ type: 'execution.output', data: { execution_id: 'inspect-test', payload: {
+          node_id: 'screen', stream: 'elements', chunk: JSON.stringify([
+            { role: 'button', name: 'Save', actions: ['click'], enabled: true },
+          ]),
+        } } });
+        return { ok: true, body: { execution_id: 'inspect-test', state: 'success', nodes: {
+          screen: { node_type: 'action', result: { status: 'ok', element_count: 1 } },
+        } } };
+      }
+      return { ok: true, body: [] };
+    };
+  } });
+  emit = page.app.handleStreamEvent;
+  const { document } = page;
+  document.querySelector('.nav-item[data-view="visual"]').click();
+  await new Promise(setImmediate);
+  document.getElementById('visualInspect').click();
+  await new Promise(setImmediate);
+  document.querySelector('#visualElements button').click();
+  document.getElementById('visualApprove').click();
+  await new Promise(setImmediate);
+  const text = document.getElementById('visualActionPreview').textContent;
+  assert.match(text, /Applied, but not independently verified/);
+  assert.doesNotMatch(text, /The action did not run/);
+  assert.doesNotMatch(text, /Applied and independently verified/);
+});
+
 function laneCards(document) {
-  return document.querySelectorAll('#homeProviderKv .purpose-lane');
+  return document.querySelectorAll('#settingsProviderKv .purpose-lane');
 }
 
 function laneText(card) { return card.textContent; }
@@ -201,7 +333,7 @@ test('the renderer boots with no exception and shows one lane per job', async ()
   const { document } = await bootPage();
 
   const cards = laneCards(document);
-  assert.equal(cards.length, 4, 'home lists chat, reasoning, image and audio');
+  assert.equal(cards.length, 4, 'AI Providers lists chat, reasoning, image and audio');
   assert.deepEqual(cards.map((card) => card.dataset.purpose), ['chat', 'reasoning', 'image', 'audio']);
   for (const card of cards) {
     assert.match(laneText(card), /Not configured/i, `${card.dataset.purpose} starts unconfigured`);
@@ -211,9 +343,9 @@ test('the renderer boots with no exception and shows one lane per job', async ()
   // The page never reaches for innerHTML, which is how untrusted provider text would
   // become markup. This is the lock the file's header comment promises.
   assert.deepEqual(document.__innerHTMLWrites, []);
-  // And the header's chat bar was populated from the chat lane's provider table only.
-  const select = document.querySelector('.provider-bar[data-purpose="chat"] .purpose-provider-select');
-  assert.deepEqual(select.options.map((option) => option.value), SPECS.chat.map((spec) => spec.id));
+  assert.equal(document.querySelector('.purpose-provider-select'), null);
+  assert.ok(document.querySelector('.nav-item[data-view="providers"]'));
+  assert.equal(document.querySelectorAll('#homeProviderKv .provider-summary').length, 4);
 });
 
 test('a lane that is configured but untested says so rather than looking connected', async () => {
@@ -231,14 +363,14 @@ test('a lane that is configured but untested says so rather than looking connect
   assert.match(laneText(reasoning), /Key held in the OS keyring/);
   assert.match(laneText(reasoning), /Configured but not tested/);
   // The chip carries the state word; "connected" is not among them.
-  assert.match(laneText(reasoning), /not configured/i);
+  assert.match(laneText(reasoning), /not tested/i);
   assert.doesNotMatch(laneText(reasoning), /connected/i);
 });
 
 test('the image and audio lanes show unimplemented providers with a reason, and cannot be saved', async () => {
   const { document, app } = await bootPage();
   // Open the modal on the image lane the way the card's Configure button does.
-  document.querySelector('#homeProviderKv [data-lane-action="configure"][data-purpose="image"]').click();
+  document.querySelector('#settingsProviderKv [data-lane-action="configure"][data-purpose="image"]').click();
   await new Promise((resolve) => setImmediate(resolve));
 
   const modal = document.getElementById('providerModal');
@@ -262,7 +394,7 @@ test('the image and audio lanes show unimplemented providers with a reason, and 
 test('opening the modal on a different job swaps the provider list with it', async () => {
   const { document } = await bootPage();
   const open = async (purpose) => {
-    document.querySelector(`#homeProviderKv [data-lane-action="configure"][data-purpose="${purpose}"]`).click();
+    document.querySelector(`#settingsProviderKv [data-lane-action="configure"][data-purpose="${purpose}"]`).click();
     await new Promise((resolve) => setImmediate(resolve));
   };
 
@@ -287,7 +419,7 @@ test('opening the modal on a different job swaps the provider list with it', asy
 
 test('Save sends the credential for the open job, then clears the box', async () => {
   const { document, bridge } = await bootPage();
-  document.querySelector('#homeProviderKv [data-lane-action="configure"][data-purpose="reasoning"]').click();
+  document.querySelector('#settingsProviderKv [data-lane-action="configure"][data-purpose="reasoning"]').click();
   await new Promise((resolve) => setImmediate(resolve));
 
   document.getElementById('cfgProvider').value = 'openai';
@@ -317,7 +449,7 @@ test('Save sends the credential for the open job, then clears the box', async ()
 
 test('closing the modal discards a typed key', async () => {
   const { document } = await bootPage();
-  document.querySelector('#homeProviderKv [data-lane-action="configure"][data-purpose="chat"]').click();
+  document.querySelector('#settingsProviderKv [data-lane-action="configure"][data-purpose="chat"]').click();
   await new Promise((resolve) => setImmediate(resolve));
   document.getElementById('cfgApiKey').value = 'sk-half-typed-0123456789';
 
@@ -329,7 +461,7 @@ test('closing the modal discards a typed key', async () => {
 
 test('Test Connection reports the failure verbatim and does not save anything', async () => {
   const { document, bridge } = await bootPage();
-  document.querySelector('#homeProviderKv [data-lane-action="configure"][data-purpose="chat"]').click();
+  document.querySelector('#settingsProviderKv [data-lane-action="configure"][data-purpose="chat"]').click();
   await new Promise((resolve) => setImmediate(resolve));
   document.getElementById('cfgProvider').value = 'anthropic';
   document.getElementById('cfgModel').value = 'claude-sonnet-5-5';
@@ -355,7 +487,7 @@ test('a missing element is a stated refusal, not an exception', async () => {
 
 test('a Configure click on a lane reaches the main process for that purpose only', async () => {
   const { document, bridge } = await bootPage();
-  document.querySelector('#homeProviderKv [data-lane-action="configure"][data-purpose="audio"]').click();
+  document.querySelector('#settingsProviderKv [data-lane-action="configure"][data-purpose="audio"]').click();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(document.getElementById('providerModal').dataset.purpose, 'audio');
   // Opening the modal reads no status on its own; the lane table was loaded once per
@@ -368,7 +500,7 @@ test('the Settings lane card names the keyring boundary honestly', async () => {
   const { document } = await bootPage();
   const note = document.getElementById('settingsProviderNote').textContent;
   assert.match(note, /own Test Connection/);
-  assert.match(note, /Image and audio adapters are not implemented/);
+  assert.match(note, /Audio supports compatible transcription endpoints/);
 });
 
 test('the renderer source is syntactically valid and keeps its two promises', async () => {
@@ -395,4 +527,11 @@ test('the renderer source is syntactically valid and keeps its two promises', as
   for (const label of Object.values(PURPOSE_LABELS)) {
     assert.ok(source.includes(label), `${label} has a label`);
   }
+});
+
+
+test('compatible endpoint form describes local HTTP support', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../ui/index.html'), 'utf8');
+  assert.ok(html.includes('Base URL (HTTPS or local HTTP)'));
+  assert.ok(html.includes('http://localhost:20128/api/v1'));
 });

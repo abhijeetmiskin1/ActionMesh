@@ -1,7 +1,6 @@
 name: CI
 
-# The three gates the project already treats as its definition of done. No secrets,
-# no credentials, no network services: the suite is stdlib-only and runs offline.
+# Default suites run without service credentials. Live acceptance stays opt-in.
 
 on:
   push:
@@ -28,8 +27,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,server]"
       - name: Unit / integration / security tests
-        run: python -m unittest discover -s tests -t .
+        run: python -m pytest tests -q
       - name: Ruff
         run: ruff check actionmesh tests scripts
       - name: Mypy
         run: mypy actionmesh
+  desktop:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - run: npm test

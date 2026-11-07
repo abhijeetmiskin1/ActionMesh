@@ -7,6 +7,15 @@
 MPRIS not live-verified. Completed work is not listed. Missing live
 credentials ≠ missing source.*
 
+## Latest release scope — 2026-11-06
+
+Booking, ordering and payment execution are excluded by the operator's explicit
+choice: discovery/review only. The real VLC live acceptance and fresh Linux package
+are recorded in CURRENT_STATUS.md; earlier rows below are historical checkpoints.
+Backend duplicate-task protection, simulation provenance and per-lane provider
+probe caching now have focused regression coverage. External-site browser and
+phone/APK acceptance still need their own evidence.
+
 ## P0 — Security, execution correctness, essential integrations
 
 | # | Objective | Current state | Required files | Dependencies | Acceptance criteria | Verification | External prerequisites |

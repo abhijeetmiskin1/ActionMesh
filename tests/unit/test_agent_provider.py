@@ -840,22 +840,14 @@ class TestScreen(_Fs):
 
     def test_a_declined_capture_is_never_confirmable(self) -> None:
         action = _action("device.screen.capture")
-        result = asyncio.run(self.provider.execute(action))
-        status = result.data.get("status")
-        if status == "captured":
-            # The portal granted it on this machine. Then, and only then, is there
-            # something to witness: the frame's own dimensions.
-            observed = self.provider.observe(action)
-            self.assertIsNotNone(observed)
-            self.assertEqual(observed["state"]["width"], result.data["file"]["width"])
+        try:
+            result = asyncio.run(self.provider.execute(action))
+        except ProviderError as exc:
+            self.assertTrue(str(exc))
+            self.assertIsNone(self.provider.observe(action))
         else:
-            # Declined or unreachable: reporting an observation here would let the
-            # verifier confirm a screen that was never read.
-            self.assertIn(status, {"cancelled", "unavailable"})
-            self.assertIsNone(
-                self.provider.observe(action),
-                f"a {status!r} capture must not be observable",
-            )
+            self.assertEqual(result.data.get("status"), "captured")
+            self.assertEqual(self.provider.observe(action), {"postcondition_observed": False})
 
     def test_an_inspection_of_no_tree_observes_nothing(self) -> None:
         # Simulate the no-bus outcome the handler records, without pretending a tree

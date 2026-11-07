@@ -37,6 +37,17 @@ contextBridge.exposeInMainWorld('actionmesh', {
   // its own closed surface, so the renderer string that names purposes is validated
   // by the main process before it touches settings or secrets. Keys are still typed
   // in via IPC arguments, never returned, and stored only when encryption is available.
+  generateImage: (payload) => ipcRenderer.invoke('image:generate', payload),
+  analyzeObservation: (payload) => ipcRenderer.invoke('screen:analyze', payload),
+  speechStatus: () => ipcRenderer.invoke('speech:status'),
+  speechTranscribe: (payload) => ipcRenderer.invoke('speech:transcribe', payload),
+  searchPublic: (query) => ipcRenderer.invoke('search:public', query),
+  todoistConfigure: (token) => ipcRenderer.invoke('todoist:configure', token),
+  todoistList: () => ipcRenderer.invoke('todoist:list'),
+  todoistDisconnect: () => ipcRenderer.invoke('todoist:disconnect'),
+  githubMcpConfigure: (token) => ipcRenderer.invoke('github-mcp:configure', token),
+  githubMcpSearch: (query) => ipcRenderer.invoke('github-mcp:search', query),
+  githubMcpDisconnect: () => ipcRenderer.invoke('github-mcp:disconnect'),
   purposeSpecs: (purpose) => ipcRenderer.invoke('purpose:specs', purpose),
   purposeStatus: (purpose) => ipcRenderer.invoke('purpose:status', purpose),
   purposeConfigure: (payload) => ipcRenderer.invoke('purpose:configure', payload),

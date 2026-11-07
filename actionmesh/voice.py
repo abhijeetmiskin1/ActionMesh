@@ -25,6 +25,8 @@ contract and the privacy evaluation.
 
 from __future__ import annotations
 
+from actionmesh.voice_audio import SCRIPT as CLOUD_VOICE_SCRIPT
+
 _PAGE = r"""<!doctype html>
 <html lang="en" data-surface="voiceos">
 <head>
@@ -192,10 +194,12 @@ footer { margin-top: 20px; font-size: 11.5px; color: var(--ink-faint); }
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z"/><path d="M6 11a6 6 0 0 0 12 0"/><path d="M12 17v4"/></svg>
   </button>
   <p id="micState">The microphone is off.</p>
-  <p id="micHint">One tap opens it for one utterance. It never listens on its own.</p>
+  <p id="micHint">One tap records for the configured cloud Audio provider; tap again to stop.
+  Review the transcript before sending. It never listens on its own.</p>
   <div class="row" style="justify-content:center">
     <button id="speakToggle" class="action ghost" type="button" aria-pressed="true">Voice feedback: on</button>
     <button id="stopSpeaking" class="action ghost" type="button">Stop speaking</button>
+    <button id="cancelDictation" class="action ghost" type="button" disabled>Cancel dictation</button>
   </div>
 </section>
 
@@ -254,12 +258,12 @@ footer { margin-top: 20px; font-size: 11.5px; color: var(--ink-faint); }
 
 <section class="card">
   <h2>Where your voice goes</h2>
-  <p class="privacy">Recognition is performed by <strong>your browser's own speech service</strong>. On desktop Chrome
-  that audio goes to the browser vendor, not to this service and not to us; on Android it is handled by Google's
-  speech service, and in a WebView or a browser without recognition there is no microphone path at all — you type
-  instead. <strong>ActionMesh receives text</strong>: the transcript, and nothing else. This page has no audio
-  capture, stores nothing on your device, and keeps no recording — the conversation lives on the control service
-  as task state, never as audio.</p>
+  <p class="privacy">Cloud dictation sends microphone audio through ActionMesh to the Audio provider configured
+  in the desktop app. Recording starts only when you press the microphone, lasts at most 30 seconds / 128 KiB,
+  and microphone tracks stop before upload. ActionMesh keeps no audio recording. Review the editable transcript
+  and press Ask VoiceOS; dictation alone creates no task and runs nothing. Cancellation discards late answers;
+  an upload already sent cannot be recalled. If cloud capture APIs are absent, native recognition uses
+  your browser's own speech service instead and ActionMesh receives text from that fallback.</p>
 </section>
 
 <footer id="capabilityCount">Loading the capability list…</footer>
@@ -301,7 +305,9 @@ const readJson = async response => {
   try { body = await response.json(); } catch (error) { body = null; }
   if (!response.ok) {
     if (response.status === 401) setToken('');
-    throw new Error((body && body.detail) || 'The laptop refused this request (' + response.status + ').');
+    const error = new Error((body && body.detail) || 'The laptop refused this request (' + response.status + ').');
+    error.status = response.status;
+    throw error;
   }
   return body;
 };
@@ -426,9 +432,10 @@ const sendMessage = async body => {
     if (answer.kind !== 'answer') speak('Here is the plan. Nothing has run yet.');
     return answer;
   } catch (error) {
-    setMessage(error.message, true);
-    setPhase('error', 'The service could not answer.');
-    speak('I could not reach the service.');
+    const busy = error.status === 409 || error.status === 503;
+    setMessage(error.message + (busy ? ' Your request text has been kept. Please wait before trying again.' : ''), true);
+    setPhase(busy ? 'busy' : 'error', busy ? 'Service busy — your text is kept.' : 'The service could not answer.');
+    speak(busy ? 'The service is busy. Please wait.' : 'I could not reach the service.');
     return null;
   } finally {
     button.disabled = false;
@@ -479,7 +486,8 @@ const renderTask = task => {
     stateLine.className = 'step-state';
     stateLine.dataset.done = STEP_DONE[step.state] || '';
     stateLine.textContent = step.state
-      + (step.verified === true ? ' · verified' : (step.verified === false ? ' · NOT verified' : ''))
+      + (step.simulated === true ? ' · simulation only (no real-world effects)'
+        : step.verified === true ? ' · verified' : (step.verified === false ? ' · NOT verified' : ''))
       + (step.execution_id ? ' · ' + step.execution_id : '')
       + (step.error ? ' · ' + step.error : '');
     li.appendChild(line);
@@ -982,6 +990,31 @@ if (!speaker) {
 }
 
 // -- push to talk --
+/* CLOUD_DICTATION_CONTROLLER */
+let dictationRevision = 0;
+let recordingRevision = 0;
+el('transcript').addEventListener('input', () => { dictationRevision += 1; });
+const cloudVoice = window.ActionMeshCloudVoice.create({
+  getStatus: () => get('/voiceos/audio/status'),
+  transcribe: async (audio, signal) => readJson(await fetch('/voiceos/audio/transcribe', {
+    method: 'POST', headers: authHeaders(), body: JSON.stringify({ audio }), signal
+  })),
+  onState: (name, detail) => {
+    state.listening = name === 'listening';
+    micButton.setAttribute('aria-pressed', cloudVoice.active ? 'true' : 'false');
+    micButton.setAttribute('aria-label', name === 'listening' ? 'Stop recording' : cloudVoice.active ? 'Cancel dictation' : 'Tap to speak');
+    el('cancelDictation').disabled = !cloudVoice.active;
+    setPhase(name, detail);
+    if (name === 'error') setMessage(detail, true);
+  },
+  onTranscript: (heard) => {
+    if (dictationRevision !== recordingRevision) {
+      setMessage('Your manual edit was kept; dictation was not inserted.'); return;
+    }
+    setTranscript(heard); syncTranscript();
+    setMessage('Review the transcript and press Ask VoiceOS. Nothing has run.');
+  }
+});
 const SPEECH_ADAPTERS = [
   {
     name: 'browser-native',
@@ -1011,11 +1044,18 @@ const sayUnavailable = () => {
   el('micHint').textContent = 'The text path works everywhere; nothing else on this page needs a microphone.';
 };
 const stopListening = () => {
+  if (cloudVoice.active) cloudVoice.cancel();
   if (state.recognizer) {
     try { state.recognizer.stop(); } catch (error) {}
   }
 };
 const toggleListening = () => {
+  if (cloudVoice.supported) {
+    if (cloudVoice.active) { cloudVoice.stop(); return; }
+    if (speaker) speaker.cancel();
+    recordingRevision = dictationRevision;
+    cloudVoice.start(); return;
+  }
   if (state.listening) { stopListening(); return; }
   const recognizer = createRecognizer();
   if (!recognizer) { sayUnavailable(); return; }
@@ -1027,7 +1067,10 @@ const toggleListening = () => {
   micButton.setAttribute('aria-pressed', 'true');
   setPhase('listening', 'Listening…');
   wireRecognizer(recognizer);
-  recognizer.start();
+  try { recognizer.start(); } catch (error) {
+    finishListening();
+    setPhase('error', 'Browser recognition could not start. Use configured cloud dictation or type your request.');
+  }
 };
 const finishListening = () => {
   state.listening = false;
@@ -1050,9 +1093,8 @@ const wireRecognizer = recognizer => {
       return;
     }
     setTranscript(finalText);
-    // Understanding is inert: it asks what ActionMesh would propose. Running is a press.
-    setPhase('running', 'Processing…');
-    sendMessage({...identityBody(), text: finalText});
+    syncTranscript();
+    setMessage('Review the transcript and press Ask VoiceOS. Nothing has run.');
   };
   recognizer.onerror = event => {
     say('Recognition stopped: ' + (event.error || 'the browser would not say why.'));
@@ -1064,6 +1106,7 @@ const wireRecognizer = recognizer => {
   recognizer.onend = () => { finishListening(); setPhase('idle', 'The microphone is off.'); };
 };
 micButton.addEventListener('click', toggleListening);
+el('cancelDictation').addEventListener('click', () => cloudVoice.cancel());
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopListening();
 });
@@ -1136,7 +1179,7 @@ const loadCapabilities = async () => {
 };
 resetTimeline();
 paintIdentity();
-if (!createRecognizer()) sayUnavailable();
+if (!cloudVoice.supported && !createRecognizer()) sayUnavailable();
 loadCapabilities();
 ping();
 // One poll of the conversation is what keeps the chip honest: presence is a heartbeat
@@ -1156,7 +1199,7 @@ window.setInterval(refreshTarget, 20000);
 
 
 def page() -> str:
-    return _PAGE
+    return _PAGE.replace("/* CLOUD_DICTATION_CONTROLLER */", CLOUD_VOICE_SCRIPT)
 
 
 __all__ = ["page"]

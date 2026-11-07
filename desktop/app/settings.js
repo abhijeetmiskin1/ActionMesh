@@ -24,7 +24,9 @@ const SECRET_KEYS = [
   'chatApiKey',           // NEW - chat/reasoning text providers
   'reasoningApiKey',      // NEW - reasoning-only providers (can alias chat)
   'imageApiKey',          // NEW - image generation providers
-  'audioApiKey'           // NEW - audio/TTS providers
+  'audioApiKey',          // NEW - audio/TTS providers
+  'todoistApiToken',
+  'githubMcpToken',
 ];
 
 const DEFAULTS = {

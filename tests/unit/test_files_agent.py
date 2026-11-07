@@ -195,6 +195,26 @@ class TestListSearch(_EngineCase):
         self.assertTrue(result["truncated"])
         self.assertLessEqual(result["count"], MAX_LIST_ENTRIES)
 
+    def test_search_skips_protected_subtrees_without_aborting(self) -> None:
+        self.make(".config/ActionMesh/secret-report.txt", "protected")
+        self.make("Documents/public-report.txt", "visible")
+        os.symlink(".config/ActionMesh/secret-report.txt", os.path.join(self.root, "linked-report.txt"))
+        result = self.engine.search("", "*report*")
+        self.assertEqual([entry["path"] for entry in result["matches"]], ["Documents/public-report.txt"])
+
+    def test_size_ranking_scans_past_limit_and_uses_regular_files(self) -> None:
+        self.make("a.txt", "small")
+        self.make("deep/large.bin", "x" * 500)
+        self.make("z-medium.txt", "x" * 100)
+        self.make(".ssh/protected.bin", "x" * 1000)
+        os.symlink("deep/large.bin", os.path.join(self.root, "link.bin"))
+        result = self.engine.search("", "*", 2, sort_by="size")
+        self.assertEqual(
+            [(item["path"], item["size"]) for item in result["matches"]],
+            [("deep/large.bin", 500), ("z-medium.txt", 100)],
+        )
+        self.assertFalse(result["truncated"])
+
 
 class TestRead(_EngineCase):
     def test_read_shape_and_digest(self) -> None:
@@ -658,3 +678,13 @@ class TestHardRules(_EngineCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStorage(_EngineCase):
+    @unittest.skipUnless(hasattr(os, "fstatvfs"), "requires filesystem capacity support")
+    def test_storage_reports_capacity_of_workspace_filesystem(self) -> None:
+        stats = os.statvfs(self.root)
+        result = self.engine.storage()
+        self.assertEqual(result["total_bytes"], stats.f_blocks * (stats.f_frsize or stats.f_bsize))
+        self.assertLessEqual(result["available_bytes"], result["total_bytes"])
+        self.assertLessEqual(result["used_bytes"], result["total_bytes"])

@@ -52,8 +52,38 @@ test.after(async () => {
   await loaded.invoke('backend:stop');
 });
 
+test('observation analysis sends only bounded labels to the reasoning provider and never runs an action', async () => {
+  const { invoke } = await app();
+  const providers = require('../app/providers');
+  const original = providers.generate;
+  let seen;
+  providers.generate = async (config, request) => {
+    seen = { config, request };
+    return { state: 'ok', content: { finding: 'A settings dialog with Save and Cancel.' } };
+  };
+  try {
+    await invoke('purpose:configure', { purpose: 'reasoning', provider: 'openai_compatible',
+      model: 'power', baseUrl: 'http://127.0.0.1:20128/api/v1', apiKey: KEY });
+    const answer = await invoke('screen:analyze', { question: 'What is this?',
+      elements: [{ role: 'button', name: 'Save', value: 'never send field values', bounds: { x: 0 } }] });
+    assert.equal(answer.ok, true);
+    assert.equal(answer.source, 'accessibility observation');
+    assert.equal(seen.request.purpose, 'diagnose');
+    assert.equal(seen.request.user.includes('never send field values'), false);
+    assert.equal(seen.request.user.includes('bounds'), false);
+    assert.equal(JSON.stringify(answer).includes(KEY), false);
+    assert.equal((await invoke('screen:analyze', { question: 'Question', elements: [] })).ok, false);
+  } finally {
+    providers.generate = original;
+    await invoke('purpose:remove', { purpose: 'reasoning' });
+    // Restore the empty initial selection expected by the remaining scenarios.
+    await invoke('settings:update', { purpose_reasoning_provider: '', purpose_reasoning_model: '' });
+  }
+});
+
 test('the main process boots and registers every channel preload invokes', async () => {
   const { stub } = await app();
+  if (process.platform === 'linux') assert.ok(stub.__store.commandLineSwitches.has('enable-speech-dispatcher'));
   // Read preload.js as text: the point is that the two lists agree, and a test that
   // imported the bridge would be asserting against itself.
   const preload = fs.readFileSync(path.join(APP_DIR, 'preload.js'), 'utf8');
@@ -200,12 +230,13 @@ test('a provider this build does not implement cannot be saved for image or audi
     const specs = await invoke('purpose:specs', purpose);
     assert.equal(specs.ok, true);
     assert.ok(specs.specs.length > 0, `${purpose} has a table`);
-    assert.ok(specs.specs.every((spec) => spec.implemented === false));
-    assert.ok(specs.specs.every((spec) => typeof spec.unavailableReason === 'string' && spec.unavailableReason.length > 10));
+    const unavailable = specs.specs.filter((spec) => !spec.implemented);
+    assert.ok(unavailable.length);
+    assert.ok(unavailable.every((spec) => typeof spec.unavailableReason === 'string' && spec.unavailableReason.length > 10));
 
     // Even a real-looking id is refused, and nothing is written.
     const refused = await invoke('purpose:configure', {
-      purpose, provider: specs.specs[0].id, model: 'x', apiKey: KEY,
+      purpose, provider: unavailable[0].id, model: 'x', apiKey: KEY,
     });
     assert.equal(refused.ok, false);
     assert.match(refused.error, /not wired|not implemented/i);
@@ -224,12 +255,18 @@ test('an unimplemented provider cannot be named for a text lane either', async (
   assert.equal(answer.error, 'unknown provider');
 });
 
-test('only the chat lane may be the default, and only once it has a provider', async () => {
+test('text lanes can independently select the planner default; media lanes cannot', async () => {
   const { invoke } = await app();
 
   const reasoning = await invoke('purpose:default', { purpose: 'reasoning' });
-  assert.equal(reasoning.ok, false);
-  assert.match(reasoning.error, /chat lane/i);
+  assert.equal(reasoning.ok, true);
+  assert.equal((await invoke('app:state')).settings.providerDefault, false);
+  for (const purpose of ['image', 'audio']) {
+    assert.equal((await invoke('purpose:default', {purpose})).ok, false);
+  }
+  await invoke('purpose:configure', {purpose:'reasoning',provider:'openai',model:'gpt-4o',apiKey:OTHER_KEY});
+  assert.equal((await invoke('purpose:default', {purpose:'reasoning'})).ok, true);
+  assert.equal((await invoke('app:state')).settings.providerDefault, false);
 
   // chat is configured by now, so the default is accepted and visible in app state.
   const chat = await invoke('purpose:default', { purpose: 'chat' });
@@ -306,4 +343,76 @@ test('every modified JS file is syntactically valid', () => {
   execFileSync(process.execPath, ['--check', path.join(APP_DIR, '..', 'ui', 'app.js')], { stdio: 'pipe' });
   execFileSync(process.execPath, ['--check', path.join(APP_DIR, 'browser_window.js')], { stdio: 'pipe' });
   execFileSync(process.execPath, ['--check', path.join(APP_DIR, 'browser_channel.js')], { stdio: 'pipe' });
+});
+
+test('provider lanes retain independent verified states and edits invalidate only their own lane', async () => {
+  const { invoke } = await app();
+  const providers = require('../app/providers');
+  const original = providers.test;
+  providers.test = async () => ({ state: 'connected', detail: 'fixture probe answered' });
+  try {
+    for (const purpose of ['chat', 'reasoning']) {
+      await invoke('purpose:configure', { purpose, provider: 'openai_compatible', model: 'fixture',
+        baseUrl: 'http://127.0.0.1:20128/api/v1', apiKey: KEY });
+      await invoke('purpose:test', { purpose });
+    }
+    assert.equal((await invoke('purpose:status', 'chat')).status.state, 'connected');
+    assert.equal((await invoke('purpose:status', 'reasoning')).status.state, 'connected');
+    await invoke('purpose:configure', { purpose: 'reasoning', provider: 'openai_compatible',
+      model: 'changed', apiKey: OTHER_KEY });
+    assert.equal((await invoke('purpose:status', 'chat')).status.state, 'connected');
+    assert.equal((await invoke('purpose:status', 'reasoning')).status.state, 'not_configured');
+    await invoke('purpose:test', { purpose: 'reasoning', apiKey: KEY });
+    assert.equal((await invoke('purpose:status', 'reasoning')).status.state, 'not_configured',
+      'testing an unsaved credential must not certify the stored credential');
+  } finally { providers.test = original; }
+});
+
+test('each provider purpose keeps its own API endpoint, model and credential', async () => {
+  const { invoke } = await app();
+  const configurations = [
+    ['chat', 'openai_compatible', 'chat-model', 'https://chat.example/v1'],
+    ['reasoning', 'openai_compatible', 'reasoning-model', 'http://localhost:20128/api/v1'],
+    ['audio', 'router_audio', 'speech-model', 'https://audio.example/v1'],
+    ['image', 'router_image', 'image-model', 'https://image.example/v1'],
+  ];
+  for (const [purpose, provider, model, baseUrl] of configurations) {
+    const saved = await invoke('purpose:configure', {purpose, provider, model, baseUrl,
+      apiKey: KEY + '-' + purpose, timeoutSeconds: 20});
+    assert.equal(saved.ok, true);
+  }
+  for (const [purpose, provider, model, endpoint] of configurations) {
+    const result = await invoke('purpose:status', purpose);
+    assert.equal(result.status.provider, provider);
+    assert.equal(result.status.model, model);
+    assert.equal(result.status.endpoint, endpoint);
+    assert.equal(result.status.hasKey, true);
+    assert.equal(JSON.stringify(result).includes(KEY), false);
+  }
+});
+
+test('Todoist verifies before saving, exposes no token, and disconnects', async () => {
+  const { invoke } = await app();
+  const providers = require('../app/providers');
+  const original = providers.todoistTasks;
+  let accepted = false;
+  providers.todoistTasks = async (token) => token === KEY && accepted
+    ? { ok: true, tasks: [{ title: 'Read an article', due: '' }], hasMore: false }
+    : { ok: false, detail: 'No usable token.' };
+  try {
+    assert.equal((await invoke('todoist:configure', KEY)).ok, false);
+    assert.equal((await invoke('todoist:list')).ok, false);
+    await invoke('settings:update', { todoistApiToken: KEY });
+    accepted = true;
+    assert.equal((await invoke('todoist:list')).ok, false);
+    const saved = await invoke('todoist:configure', KEY);
+    assert.deepEqual(saved, { ok: true, detail: 'Todoist verified and saved.' });
+    assert.equal(JSON.stringify(await invoke('app:state')).includes(KEY), false);
+    assert.equal((await invoke('todoist:list')).tasks[0].title, 'Read an article');
+    assert.equal((await invoke('todoist:disconnect')).ok, true);
+    assert.equal((await invoke('todoist:list')).ok, false);
+  } finally {
+    await invoke('todoist:disconnect');
+    providers.todoistTasks = original;
+  }
 });

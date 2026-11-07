@@ -31,8 +31,11 @@ tree that has no actionable element in the asked-for window is an empty list, no
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit
+from uuid import uuid4
 
 #: Screen-space coordinates AT-SPI reports when it has none. They are the GLib sentinel
 #: for "no geometry", and a caller that saw them as a real position would aim a click at
@@ -245,62 +248,66 @@ def capture_screenshot(timeout_s: float = _CAPTURE_TIMEOUT_S) -> dict[str, Any]:
         # absent — but all of them are "no image", and the status says which one.
         if code == 0:
             box["ok"] = True
-            box["uri"] = dict(out or {}).get("screenshot") or ""
+            box["uri"] = out.get("uri", "")
         else:
             box["ok"] = False
             box["code"] = code
         loop.quit()
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    # `interactive: False` asks for a straight capture of the screen without routing
-    # through the compositor's interactive selection UI. It still goes through the
-    # portal, so the OS still applies its policy — and on a session that will not show
-    # a consent dialog to a non-focused requester, the portal answers ``cancelled``
-    # rather than hanging on UI that nobody can click. `modal` keeps that answer tied
-    # to the user rather than a background timer. The focused-app rule is what makes a
-    # capture a foreground action, and passing ``interactive: True`` here only replaces
-    # an honest refusal with a hang.
-    result = bus.call_sync(
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.Screenshot",
-        "Screenshot",
-        GLib.Variant(
-            "(sa{sv})",
-            (
-                "",
-                {
-                    "modal": GLib.Variant("b", True),
-                    "interactive": GLib.Variant("b", False),
-                },
-            ),
-        ),
-        GLib.VariantType("(o)"),
-        Gio.DBusCallFlags.NONE,
-        int(timeout_s * 1000),
-        None,
-    )
-    handle = result.unpack()[0]
-    bus.signal_subscribe(
-        "org.freedesktop.portal.Desktop",
-        "org.freedesktop.portal.Request",
-        "Response",
-        handle,
-        None,
-        Gio.DBusSignalFlags.NONE,
-        on_response,
-    )
-    GLib.timeout_add_seconds(int(max(timeout_s, 1)), loop.quit)
-    loop.run()
+    token = f"actionmesh_{uuid4().hex}"
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    expected_handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+
+    def subscribe(handle: str) -> int:
+        return int(bus.signal_subscribe(
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.portal.Request",
+            "Response",
+            handle,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            on_response,
+        ))
+
+    subscription = subscribe(expected_handle)
+    timer = 0
+    try:
+        result = bus.call_sync(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Screenshot",
+            "Screenshot",
+            GLib.Variant("(sa{sv})", ("", {
+                "handle_token": GLib.Variant("s", token),
+                "modal": GLib.Variant("b", True),
+                "interactive": GLib.Variant("b", False),
+            })),
+            GLib.VariantType("(o)"),
+            Gio.DBusCallFlags.NONE,
+            int(timeout_s * 1000),
+            None,
+        )
+        handle = result.unpack()[0]
+        if handle != expected_handle:
+            old_subscription = subscription
+            subscription = subscribe(handle)
+            bus.signal_unsubscribe(old_subscription)
+        timer = GLib.timeout_add_seconds(int(max(timeout_s, 1)), loop.quit)
+        loop.run()
+    except GLib.Error:
+        return {
+            "status": "unavailable",
+            "reason": "portal_call_failed",
+            "detail": "the OS screenshot portal could not start the capture",
+        }
+    finally:
+        bus.signal_unsubscribe(subscription)
+        if timer and box:
+            GLib.source_remove(timer)
 
     if not box.get("ok"):
         code = box.get("code", -1)
-        # The portal's own vocabulary: 0 success, 1 error, 2 cancelled, 3 closed. A
-        # ``2`` here on a telemetry-driven session means the compositor declined to
-        # show its consent dialog to a process it does not consider focused -- the
-        # focused-app rule enforced below the app, not by it. The status says
-        # "cancelled" because that is what the user-visible outcome is; the detail
-        # says why, so an operator is not left guessing whether a person clicked "no".
         return {
             "status": "cancelled",
             "session": session,
@@ -308,12 +315,19 @@ def capture_screenshot(timeout_s: float = _CAPTURE_TIMEOUT_S) -> dict[str, Any]:
             "detail": _portal_refusal_detail(code),
         }
 
-    uri = str(box.get("uri") or "")
+    uri = box.get("uri")
+    file = _describe_file(uri) if isinstance(uri, str) else {}
+    if not file.get("format"):
+        return {
+            "status": "unavailable",
+            "reason": "invalid_portal_frame",
+            "detail": "the screenshot portal returned no readable image",
+        }
     return {
         "status": "captured",
         "session": session,
         "uri": uri,
-        "file": _describe_file(uri),
+        "file": file,
         # The bytes are not returned and not kept: a frame is shown in the moment it is
         # captured and then the only record of it is that it happened and how large it
         # was. Retaining it would be storing a screenshot, which this capability does
@@ -324,33 +338,26 @@ def capture_screenshot(timeout_s: float = _CAPTURE_TIMEOUT_S) -> dict[str, Any]:
 
 def _portal_refusal_detail(code: int) -> str:
     """The portal's refusal code as a sentence, using the portal's own vocabulary."""
-    if code == 2:
-        # The usual meaning in a real session is a person declining. In a session whose
-        # requester is not focused (a background agent, a headless host), the compositor
-        # cannot show its dialog and the request is refused this same way; both are
-        # "no image", and this detail does not pretend to know which one happened.
-        return (
-            "the screenshot request was cancelled: the OS did not grant it (a user "
-            "declining, or a session that will not show a consent dialog to this "
-            "process, both answer here)"
-        )
     if code == 1:
-        return "the screenshot portal reported an error while capturing"
-    if code == 3:
-        return "the screenshot request was closed before it completed"
+        return "the screenshot request was cancelled"
+    if code == 2:
+        return "the OS ended the screenshot request without granting a capture"
+    if code == -1:
+        return "the screenshot portal did not respond before the deadline"
     return "the screenshot request was not granted"
 
 
 def _describe_file(uri: str) -> dict[str, Any]:
     """The file at a ``file://`` URI, by its own shape. Empty when it is not readable."""
-    if not uri.startswith("file://"):
-        return {}
-    path = uri[len("file://"):]
     try:
+        parsed = urlsplit(uri)
+        if parsed.scheme != "file" or parsed.netloc or not parsed.path.startswith("/"):
+            return {}
+        path = unquote(parsed.path)
         size = os.path.getsize(path)
         with open(path, "rb") as handle:
             head = handle.read(64)
-    except OSError:
+    except (OSError, ValueError):
         return {}
     return _decode_image(head, size)
 
@@ -528,8 +535,11 @@ def inspect_gui(
             for index, app in apps
             if (app.get_name() or "").strip().lower() == wanted
         ]
-        if named:
-            chosen = named
+        if not named:
+            return {"status": "window_not_found", "session": _desktop_session(),
+                    "window": window.strip(), "element_count": 0, "elements": [],
+                    "detail": "The named accessibility application was not found; no other window was read."}
+        chosen = named
 
     elements: list[dict[str, Any]] = []
     counter = {"n": 0}
@@ -1216,3 +1226,81 @@ __all__ = [
     "scroll_element",
     "type_text",
 ]
+
+
+# A bundled Python cannot load a host CPython's compiled gi extension. Executed
+# as a standalone, fixed script by native_desktop, this module needs only stdlib
+# and the host's installed desktop bindings. It exposes no arbitrary command/code.
+def valid_native_request(operation: str, parameters: dict[str, Any]) -> bool:
+    if not isinstance(parameters, dict):
+        return False
+    keys = {
+        "capture": set(), "inspect": {"window", "max_elements"},
+        "click": {"role", "name", "window"},
+        "type": {"role", "name", "text", "window"},
+        "scroll": {"role", "name", "direction", "window"},
+    }
+    if operation not in keys or set(parameters) - keys[operation]:
+        return False
+    for key in ("window", "role", "name"):
+        value = parameters.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > 500):
+            return False
+    if operation in {"click", "type", "scroll"} and (
+        not parameters.get("role") or not isinstance(parameters.get("name"), str)
+    ):
+        return False
+    if operation == "inspect":
+        cap = parameters.get("max_elements", _MAX_ELEMENTS)
+        if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= _MAX_ELEMENTS:
+            return False
+    if operation == "type":
+        text = parameters.get("text")
+        if not isinstance(text, str) or not text or len(text) > 16000:
+            return False
+    return operation != "scroll" or parameters.get("direction") in _SCROLL_EDGES
+
+
+def _native_main() -> None:
+    import json
+    import sys
+
+    if sys.argv[1:] == ["--native-probe"]:
+        try:
+            import gi
+
+            gi.require_version("Gio", "2.0")
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi, Gio  # noqa: F401
+
+            print(json.dumps({"available": True}))
+        except (ImportError, ValueError):
+            print(json.dumps({"available": False}))
+        return
+    if sys.argv[1:] != ["--native-request"]:
+        return
+    raw = os.environ.pop("ACTIONMESH_NATIVE_REQUEST", "")
+    answer: dict[str, Any] = {"status": "invalid", "detail": "Invalid native desktop request."}
+    try:
+        if len(raw.encode("utf-8")) > 64 * 1024:
+            raise ValueError("request limit")
+        request = json.loads(raw)
+        operation = request.get("operation")
+        parameters = request.get("parameters")
+        if not isinstance(operation, str) or not valid_native_request(operation, parameters):
+            raise ValueError("invalid request")
+        functions: dict[str, Callable[..., dict[str, Any]]] = {
+                     "capture": capture_screenshot, "inspect": inspect_gui,
+                     "click": click_element, "type": type_text, "scroll": scroll_element}
+        answer = functions[operation](**parameters)
+    except Exception:
+        # Never print exception text or an input: labels and typed text are private.
+        answer = {"status": "unavailable", "detail": "The host desktop operation was unavailable."}
+    encoded = json.dumps(answer)
+    if len(encoded.encode("utf-8")) > 256 * 1024:
+        encoded = json.dumps({"status": "unavailable", "detail": "Desktop observation exceeded its limit."})
+    print(encoded)
+
+
+if __name__ == "__main__":
+    _native_main()

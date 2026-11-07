@@ -14,6 +14,8 @@ simulated providers. Deployments and tests may inject an `ExecutionEngine`.
 | GET | `/voice` | VoiceOS: the microphone surface. Transcript → `/plan` → an explicit run press → `/execute` → the existing approval gate → `/events` → `/executions/{execution_id}`. It cannot record a consent or mint a pairing, and every privileged step is its own press — `docs/voiceos.md` is the contract, `tests/unit/test_voice.py` pins it |
 | GET | `/manifest.webmanifest`, `/sw.js`, `/icon.svg` | Installable-app shell assets |
 | POST | `/plan` | **Propose** candidate actions from natural-language intent (C18) |
+| GET | `/voiceos/audio/status` | Whether the desktop Audio lane is configured for cloud dictation; no microphone access or credentials are returned |
+| POST | `/voiceos/audio/transcribe` | Explicit transient WebM/Opus upload as `{ "audio": "<base64>" }`; decoded maximum 128 KiB, JSON body maximum 180,000 bytes. Returns editable `text`, `ran: false`, `stored: false`. Requires the existing local/paired principal and API-key boundary; no tasks, audit audio or executions are created |
 | POST | `/voiceos/messages` | One VoiceOS turn: intent, conversational references and a proposed task session. It never runs anything — the answer carries `ran: false` always (C34) |
 | POST | `/voiceos/guide` | Which of a caller-supplied list of example phrasings this deployment's planner would actually route. A **measurement**, not a promise: each phrase runs through the same planner a real turn uses. Proposes nothing, authorizes nothing, runs nothing (C41) |
 | GET | `/voiceos/conversation` | This actor's conversation context: history, active session, and the observed items a later turn may refer to |
@@ -490,3 +492,19 @@ entries of `GUIDE_MAX_PHRASE_CHARS` (200) characters, blank entries refused with
 400, and each string echoed back only as the string that was sent. **The route
 proposes nothing, authorizes nothing and runs nothing** — it creates no session and
 no execution, which `tests/unit/test_command_guide.py` asserts directly.
+
+
+## Cloud dictation
+
+The web Voice page captures only after a microphone press, at most 30 seconds or
+128 KiB. Tracks stop before upload. It forwards audio through the existing private
+provider bridge to the desktop Audio configuration; provider credentials remain
+in Electron main. ActionMesh does not persist recordings. Cancellation stops local
+capture and ignores late responses; it cannot recall data already sent upstream.
+The transcript remains editable and requires an explicit Ask VoiceOS press.
+
+Invalid audio/extra fields return 400, oversized streamed bodies 413, non-JSON
+requests 415, empty transcripts 422, and unavailable/busy providers 503. Browser
+microphone capture requires a secure context and a supported WebM/Opus recorder.
+Unconfigured deployments and unsupported devices retain text input. HTTP 409/503
+on a message keeps the web page's request text and never triggers an automatic retry.

@@ -23,7 +23,7 @@ from actionmesh.core.devices import EXECUTION_KINDS
 from actionmesh.core.executor.engine import ExecutionEngine, ExecutionResult
 from actionmesh.core.graph.serialization import graph_from_dict
 from actionmesh.core.permissions.context import PolicyContext
-from actionmesh.protocol.models import ActionState, ExecutionRecord
+from actionmesh.protocol.models import ActionState, ExecutionRecord, RiskLevel
 from actionmesh.voiceos.models import TaskSession, TaskStep
 from actionmesh.voiceos.reasoning import observed_references
 
@@ -45,13 +45,64 @@ TERMINAL_STATES = frozenset(
 )
 
 
+class SessionBusyError(RuntimeError):
+    """A task already has an advancing request, or the active-task limit was reached."""
+
+
+# These actions can start after a single spoken request. The normal policy and
+# approvals still apply. Browser form interactions, writes and commands stay in review.
+_HANDS_FREE_ACTIONS = frozenset({
+    "device.app.open", "device.screen.capture", "device.screen.inspect",
+    "device.file.list", "device.file.read", "device.files.list", "device.files.search",
+    "device.files.read", "device.files.info", "device.files.open", "device.files.storage",
+    "device.process.list", "device.server.status", "device.project.list",
+    "device.project.status", "device.ide.list",
+    "browser.inspect", "browser.snapshot", "browser.stop",
+    "media.status", "media.play", "media.pause", "media.next", "media.previous",
+    "media.volume", "media.open_file",
+})
+
+
 class Orchestrator:
     """Runs a session's steps, and reports what actually happened to each one."""
 
     def __init__(self, *, engine: ExecutionEngine) -> None:
         self.engine = engine
+        self._advancing: set[str] = set()
+
+    def can_start_from_voice(self, session: TaskSession, local_device: str) -> bool:
+        """Whether the whole fresh plan can start without a separate review click."""
+        registry = self.engine.registry
+        return bool(
+            local_device and session.device_id == local_device and session.steps
+            and all(
+                step.state == "pending"
+                and step.device_id in {"", local_device}
+                and step.action_type in _HANDS_FREE_ACTIONS
+                and (step.action_type != "device.app.open" or not step.parameters.get("arguments"))
+                and registry.has(step.action_type)
+                and registry.get(step.action_type).risk_level in {RiskLevel.LOW, RiskLevel.MEDIUM}
+                for step in session.steps
+            )
+        )
 
     async def advance(
+        self, session: TaskSession, context: PolicyContext, *,
+        checkpoint: Callable[[TaskSession], None] | None = None,
+    ) -> dict[str, Any]:
+        # No await between testing and claiming: requests on this event loop cannot
+        # both advance a stale copy of one session. Always release on cancellation.
+        if session.session_id in self._advancing:
+            raise SessionBusyError("This task is already advancing; wait for its current request.")
+        if len(self._advancing) >= 128:
+            raise SessionBusyError("The task service is busy; try again shortly.")
+        self._advancing.add(session.session_id)
+        try:
+            return await self._advance(session, context, checkpoint=checkpoint)
+        finally:
+            self._advancing.discard(session.session_id)
+
+    async def _advance(
         self,
         session: TaskSession,
         context: PolicyContext,
@@ -433,6 +484,8 @@ class Orchestrator:
         step.execution_id = result.execution_id
         node = self._action_node(result.nodes)
         step.observed = dict(self._field(node, "result") or {})
+        simulated = self._field(node, "simulated")
+        step.simulated = simulated if isinstance(simulated, bool) else None
         # Overwrite, never accumulate: the reason a step parked must not still be
         # printed next to it after it succeeded.
         step.error = str(self._field(node, "error") or result.error or "")
@@ -460,6 +513,8 @@ class Orchestrator:
             return False
         node = self._action_node(record.results)
         step.observed = dict(self._field(node, "result") or {})
+        simulated = self._field(node, "simulated")
+        step.simulated = simulated if isinstance(simulated, bool) else None
         step.error = str(self._field(node, "error") or "")
         if record.state is ActionState.DENIED:
             step.state = "denied"
@@ -513,6 +568,10 @@ class Orchestrator:
         parts = [f"{len(settled)} of {total} steps settled."]
         if analysed:
             parts.append("The explanation step is filled in when you ask for it.")
+        simulated = [str(step.index + 1) for step in settled if step.simulated is True]
+        if simulated:
+            parts.append("Simulation only for step(s) " + ", ".join(simulated)
+                         + "; these steps produced no real-world effects.")
         if unverified:
             parts.append(
                 "Step(s) " + ", ".join(str(item) for item in unverified)

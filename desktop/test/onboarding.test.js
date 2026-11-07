@@ -327,3 +327,16 @@ test('onboarding readiness reflects initialState, never invented READY', () => {
   const up = onboarding.collectChecks(fakeState(), null);
   assert.equal(up.service.status, onboarding.READY);
 });
+
+
+test('implemented router image and audio lanes can earn READY after a real probe', () => {
+  const statuses = { ...fakeState().purposes,
+    image: { state: 'connected' }, audio: { state: 'connected' } };
+  const specs = { ...fakeState().specsByPurpose,
+    image: [{ id: 'router_image', implemented: true }],
+    audio: [{ id: 'router_audio', implemented: true }] };
+  const result = onboarding.checkProviders(statuses, specs);
+  assert.equal(result.lanes.image.status, READY);
+  assert.equal(result.lanes.audio.status, READY);
+  assert.doesNotMatch(onboarding.STEPS.find((step) => step.id === 'providers').blurb, /not implemented/);
+});

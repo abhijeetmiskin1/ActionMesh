@@ -49,7 +49,7 @@
     { id: 'permissions', label: 'Permissions', optional: false,
       blurb: 'OS boundaries stay off until you turn each one on. Nothing below is required to finish.' },
     { id: 'providers', label: 'AI providers', optional: true,
-      blurb: 'Optional. Chat and reasoning can be connected now; image and audio adapters are not implemented in this build.' },
+      blurb: 'Optional. Configure chat, reasoning, image generation and speech-to-text providers in AI Providers.' },
     { id: 'browser', label: 'Browser', optional: true,
       blurb: 'Optional. A hardened, controlled browser window you can already open from the shell.' },
     { id: 'media', label: 'Media', optional: true,
@@ -339,8 +339,8 @@
       }
       const note = el(doc, 'p', {
         class: 'onboarding-note',
-        text: 'Image and audio adapters are not implemented in this build, so those lanes can never show READY here. '
-          + 'Connect a provider from Settings → Providers; “Test Connection” is the only way a lane earns READY.',
+        text: 'Connect each lane from AI Providers. Image and Audio support compatible 9router endpoints. '
+          + '“Test Connection” verifies the configured model; an image test generates an image and may incur usage.',
       });
       const testBtn = el(doc, 'button', {
         class: 'btn ghost small', type: 'button', text: 'Test chat connection',

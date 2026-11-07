@@ -16,7 +16,7 @@
  * misconfigured workspace is a startup failure rather than a quietly reduced
  * capability list.
  */
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const net = require('net');
@@ -38,6 +38,21 @@ function ensureDirs(dataDir) {
   };
   for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { recursive: true });
   return dirs;
+}
+
+/** Keep process logs outside any operator-selected file workspace. */
+function chooseAgentLogDir(workspace, desired) {
+  const root = fs.realpathSync(workspace);
+  const outside = candidate => {
+    const relative = path.relative(root, candidate);
+    return relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
+  };
+  const candidate = path.join(fs.realpathSync(path.dirname(desired)), path.basename(desired));
+  if (outside(candidate)) return candidate;
+  const temporaryRoot = fs.realpathSync(os.tmpdir());
+  if (!outside(temporaryRoot)) throw new Error('Choose a workspace that leaves room for private agent logs.');
+  // mkdtemp creates a private 0700 directory; never reuse an untrusted existing path.
+  return fs.mkdtempSync(path.join(temporaryRoot, 'actionmesh-agent-logs-'));
 }
 
 /** Ask the kernel for a free loopback port, then release it for the child. */
@@ -240,6 +255,7 @@ class Backend {
     this.dirs = ensureDirs(this.dataDir);
     const workspace = this.settings.workspaceRoot || this.dirs.workspace;
     fs.mkdirSync(workspace, { recursive: true });
+    this.agentLogDir = chooseAgentLogDir(workspace, path.join(this.dirs.logs, 'agent'));
     this.runtime = resolveRuntime({
       appRoot: this.appRoot,
       isPackaged: this.isPackaged,
@@ -259,6 +275,28 @@ class Backend {
     }
     if (!fs.existsSync(this.appRoot)) {
       throw new Error(`no application source at ${this.appRoot}`);
+    }
+    // Compiled PyGObject belongs to the host CPython ABI. Keep the bundled
+    // backend isolated and call only the shipped, typed OS adapter with host Python.
+    this.nativeDesktop = false;
+    if (this.isPackaged && process.platform === 'linux' && this.settings.agentEnabled && this.settings.allowDesktop) {
+      try {
+        const probe = spawnSync('/usr/bin/python3', ['-I',
+          path.join(this.appRoot, 'actionmesh', 'agent', 'device_screen.py'), '--native-probe'], {
+          timeout: 3000, maxBuffer: 1024, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: {},
+        });
+        this.nativeDesktop = probe.status === 0 && JSON.parse(probe.stdout).available === true;
+      } catch { /* unavailable: never advertise a fake desktop */ }
+    }
+    this.nativeMedia = false;
+    if (this.isPackaged && process.platform === 'linux' && this.settings.agentEnabled && this.settings.allowMedia) {
+      try {
+        const probe = spawnSync('/usr/bin/python3', ['-I',
+          path.join(this.appRoot, 'actionmesh', 'agent', 'mpris.py'), '--native-probe'], {
+          timeout: 3000, maxBuffer: 1024, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: {},
+        });
+        this.nativeMedia = probe.status === 0 && JSON.parse(probe.stdout).available === true;
+      } catch { /* unavailable; never enable another OS boundary */ }
     }
     return { workspace, ...this.runtime };
   }
@@ -295,6 +333,8 @@ class Backend {
       // A packaged runtime must not go looking at the user's site-packages: what
       // ships is exactly what runs.
       PYTHONNOUSERSITE: '1',
+      ACTIONMESH_NATIVE_DESKTOP: this.nativeDesktop ? '1' : '0',
+      ACTIONMESH_NATIVE_MEDIA: this.nativeMedia ? '1' : '0',
     };
     // 5: the laptop agent, configured from the app's own settings.
     if (s.agentEnabled) {
@@ -311,7 +351,7 @@ class Backend {
       env.ACTIONMESH_ALLOW_BROWSER = s.allowBrowser ? '1' : '0';
       env.ACTIONMESH_ALLOW_MEDIA = s.allowMedia ? '1' : '0';
       env.ACTIONMESH_ALLOWED_COMMANDS = (s.allowedCommands || []).join(',');
-      env.ACTIONMESH_AGENT_LOG_DIR = path.join(this.dirs.logs, 'agent');
+      env.ACTIONMESH_AGENT_LOG_DIR = this.agentLogDir || path.join(this.dirs.logs, 'agent');
     }
     if (s.voiceTasksFile) env.ACTIONMESH_VOICEOS_TASKS = s.voiceTasksFile;
     // 6: the model bridge. The credential is *not* here — only the address of the
@@ -497,6 +537,7 @@ module.exports = {
   Backend,
   newLoopbackKey,
   ensureDirs,
+  chooseAgentLogDir,
   resolveRuntime,
   freePort,
   // Exported for the data-directory claim's own tests: the guard that stops a second

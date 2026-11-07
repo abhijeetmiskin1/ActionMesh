@@ -49,7 +49,7 @@ MAX_NODE_BYTES = 64 * 1024
 #: wants; an element list is a single document, and a fragment of it is not "less of the
 #: answer" -- it is unparseable, so the reader gets nothing at all. These streams are
 #: therefore delivered entire or refused, never cut.
-WHOLE_DOCUMENT_STREAMS = frozenset({"elements"})
+WHOLE_DOCUMENT_STREAMS = frozenset({"elements", "browser.elements"})
 #: The node budget for a whole-document stream. An accessibility walk returns at most
 #: ``device_screen._MAX_ELEMENTS`` (200) elements, and one element measured on a real
 #: desktop is about 170 bytes of JSON, so the cap that fits the walk is roughly 35 KB.

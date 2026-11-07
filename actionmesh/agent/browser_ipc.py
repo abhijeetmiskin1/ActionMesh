@@ -485,6 +485,8 @@ class CommandResult:
     #: returning it; the engine re-redacts regardless.
     text: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    loading: bool = False
+    requested_url: str = ""
 
     def to_wire(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"request_id": self.request_id, "status": self.status}
@@ -494,6 +496,10 @@ class CommandResult:
             payload["url"] = self.url
         if self.title:
             payload["title"] = self.title
+        if self.loading:
+            payload["loading"] = True
+        if self.requested_url:
+            payload["requested_url"] = self.requested_url
         if self.changed is not None:
             payload["changed"] = self.changed
         if self.inserted is not None:
@@ -512,6 +518,10 @@ class CommandResult:
     def from_wire(cls, data: dict[str, Any]) -> CommandResult:
         if not isinstance(data, dict):
             raise BrowserIpcError("result must be an object")
+        if "loading" in data and not isinstance(data["loading"], bool):
+            raise BrowserIpcError("loading must be a boolean")
+        if "requested_url" in data and not isinstance(data["requested_url"], str):
+            raise BrowserIpcError("requested_url must be a string")
         raw_elements = data.get("elements") or []
         return cls(
             request_id=str(data.get("request_id") or ""),
@@ -519,6 +529,8 @@ class CommandResult:
             epoch=(None if data.get("epoch") is None else int(data["epoch"])),
             url=str(data.get("url") or ""),
             title=str(data.get("title") or ""),
+            loading=data.get("loading") is True,
+            requested_url=str(data.get("requested_url") or "")[:2048],
             changed=(None if data.get("changed") is None else bool(data["changed"])),
             note=str(data.get("note") or ""),
             inserted=(None if data.get("inserted") is None else int(data["inserted"])),

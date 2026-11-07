@@ -44,7 +44,7 @@ Executor acts. Verifier confirms. Audit remembers.*
 
 | Concern | Location |
 |---|---|
-| API routes | `actionmesh/api.py` (49 routes, excl. middleware; verified 2026-11-04) |
+| API routes | `actionmesh/api.py` (51 routes, excl. middleware; verified 2026-11-07) |
 | Registry + seeds | `actionmesh/core/registry/` |
 | Permission catalog + policy | `actionmesh/core/permissions/` |
 | Graph | `actionmesh/core/graph/` |
@@ -100,3 +100,6 @@ cd desktop && npm test
 - Light theme only (`desktop/ui/styles.css` tokens) — do not change
   without an explicit requirement.
 - Add a focused test for new behavior; verify actual functionality.
+- Prefer clear standard-library code, bounded work, and efficient data structures.
+  Measure performance changes on the affected path and avoid duplicate I/O, repeated
+  scans, and artificial delays.

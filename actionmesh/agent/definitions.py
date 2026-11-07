@@ -213,7 +213,8 @@ def device_definitions() -> list[ActionDefinition]:
         _def(
             "device.app.open", RiskLevel.MEDIUM, ["system.app.launch"],
             {"app": _S, "arguments": _ARGS}, ["app"],
-            "Launch an application on the laptop",
+            "Launch an application by executable name; use app=browser for the web browser "
+            "without a destination, or app=calculator for the calculator",
         ),
         _def(
             "device.app.close", RiskLevel.HIGH, ["device.control"],
@@ -394,8 +395,10 @@ def device_definitions() -> list[ActionDefinition]:
         ),
         _def(
             "device.files.search", RiskLevel.LOW, ["device.file.list"],
-            {"path": _S, "pattern": _S, "limit": _NUM}, ["path", "pattern"],
-            "Search file names under a directory inside the workspace root",
+            {"path": _S, "pattern": _S, "limit": _NUM,
+             "sort_by": {"type": "string", "enum": ["name", "size"]}}, ["path", "pattern"],
+            "Search workspace file names (glob pattern, not contents). For largest files, "
+            "use pattern=* and sort_by=size. Use path=. for the workspace root",
         ),
         _def(
             "device.files.read", RiskLevel.MEDIUM, ["file.read"],
@@ -406,6 +409,10 @@ def device_definitions() -> list[ActionDefinition]:
             "device.files.open", RiskLevel.MEDIUM, ["device.file.list"],
             {"path": _S}, ["path"],
             "Open a file in its default application",
+        ),
+        _def(
+            "device.files.storage", RiskLevel.LOW, ["device.file.list"],
+            {}, [], "Report used, available and total space on the workspace filesystem",
         ),
         _def(
             "device.files.info", RiskLevel.LOW, ["device.file.list"],
@@ -459,7 +466,7 @@ def device_definitions() -> list[ActionDefinition]:
         _def(
             "media.pause", RiskLevel.LOW, ["media.control"],
             {"ref": _S}, [],
-            "Pause the current media selection",
+            "Pause or stop playback of the current media selection (can resume later)",
         ),
         _def(
             "media.next", RiskLevel.LOW, ["media.control"],
@@ -531,6 +538,7 @@ REQUIRING_FILE_ROOT: frozenset[str] = frozenset(
         "device.files.read",
         "device.files.open",
         "device.files.info",
+        "device.files.storage",
         "device.files.create",
         "device.files.rename",
         "device.files.move",
@@ -635,6 +643,7 @@ IMPLEMENTED: frozenset[str] = frozenset(
         "device.files.read",
         "device.files.open",
         "device.files.info",
+        "device.files.storage",
         "device.files.create",
         "device.files.rename",
         "device.files.move",

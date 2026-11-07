@@ -465,6 +465,7 @@ function install({ bridge } = {}) {
     return handler ? handler(...args) : Promise.resolve(undefined);
   };
   for (const name of [
+    'generateImage', 'analyzeObservation', 'speechStatus', 'speechTranscribe',
     'state', 'updateSettings', 'providerSpecs', 'providerStatus', 'providerConfigure',
     'providerTest', 'providerRemove', 'providerSetModel', 'purposeSpecs', 'purposeStatus',
     'purposeConfigure', 'purposeTest', 'purposeRemove', 'purposeSetModel', 'purposeSetDefault',
@@ -492,6 +493,7 @@ function install({ bridge } = {}) {
     navigator: { platform: 'Linux x86_64', userAgent: 'node-harness', clipboard: { writeText: async () => {} } },
     location: { href: 'file:///index.html' },
     URL: { createObjectURL: () => 'blob:fake', revokeObjectURL() {} },
+    URLSearchParams,
     setTimeout: (fn, ms, ...rest) => {
       // Long polls are recorded, not scheduled: a boot test must not leave a 5-second
       // interval behind that keeps the process alive.
@@ -561,7 +563,7 @@ function install({ bridge } = {}) {
       const names = ['window', 'document', 'navigator', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'confirm', 'alert', 'URL', 'fetch', 'Node', 'CSS'];
       const values = names.map((name) => (name in win ? win[name] : globalThis[name]));
       // eslint-disable-next-line no-new-func
-      const run = new Function(...names, `${source}\nreturn { boot };`);
+      const run = new Function(...names, `${source}\nreturn { boot, handleStreamEvent };`);
       return run(...values);
     },
   };

@@ -1,5 +1,36 @@
 # Integrations
 
+## Desktop discovery and service shortcuts
+
+VoiceOS recognizes explicit flight-route requests and “search the public web for”
+requests. The desktop provider transport sends a bounded public query to the
+configured loopback 9router `/search` endpoint using the stored Chat credential.
+The live-tested upstream is Antigravity. The reply shows up to five HTTPS
+sources and gives a separate link to look up the route and date. These sources
+are web discovery, with no live fare inventory or booking integration.
+
+“Directions from … to …” and “find … on Google Maps” prepare Maps links.
+The **Services** button opens browser shortcuts for Gmail, Calendar, Google
+Tasks, Drive, Maps, Docs, Sheets, Keep, Contacts, Todoist, Microsoft To Do and
+LinkedIn. Shortcuts use the browser's sign-in.
+
+**Todoist** also supports a direct read-only connection. In Voice, open
+**Services → Manage Todoist connection** to verify and save a Todoist developer
+token using the desktop keyring. “Show my Todoist tasks” reads the first ten
+active tasks. The connector displays titles and due dates, keeps the token in
+the main process after setup, and does not send tasks to a model or persist
+their contents. Disconnect removes the saved token. Other in-app account
+reads still need separate per-service integrations and authorization.
+
+**GitHub repository search** is available with “Search GitHub for …”. Without a
+saved token it uses GitHub's public REST API. **Services → Manage GitHub MCP
+connection** can verify and save a GitHub personal access token for the hosted
+GitHub MCP server. The desktop transport negotiates the session, restricts
+the server to read-only mode and calls only `search_repositories`. The reply
+labels the source and displays up to five public repository names,
+descriptions and links. The token stays in desktop storage. Other MCP servers
+and toolsets require separate implementations.
+
 ## Browser
 
 | Aspect | Detail |

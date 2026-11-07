@@ -36,7 +36,7 @@ _TERMINAL_STATES = frozenset(
 )
 
 #: The schema this code writes. Bump by one with each migration appended below.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _migrate_v0_to_v1(connection: sqlite3.Connection) -> None:
@@ -117,12 +117,23 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE execution_parked RENAME TO execution_body")
 
 
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Bound recent-history reads without sorting the entire execution table."""
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS execution_records_recent ON execution_records (updated_at DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS mesh_events_execution ON mesh_events (execution_id)"
+    )
+
+
 #: Each entry upgrades from its index to index+1. Appending a step is the only way the
 #: version moves; there is no branching on "does this table exist".
 MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _migrate_v0_to_v1,
     _migrate_v1_to_v2,
     _migrate_v2_to_v3,
+    _migrate_v3_to_v4,
 )
 
 

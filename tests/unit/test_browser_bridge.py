@@ -135,11 +135,15 @@ async def test_provider_wires_bridge_driver_when_configured(tmp_path) -> None:
     assert type(provider.browser._driver).__name__ == "BridgeDriver"
 
     bare = LaptopProvider()
-    assert type(bare.browser._driver).__name__ == "FakeDriver"
+    assert type(bare.browser._driver).__name__ == "BridgeDriver"
 
     # A half-filled pair is "not configured", never a dead dial.
     half = LaptopProvider(browser_bridge=BrowserBridgeConfig(socket_path=str(tmp_path / "x.sock"), token=""))
-    assert type(half.browser._driver).__name__ == "FakeDriver"
+    assert type(half.browser._driver).__name__ == "BridgeDriver"
+    for candidate in (bare, half):
+        opened = await candidate.browser.open("https://example.com")
+        assert opened["status"] == "unavailable"
+        assert not candidate.browser.is_open
 
 async def test_bridge_driver_snapshot_records_carry_driver_id(tmp_path) -> None:
     """The driver contract promises snapshot records keyed by ``id`` (the

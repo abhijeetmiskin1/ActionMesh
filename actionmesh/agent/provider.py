@@ -44,9 +44,10 @@ from actionmesh.agent.errors import (
     PathNotFound,
     ProcessError,
 )
+from actionmesh.agent.files import MAX_READ_BYTES as FILE_READ_LIMIT
 from actionmesh.agent.files import FilesEngine
 from actionmesh.agent.ides import KNOWN_IDES, EditorDiscovery, EditorNotFound
-from actionmesh.agent.media import MediaEngine, MprisMediaDriver
+from actionmesh.agent.media import MediaEngine, production_driver
 from actionmesh.agent.paths import ResolvedPath, Workspace
 from actionmesh.agent.processes import (
     EXITED,
@@ -150,6 +151,7 @@ class LaptopProvider(ActionProvider):
             "device.files.read",
             "device.files.open",
             "device.files.info",
+            "device.files.storage",
             "device.files.create",
             "device.files.rename",
             "device.files.move",
@@ -224,6 +226,7 @@ class LaptopProvider(ActionProvider):
             "device.files.read",
             "device.files.open",
             "device.files.info",
+            "device.files.storage",
             "device.files.create",
             "device.files.rename",
             "device.files.move",
@@ -290,15 +293,11 @@ class LaptopProvider(ActionProvider):
         #: C42 — the controlled browser session, driven only by the named
         #: operations. The driver is chosen by the host's *configuration*, never
         #: by the request: when a bridge config is present the engine drives the
-        #: hardened window over the drive socket; otherwise it is a ``FakeDriver``
-        #: whose verbs answer ``unavailable`` honestly rather than claiming a
-        #: bridge that is not there. ``api.py`` builds the config from the env
-        #: main wrote at spawn, so the provider core never opens IPC itself.
-        self.browser: BrowserEngine = (
-            BrowserEngine(BridgeDriver(_make_browser_request(browser_bridge)))
-            if browser_bridge is not None and browser_bridge.configured
-            else BrowserEngine()
-        )
+        #: hardened window over the drive socket. An absent/partial config uses the
+        #: same transport's unavailable response, never a simulated browser.
+        #: Tests that need pages explicitly inject BrowserEngine(FakeDriver()).
+        config = browser_bridge or BrowserBridgeConfig(socket_path="", token="")
+        self.browser = BrowserEngine(BridgeDriver(_make_browser_request(config)))
         #: C42 — the confined richer file verbs. ``FilesEngine`` reuses
         #: ``Workspace`` for every resolution; the provider delegates and records
         #: effects on the way back, exactly as it does for ``device.file.*``.
@@ -328,7 +327,7 @@ class LaptopProvider(ActionProvider):
         #: engine's sync callable is only the legacy delegate above; the real
         #: async navigation happens in the provider wrapper.
         self.media: MediaEngine = MediaEngine(
-            MprisMediaDriver(),
+            production_driver(),
             workspace=workspace,
             browser_open=_media_open_url,
         )
@@ -361,7 +360,7 @@ class LaptopProvider(ActionProvider):
             # reproduces it, and the executor must not treat it as worth another go.
             raise ProviderError(str(exc), FailureKind.AUTHORIZATION) from exc
         assert handler is not None
-        self._journal_effect(action)
+        await self._journal_effect(action)
         # `simulated` comes from the class, not the default. ProviderResult defaults
         # to True, and a real adapter that forgets to say otherwise reports its work
         # as a simulation — the one flag every later layer reads to decide whether a
@@ -427,6 +426,7 @@ class LaptopProvider(ActionProvider):
             "device.files.read": lambda: self._files_read(action),
             "device.files.open": lambda: self._files_open(action),
             "device.files.info": lambda: self._files_info(action),
+            "device.files.storage": lambda: asyncio.to_thread(self._files_engine().storage),
             "device.files.create": lambda: self._files_create(action),
             "device.files.rename": lambda: self._files_rename(action),
             "device.files.move": lambda: self._files_move(action),
@@ -460,7 +460,7 @@ class LaptopProvider(ActionProvider):
         # payload by the safe view. Emitted after the handler returns, on the loop, for
         # the same reason as the sync path.
         self._stream_content(action, data)
-        self._journal_effect(action)
+        await self._journal_effect(action)
         return ProviderResult(
             ok=True,
             provider=self.name,
@@ -516,8 +516,12 @@ class LaptopProvider(ActionProvider):
 
     async def _browser_click(self, action: Action) -> dict[str, Any]:
         raw_ref = action.parameters.get("ref")
-        if not isinstance(raw_ref, int) or isinstance(raw_ref, bool):
-            raise ProviderError("browser.click requires an integer ref", FailureKind.INVALID_INPUT)
+        # The registry's public ref schema is a string, while the window transport
+        # uses integers. Accept only a canonical decimal handle, never selectors.
+        if isinstance(raw_ref, str) and raw_ref.isascii() and raw_ref.isdecimal() and 0 < len(raw_ref) <= 16:
+            raw_ref = int(raw_ref)
+        if not isinstance(raw_ref, int) or isinstance(raw_ref, bool) or not 0 < raw_ref <= 2**53 - 1:
+            raise ProviderError("browser.click requires a positive integer ref", FailureKind.INVALID_INPUT)
         ref = raw_ref
         double = bool(action.parameters.get("double", False))
         result = await self.browser.click(ref, double)
@@ -591,13 +595,8 @@ class LaptopProvider(ActionProvider):
     def _record_browser_effect(self, action: Action, result: dict[str, Any]) -> None:
         """Record the engine's read-back as the verifier's witness, iff it is ``ok``.
 
-        The browser engine already reads the page back as part of every operation
-        (a navigation refreshes the facts, a click refreshes them after the
-        click, a snapshot rebuilds the ref map). Wait — the click handler does
-        not itself re-read; observe() therefore must not be the one to do so
-        either. What is recorded here is the *result the engine handed back*,
-        captured as a structural copy, so observe() can answer from the recorded
-        effect without issuing a second network request.
+        This is a bounded dispatch receipt. Observation separately queries the
+        driver and compares current page facts; the receipt cannot certify itself.
 
         Only ``status == "ok"`` is a witness. Every refusal — ``stale``,
         ``needs_user``, ``unavailable``, ``error`` — is no evidence at all, and
@@ -646,7 +645,12 @@ class LaptopProvider(ActionProvider):
         path = action.parameters.get("path", "")
         pattern = action.parameters.get("pattern", "")
         limit = action.parameters.get("limit")
-        return await asyncio.to_thread(engine.search, path, pattern, limit)
+        result = await asyncio.to_thread(
+            engine.search, path, pattern, limit, sort_by=action.parameters.get("sort_by", "name")
+        )
+        # Search returns the same confined filename metadata as a directory listing.
+        # Use the existing bounded entries projection for client-visible rows.
+        return {**result, "entries": result["matches"]}
 
     async def _files_read(self, action: Action) -> dict[str, Any]:
         engine = self._files_engine()
@@ -747,12 +751,13 @@ class LaptopProvider(ActionProvider):
         engine = self._files_engine()
         path = action.parameters.get("path", "")
         result = await asyncio.to_thread(engine.trash, path)
-        self._effects[action.action_id] = {
-            "action_type": action.type,
-            "idempotency_key": action.idempotency_key,
-            "path": path,
-            "trashed": result.get("trashed", False),
-        }
+        if result.get("trashed"):
+            self._effects[action.action_id] = {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "path": path,
+                "trashed": True,
+            }
         return result
 
     # -- C42: media -------------------------------------------------------
@@ -799,17 +804,8 @@ class LaptopProvider(ActionProvider):
     def _record_media_effect(self, action: Action, result: dict[str, Any]) -> None:
         """Record the engine's read-back as the verifier's witness, iff it is ``ok``.
 
-        The media engine already reads the player back after every command
-        (a play is confirmed by the reported ``playing`` state, a volume set
-        by the reported level). What is recorded here is the *result the
-        engine handed back*, captured as a structural copy, so observe() can
-        answer from the recorded effect without issuing a second MPRIS query.
-
-        Only ``status == "ok"`` is a witness. Every refusal —
-        ``unavailable``, ``ambiguous``, ``no_effect``, ``unsupported``,
-        ``invalid_input`` — is no evidence at all, and recording it as an
-        effect would let verify() match on the label alone. On a refusal we
-        record nothing, exactly as the filesystem handlers do when they raise.
+        This captures the expected postcondition. Observation queries the same
+        player's current state again and refuses a disappeared or changed player.
 
         Bounded and sanitized: the stored dict carries player identity (the
         bus name, already a public identifier), track title, state, level,
@@ -829,7 +825,7 @@ class LaptopProvider(ActionProvider):
         # metadata blobs, position counters) stays out.
         for key in (
             "player", "track", "state", "level", "muted", "changed",
-            "players", "position_s", "duration_s", "opened", "path", "url",
+            "players", "position_s", "duration_s", "opened", "path", "url", "track_fingerprint",
         ):
             if key in result:
                 effect[key] = result[key] if key != "players" else result[key][:8]
@@ -845,7 +841,9 @@ class LaptopProvider(ActionProvider):
         # delegate that cannot verify the navigation.
         if not isinstance(url, str) or not url:
             return {"status": "unavailable", "reason": "url must be a non-empty string"}
-        return await self.browser.navigate(url)
+        result = await (self.browser.navigate(url) if self.browser.is_open else self.browser.open(url))
+        self._record_browser_effect(action, result)
+        return result
 
     def _perform(self, action: Action, workspace: Workspace) -> dict[str, Any]:
         params = action.parameters
@@ -1705,19 +1703,29 @@ class LaptopProvider(ActionProvider):
             raise ProviderError(
                 "no command policy is configured on this laptop", FailureKind.PERMANENT
             )
+        label = app.strip()
+        candidates = {
+            "browser": ("firefox", "google-chrome", "chromium", "chromium-browser"),
+            "calculator": ("gnome-calculator", "kcalc", "galculator", "calc.exe"),
+        }.get(label.casefold())
+        if candidates and not policy.resolve_executable(app):
+            available = next((name for name in candidates if policy.resolve_executable(name)), None)
+            if available is None:
+                raise ProviderError(f"no installed, allowed {app} was found", FailureKind.PERMANENT)
+            app = available
         decision = policy.evaluate(app, [str(item) for item in arguments])
         if decision.refused:
             raise ProviderError(
                 "command policy refused this request: " + "; ".join(decision.reasons),
                 FailureKind.AUTHORIZATION,
             )
-        self.processes.reserve(kind="process", label=app.strip())
+        self.processes.reserve(kind="process", label=label)
         process = await self.runner.start(decision)
         record = self._adopt(
             kind="process",
             decision=decision,
             process=process,
-            label=app.strip(),
+            label=label,
             action_id=action.action_id,
             working_directory=_relative_directory(decision.working_directory, self.workspace),
         )
@@ -1777,9 +1785,13 @@ class LaptopProvider(ActionProvider):
         ``cancelled`` / ``unavailable`` with the reason. There is no simulated image and
         no "close enough" fallback — a screen that was not captured says so.
         """
-        from actionmesh.agent import device_screen
+        from actionmesh.agent import native_desktop
 
-        data = await asyncio.to_thread(device_screen.capture_screenshot)
+        data = await native_desktop.call("capture", {})
+        if data.get("status") != "captured":
+            detail = data.get("detail") or "the OS did not return a screenshot"
+            kind = FailureKind.TIMEOUT if data.get("portal_code") == -1 else FailureKind.PERMANENT
+            raise ProviderError(detail, kind)
         self._effects[action.action_id] = {
             "action_type": action.type,
             "idempotency_key": action.idempotency_key,
@@ -1794,7 +1806,7 @@ class LaptopProvider(ActionProvider):
 
     async def _screen_inspect(self, action: Action) -> dict[str, Any]:
         """Describe the accessibility tree, honestly and bounded."""
-        from actionmesh.agent import device_screen
+        from actionmesh.agent import device_screen, native_desktop
 
         params = action.parameters
         window = params.get("window")
@@ -1809,9 +1821,7 @@ class LaptopProvider(ActionProvider):
             max_elements = min(raw_max, device_screen._MAX_ELEMENTS)
         else:
             max_elements = device_screen._MAX_ELEMENTS
-        data = await asyncio.to_thread(
-            device_screen.inspect_gui, window or "", max_elements
-        )
+        data = await native_desktop.call("inspect", {"window": window or "", "max_elements": max_elements})
         self._effects[action.action_id] = {
             "action_type": action.type,
             "idempotency_key": action.idempotency_key,
@@ -1878,12 +1888,10 @@ class LaptopProvider(ActionProvider):
         self._effects[action.action_id] = record
 
     async def _gui_click(self, action: Action) -> dict[str, Any]:
-        from actionmesh.agent import device_screen
+        from actionmesh.agent import native_desktop
 
         role, name, window = self._gui_target(action.parameters)
-        data = await asyncio.to_thread(
-            device_screen.click_element, role, name, window
-        )
+        data = await native_desktop.call("click", {"role": role, "name": name, "window": window})
         observed = data.get("observed") or {}
         self._record_gui(
             action, data, role=role, name=name, window=window,
@@ -1895,15 +1903,13 @@ class LaptopProvider(ActionProvider):
         return data
 
     async def _gui_type(self, action: Action) -> dict[str, Any]:
-        from actionmesh.agent import device_screen
+        from actionmesh.agent import native_desktop
 
         role, name, window = self._gui_target(action.parameters)
         text = action.parameters.get("text")
         if not isinstance(text, str) or not text:
             raise ProviderError("text must be a non-empty string", FailureKind.INVALID_INPUT)
-        data = await asyncio.to_thread(
-            device_screen.type_text, role, name, text, window
-        )
+        data = await native_desktop.call("type", {"role": role, "name": name, "text": text, "window": window})
         lengths = data.get("length") or {}
         self._record_gui(
             action, data, role=role, name=name, window=window,
@@ -1917,7 +1923,7 @@ class LaptopProvider(ActionProvider):
         return data
 
     async def _gui_scroll(self, action: Action) -> dict[str, Any]:
-        from actionmesh.agent import device_screen
+        from actionmesh.agent import native_desktop
 
         role, name, window = self._gui_target(action.parameters)
         direction = action.parameters.get("direction")
@@ -1925,9 +1931,7 @@ class LaptopProvider(ActionProvider):
             raise ProviderError(
                 "direction must be one of top/bottom/left/right", FailureKind.INVALID_INPUT
             )
-        data = await asyncio.to_thread(
-            device_screen.scroll_element, role, name, direction, window
-        )
+        data = await native_desktop.call("scroll", {"role": role, "name": name, "direction": direction, "window": window})
         self._record_gui(
             action, data, role=role, name=name, window=window,
             extra={
@@ -2024,7 +2028,7 @@ class LaptopProvider(ActionProvider):
             ended_at=record.ended_at.isoformat() if record.ended_at else "",
         )
 
-    def _journal_effect(self, action: Action) -> None:
+    async def _journal_effect(self, action: Action) -> None:
         """Copy the verifier's witness where a restart cannot wipe it.
 
         What is stored is ``observe()``'s answer, not the raw effect record: the two
@@ -2034,7 +2038,7 @@ class LaptopProvider(ActionProvider):
         """
         if self._effects.get(action.action_id) is None:
             return
-        seen = self.observe(action)
+        seen = await self.observe_async(action)
         if seen is None:
             return
         self._save_row(action.action_id, observation=json.dumps(seen, default=str, sort_keys=True))
@@ -2173,7 +2177,11 @@ class LaptopProvider(ActionProvider):
     def _observe_gui(
         self, action: Action, recorded: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """What the machine's own read-back showed, for one GUI action.
+        """A bounded dispatch receipt, never independent proof of a GUI effect.
+
+        Generic activation/insertion/scrolling has no domain postcondition. The
+        adapter's immediate read-back is useful metadata, but replaying it here is
+        not a second observation, so every returned receipt is explicitly unverified.
 
         ``recorded`` holds only what the adapter witnessed. The parameter echo below
         carries the *restricted* parameter set -- role, label and, when one was given,
@@ -2197,6 +2205,7 @@ class LaptopProvider(ActionProvider):
             "action_type": action.type,
             "idempotency_key": action.idempotency_key,
             "parameters": params,
+            "postcondition_observed": False,
         }
 
         if action.type == "device.gui.click":
@@ -2247,14 +2256,145 @@ class LaptopProvider(ActionProvider):
             return None
         return None
 
+    async def observe_async(self, action: Action) -> dict[str, Any] | None:
+        if not (action.type.startswith("browser.") or action.type == "media.open_url"):
+            return await asyncio.to_thread(self.observe, action)
+        recorded = self._effects.get(action.action_id)
+        if not isinstance(recorded, dict) or recorded.get("status") != "ok":
+            return None
+        fresh = await self.browser.observe(elements=action.type in {"browser.snapshot", "browser.inspect"})
+        if fresh.get("status") != "ok" or fresh.get("loading"):
+            return None
+        expected_url = recorded.get("url_after") or recorded.get("url")
+        if expected_url and fresh.get("url") != expected_url:
+            return None
+        # A redirect is confirmed only when a fresh host read ties this exact
+        # completed navigation to the requested URL. Without that provenance,
+        # the verifier keeps comparing the actual final URL and fails closed.
+        observed_url = fresh.get("url")
+        if action.type in {"browser.open", "browser.navigate", "media.open_url"}:
+            observed_url = fresh.get("requested_url") or observed_url
+        return {"action_type": action.type, "idempotency_key": action.idempotency_key,
+                "parameters": {"url": observed_url, "title": fresh.get("title")},
+                "state": {"page_available": True, **{k: fresh[k] for k in ("element_count", "count") if k in fresh}},
+                "postcondition_observed": action.type in {
+                    "browser.open", "browser.navigate", "browser.search", "browser.back",
+                    "browser.forward", "browser.refresh", "browser.wait", "browser.inspect",
+                    "browser.snapshot", "browser.read", "browser.read_text", "media.open_url",
+                }}
+
+    def _observe_media(self, action: Action, recorded: dict[str, Any]) -> dict[str, Any] | None:
+        if recorded.get("status") != "ok":
+            return None
+        if action.type == "media.open_file":
+            return {"postcondition_observed": False}
+        name = recorded.get("player")
+        if not isinstance(name, str):
+            return None
+        try:
+            player = self.media.driver.get(name)
+            players = self.media.driver.list_players()
+        except Exception:
+            return None
+        if player is None:
+            return None
+        current = {"player": player.name, "track": player.track, "state": player.state,
+                   "level": player.volume, "muted": player.muted, "track_fingerprint": player.track_id}
+        if action.type != "media.status":
+            for key in ("state", "track", "level", "muted", "track_fingerprint"):
+                if key in recorded and recorded[key] != current[key]:
+                    return None
+        return {"action_type": action.type, "idempotency_key": action.idempotency_key,
+                "parameters": {key: current[key] for key in ("player", "track", "state")},
+                "state": {"level": player.volume, "muted": player.muted,
+                          "position_s": player.position_s, "duration_s": player.duration_s,
+                          "players": sorted(p.name for p in players)[:8]}}
+
+    def _file_snapshot(self, path: str, limit: int) -> dict[str, Any] | None:
+        if self.workspace is None:
+            return None
+        resolved = self.workspace.resolve(path, must_exist=True)
+        fd = self.workspace.open_fd(resolved, os.O_RDONLY)
+        with os.fdopen(fd, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            body = handle.read(limit + 1)
+        return {"sha256": hashlib.sha256(body[:limit]).hexdigest(),
+                "size": size, "truncated": len(body) > limit}
+
+    def _file_exists(self, path: str) -> bool:
+        assert self.workspace is not None
+        resolved = self.workspace.resolve(path)
+        parent, _, name = resolved.relative.rpartition("/")
+        fd = self.workspace.walk_fd(parent)
+        try:
+            try:
+                os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            return True
+        finally:
+            os.close(fd)
+
+    def _observe_files(self, action: Action, recorded: dict[str, Any]) -> dict[str, Any] | None:
+        """Verify the requested endpoint of a file operation, never just its receipt."""
+        path = action.parameters.get("path")
+        if not isinstance(path, str) or self.workspace is None:
+            return None
+        parameters: dict[str, Any] = {"path": path}
+        state: dict[str, Any]
+        try:
+            if action.type == "device.files.trash":
+                if self._file_exists(path):
+                    return None
+                state = {"exists": False, "trashed": True}
+            elif action.type in {"device.files.rename", "device.files.move", "device.files.copy"}:
+                target = action.parameters.get("to")
+                if not isinstance(target, str):
+                    return None
+                destination = self._file_snapshot(target, MAX_WRITE_BYTES)
+                if destination is None:
+                    return None
+                parameters["to"] = target
+                if action.type == "device.files.copy":
+                    source = self._file_snapshot(path, MAX_WRITE_BYTES)
+                    if (source is None or source["truncated"] or destination["truncated"]
+                            or source["size"] != destination["size"]
+                            or source["sha256"] != destination["sha256"]):
+                        return None
+                    state = {**destination, "copied": True}
+                else:
+                    if self._file_exists(path):
+                        return None
+                    state = {**destination, "moved": True, "source_exists": False}
+            else:
+                snapshot = self._file_snapshot(path, FILE_READ_LIMIT if action.type == "device.files.read" else MAX_WRITE_BYTES)
+                if snapshot is None:
+                    return None
+                previous = recorded.get("state") or recorded
+                expected = previous.get("sha256")
+                if expected is not None and expected != snapshot["sha256"]:
+                    return None
+                state = snapshot
+        except (AgentError, OSError):
+            return None
+        return {"action_type": action.type, "idempotency_key": action.idempotency_key,
+                "parameters": parameters, "state": state}
+
     def observe(self, action: Action) -> dict[str, Any] | None:
         """Re-read the effect from the filesystem. Nothing here is remembered.
 
         C6 weights this observation above any claim this provider makes, so it has to
         be an answer to "what is true now", not a recording of what the code intended.
         """
+        if action.type.startswith("browser.") or action.type == "media.open_url":
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(self.observe_async(action))
+            # Async callers must use observe_async; never nest an event loop.
+            return None
         # -- C42 readonly file probes (live re-read, no effect, no ledger) ----
-        # list/search/info/open are reads: the handlers deliberately record no
+        # list/search/info are reads: the handlers deliberately record no
         # effect, and test_browser_files_media_provider pins that ("Reads do not
         # mutate, so they journal nothing."). The gate above therefore hides them
         # from the recorded-effect branches below. This branch sits ahead of the
@@ -2264,11 +2404,11 @@ class LaptopProvider(ActionProvider):
         # nothing to the ledger. A refusal (confinement, missing path where the
         # request needs one) is no evidence, so every failure path returns None
         # and the verifier reads the step as unconfirmed.
-        if action.type == "device.files.list":
+        if action.type in {"device.files.list", "device.file.list"}:
             if self.files is None:
                 return None
             try:
-                fresh = self.files.list_(action.parameters.get("path", ""), action.parameters.get("limit"))
+                fresh = self.files.list_(action.parameters.get("path", "."), action.parameters.get("limit"))
             except (AgentError, OSError):
                 return None
             return {
@@ -2285,14 +2425,30 @@ class LaptopProvider(ActionProvider):
                     action.parameters.get("path", ""),
                     action.parameters.get("pattern", ""),
                     action.parameters.get("limit"),
+                    sort_by=action.parameters.get("sort_by", "name"),
                 )
             except (AgentError, OSError):
                 return None
             return {
                 "action_type": action.type,
                 "idempotency_key": action.idempotency_key,
-                "parameters": {"path": fresh.get("path"), "pattern": action.parameters.get("pattern", "")},
+                "parameters": {
+                    "path": fresh.get("path"), "pattern": action.parameters.get("pattern", ""),
+                    "sort_by": action.parameters.get("sort_by", "name"),
+                },
                 "state": {"count": fresh.get("count")},
+            }
+        if action.type == "device.files.storage":
+            if self.files is None:
+                return None
+            try:
+                fresh_storage = self.files.storage()
+            except ProviderError:
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "state": fresh_storage,
             }
         if action.type == "device.files.info":
             if self.files is None:
@@ -2318,24 +2474,16 @@ class LaptopProvider(ActionProvider):
                 },
             }
         if action.type == "device.files.open":
-            if self.files is None:
-                return None
-            try:
-                fresh = self.files.open_(action.parameters.get("path", ""))
-            except (AgentError, OSError):
-                return None
-            if fresh.get("status") != "ok":
-                # No opener, failed launch, non-zero exit: nothing was opened,
-                # so there is no witness to record. Re-running the opener here
-                # is also never an observation: it performs the act a second time.
-                return None
-            return {
-                "action_type": action.type,
-                "idempotency_key": action.idempotency_key,
-                "parameters": {"path": fresh.get("path") or action.parameters.get("path", "")},
-                "state": {"opened": fresh.get("opened")},
-            }
+            # A launcher exit is a receipt, not an independently observable window.
+            # Never launch again while verifying. No window read-back is available.
+            return {"postcondition_observed": False}
         recorded = self._effects.get(action.action_id)
+        file_effect = action.type in {
+            "device.files.read", "device.files.create", "device.files.rename",
+            "device.files.move", "device.files.copy", "device.files.edit", "device.files.trash",
+        }
+        if file_effect and isinstance(recorded, dict):
+            return self._observe_files(action, recorded)
         if not isinstance(recorded, dict):
             # C35: this process may not be the one that did the work. The ledger holds
             # the same effect description the executor wrote when it ran, so a verifier
@@ -2359,7 +2507,16 @@ class LaptopProvider(ActionProvider):
             # a raw effect record, so running it through the derivation below a second
             # time would build a description of a description -- and report an exit code
             # of None for a command that exited 0.
-            return recovered
+            if file_effect:
+                return self._observe_files(action, recovered)
+            if action.type.startswith(("browser.", "media.")):
+                # A historical receipt does not prove the external state now.
+                return None
+            if action.type.startswith("device.file."):
+                # Reconstruct only the dispatch identity; file evidence is read again.
+                recorded = {"action_type": action.type, **(recovered.get("parameters") or {})}
+            else:
+                return recovered
         # -- screen capabilities, deliberately above the workspace guard ---------
         # `observe()` below starts by refusing to answer without a workspace root,
         # because most branch below rebuilds a path. Screen work has no path: it reads
@@ -2371,33 +2528,25 @@ class LaptopProvider(ActionProvider):
         if not isinstance(action_type, str):
             return None
         if action_type == "device.screen.capture":
-            # A capture is evidenced by the portal having returned a frame, and by that
-            # frame's own dimensions -- never by the image, which is not retained. A
-            # capture the portal declined is *not* confirmable: returning a shape for it
-            # would let verification confirm a screen that was never read, which is the
-            # one thing this capability must never do.
-            if recorded.get("status") != "captured":
-                return None
-            return {
-                "action_type": action.type,
-                "idempotency_key": action.idempotency_key,
-                "parameters": {},
-                "state": {
-                    "width": recorded.get("width"),
-                    "height": recorded.get("height"),
-                },
-            }
+            # Never repeat a portal capture while verifying. A dispatch receipt
+            # cannot independently prove the requested screenshot exists now.
+            return {"postcondition_observed": False}
         if action_type == "device.screen.inspect":
-            # The observation is that a tree was walked and how many elements it held.
-            # An inspection that could not read the tree (no bus, no gi) was not an
-            # inspection, and observing nothing says exactly that.
             if recorded.get("status") != "ok":
                 return None
+            from actionmesh.agent import native_desktop
+
+            fresh = asyncio.run(native_desktop.call("inspect", {
+                "window": action.parameters.get("window", ""),
+                "max_elements": min(action.parameters.get("max_elements", 200), 200),
+            }))
+            if fresh.get("status") != "ok":
+                return None
             return {
                 "action_type": action.type,
                 "idempotency_key": action.idempotency_key,
-                "parameters": {"window": recorded.get("window", "")},
-                "state": {"elements": recorded.get("count")},
+                "parameters": {"window": fresh.get("window", "")},
+                "state": {"elements": fresh.get("element_count")},
             }
         # -- GUI actions, same reason for sitting above the workspace guard ---------
         # These read and drive the accessibility tree, which has no path under the
@@ -2432,72 +2581,8 @@ class LaptopProvider(ActionProvider):
                 },
                 "state": {"reference": recorded.get("reference")},
             }
-        # -- C42: the controlled browser and local playback, above the guard ------
-        # Browser and media have no path under the configured root: the browser
-        # lives in its own window and the player on its own session bus. Both
-        # engines already read back after every operation (the browser refreshes
-        # its page facts, the media engine re-reads the player), so observe()
-        # answers from the recorded read-back without issuing a second network
-        # request or a second MPRIS query. That is the design's whole point: a
-        # second read would be both more work and a second source of truth.
-        #
-        # Every refusal — ``stale``, ``needs_user``, ``unavailable``, ``error``,
-        # ``ambiguous``, ``no_effect``, ``unsupported``, ``invalid_input`` — is
-        # no evidence at all, and it returns None here, because the wrappers
-        # record *nothing* on a refusal. A browser refusal that somehow did
-        # record an effect cannot have it counted as a witness either: only
-        # ``status == "ok"`` observed through the recorded effect counts.
-        if action_type.startswith("browser."):
-            if recorded.get("status") != "ok":
-                return None
-            # The engine already redacted page content before returning it;
-            # this narrows it further to the bounded evidence keys the effect
-            # recorder itself captured. The ledger never grows a page.
-            params: dict[str, Any] = {}
-            for key in ("url", "title", "url_after"):
-                if recorded.get(key) is not None:
-                    params[key] = recorded[key]
-            # There is no honest echo for ``ref`` above all: it is an opaque
-            # session-scoped handle, and the recorded effect does not carry the
-            # resolved driver element id. Echoing the requested ref against
-            # itself is a tautology the verifier would pass for the wrong
-            # element, so ``ref`` is simply carried into ``state`` as an opaque
-            # identifier for audit — it never participates in the parameter
-            # comparison, and verification relies on the other read-back fields.
-            return {
-                "action_type": action.type,
-                "idempotency_key": action.idempotency_key,
-                "parameters": params,
-                "state": {
-                    key: recorded[key]
-                    for key in ("changed", "inserted", "element_count",
-                                "count", "ref_map_size", "truncated", "results")
-                    if key in recorded
-                },
-            }
         if action_type.startswith("media."):
-            if recorded.get("status") != "ok":
-                return None
-            # The engine already read the player back; observe() trusts that
-            # read-back and never re-queries MPRIS. ``unavailable`` /
-            # ``ambiguous`` / ``no_effect`` / ``unsupported`` / ``invalid_input``
-            # never reach this dict (the wrapper records nothing for them), so
-            # they read as unconfirmed rather than as a confirmed empty result.
-            params = {}
-            for key in ("player", "track", "state", "url", "path"):
-                if recorded.get(key) is not None:
-                    params[key] = recorded[key]
-            return {
-                "action_type": action.type,
-                "idempotency_key": action.idempotency_key,
-                "parameters": params,
-                "state": {
-                    key: recorded[key]
-                    for key in ("level", "muted", "changed", "opened",
-                                "position_s", "duration_s", "players")
-                    if key in recorded
-                },
-            }
+            return self._observe_media(action, recorded)
         workspace = self.workspace
         if workspace is None:
             return None
@@ -2612,24 +2697,15 @@ class LaptopProvider(ActionProvider):
             }
         try:
             resolved = workspace.resolve(path, must_exist=True)
-            with open(resolved.absolute, "rb") as handle:
+            fd = workspace.open_fd(resolved, os.O_RDONLY)
+            with os.fdopen(fd, "rb") as handle:
                 body = handle.read(MAX_WRITE_BYTES + 1)
         except (AgentError, OSError):
             return None
         digest = hashlib.sha256(body).hexdigest()
         parameters: dict[str, Any] = {"path": path}
-        # A write is confirmed by the bytes on disk *now*. Echoing the live content
-        # is what lets the verifier compare it with what was asked for, so a write
-        # that did not land — or landed differently — produces a mismatch rather than
-        # a pass. Beyond the cap the live bytes are not compared and the observation
-        # falls back to identity, which is what the rest of the system does; refusing
-        # to read a huge file is better than a false refutation of a real write.
-        if (
-            action_type == "device.file.write"
-            and "content" in recorded
-            and len(body) <= MAX_WRITE_BYTES
-        ):
-            parameters["content"] = body.decode("utf-8", errors="replace")
+        # C6 compares this digest with the requested content. Raw file text is
+        # unnecessary evidence and must not be persisted in the dispatch journal.
         return {
             "action_type": action.type,
             "idempotency_key": action.idempotency_key,

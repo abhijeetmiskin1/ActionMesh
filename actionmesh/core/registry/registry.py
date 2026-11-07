@@ -53,6 +53,18 @@ class ResolvedAction:
 @dataclass
 class ActionRegistry:
     _defs: dict[tuple[str, str], ActionDefinition] = field(default_factory=dict)
+    _by_name: dict[str, dict[str, ActionDefinition]] = field(default_factory=dict, init=False)
+    _latest: dict[str, ActionDefinition] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        for (name, version), definition in self._defs.items():
+            self._index(name, version, definition)
+
+    def _index(self, name: str, version: str, definition: ActionDefinition) -> None:
+        self._by_name.setdefault(name, {})[version] = definition
+        previous = self._latest.get(name)
+        if previous is None or version_key(version) > version_key(previous.version):
+            self._latest[name] = definition
 
     def register(self, defn: ActionDefinition) -> ActionDefinition:
         validate_definition(defn)
@@ -60,6 +72,7 @@ class ActionRegistry:
         if key in self._defs:
             raise DuplicateError(f"action {defn.name} v{defn.version} already registered")
         self._defs[key] = defn
+        self._index(defn.name, defn.version, defn)
         return defn
 
     @classmethod
@@ -70,17 +83,17 @@ class ActionRegistry:
         return reg
 
     def versions(self, name: str) -> list[str]:
-        available = sorted((v for n, v in self._defs if n == name), key=version_key)
+        available = sorted(self._by_name.get(name, ()), key=version_key)
         if not available:
             raise UnknownActionError(f"unknown action: {name!r}")
         return available
 
     def get(self, name: str, version: str | None = None) -> ActionDefinition:
         """Fetch a definition. Defaults to the highest registered version."""
-        if version is None:
-            version = self.versions(name)[-1]
-        defn = self._defs.get((name, version))
+        defn = self._latest.get(name) if version is None else self._defs.get((name, version))
         if defn is None:
+            if version is None:
+                raise UnknownActionError(f"unknown action: {name!r}")
             raise UnknownActionError(f"unknown action {name!r} version {version!r}")
         return defn
 
@@ -95,7 +108,7 @@ class ActionRegistry:
         (C19) probe many names at once — turning each lookup into exception
         control flow would hide the one failure that matters.
         """
-        return isinstance(name, str) and any(known == name for known, _ in self._defs)
+        return isinstance(name, str) and name in self._latest
 
     def discover(
         self,
@@ -112,7 +125,7 @@ class ActionRegistry:
         """
         out: list[Capability] = []
         seen: set[str] = set()
-        for defn in self.list():
+        for defn in (self._latest[name] for name in sorted(self._latest)):
             if defn.name in seen:
                 continue
             seen.add(defn.name)

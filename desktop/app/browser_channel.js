@@ -1,20 +1,17 @@
 /**
  * IPC channels for the browser drive (C42) — the renderer-facing surface.
  *
- * Registers `ipcMain.handle` endpoints the dashboard UI invokes to drive the
- * kept browser window (desktop/app/browser_window.js), and bridges page
- * observations back to the UI as bounded events. This is the UI path; the
- * engine's own path is the NDJSON bridge (browser_bridge.js) calling
- * `handleDrive` directly — both go through the SAME handlers, so there is one
- * drive surface, not two.
+ * Registers renderer controls which propose ordinary backend actions. The backend
+ * alone authorizes and executes them through the existing private drive bridge.
+ * Renderer controls never invoke handleDrive directly.
  *
  * Payloads mirror actionmesh/agent/browser_ipc.py exactly: fixed keys, no
  * arbitrary JS, refs are integers. Everything the UI may send is validated
  * again here — a handler that trusts its renderer is not a hardened boundary.
  *
  * Lead wiring (main.js): require both modules, call
- * `registerBrowserIpc(browserWindow)` after app.whenReady(), and forward
- * `browser:*` events to the UI via preload's `onBrowserEvent` subscription.
+ * `registerBrowserIpc(browserWindow, getMainWindow, runAction)` after app.whenReady().
+ * Observations reach the UI through the backend's scoped execution output stream.
  */
 
 'use strict';
@@ -53,10 +50,10 @@ function optionalRef(value) {
  * @param {object} mainWindowGetter () => BrowserWindow|null — where to push
  *        observations. Never captured eagerly: the UI window can be closed.
  */
-function registerBrowserIpc(browserWindow, mainWindowGetter) {
+function registerBrowserIpc(browserWindow, mainWindowGetter, runAction) {
   const drive = async (frame) => {
-    const reply = await browserWindow.handleDrive(frame);
-    return reply; // already { request_id, status, ... } with bounded fields
+    if (typeof runAction !== 'function') bad('the browser execution pipeline is not configured');
+    return runAction(frame);
   };
 
   ipcMain.handle('browser:open', (_event, payload) =>
@@ -72,7 +69,7 @@ function registerBrowserIpc(browserWindow, mainWindowGetter) {
     const engine = payload && payload.engine !== undefined
       ? needString(payload.engine, 'engine', 32)
       : undefined;
-    return drive({ op: 'navigate', url: searchUrl(query, engine), request_id: 'ui' });
+    return drive({ op: 'search', query, engine, request_id: 'ui' });
   });
 
   ipcMain.handle('browser:inspect', () => drive({ op: 'snapshot', request_id: 'ui', max_elements: 200 }));
@@ -135,32 +132,10 @@ function registerBrowserIpc(browserWindow, mainWindowGetter) {
     return drive({ op: 'page_text', limit, request_id: 'ui' });
   });
 
-  // Observations: the window pushes facts, we relay a bounded copy to the UI
-  // shell. Page-derived strings are forwarded as-is for *display* only — the
-  // renderer must treat them as untrusted text (the UI never evals them;
-  // contextIsolation keeps it honest).
-  browserWindow.setObservationSink((observation) => {
-    const target = mainWindowGetter ? mainWindowGetter() : null;
-    if (!target || target.isDestroyed()) return;
-    const bounded = { ...observation };
-    if (Array.isArray(bounded.elements) && bounded.elements.length > 50) {
-      bounded.elements = bounded.elements.slice(0, 50);
-      bounded.truncated = true;
-    }
-    target.webContents.send('browser:event', bounded);
-  });
-}
+  // Driver IDs are not the backend's session refs. Page content reaches the UI
+  // only through actor-scoped, redacted execution output from the backend.
+  browserWindow.setObservationSink(() => {});
 
-const SEARCH_ENGINES = {
-  duckduckgo: 'https://duckduckgo.com/?q=',
-  google: 'https://www.google.com/search?q=',
-  bing: 'https://www.bing.com/search?q=',
-};
-
-function searchUrl(query, engine) {
-  const name = String(engine || 'duckduckgo').toLowerCase();
-  const base = SEARCH_ENGINES[name] || SEARCH_ENGINES.duckduckgo;
-  return base + encodeURIComponent(query);
 }
 
 module.exports = { registerBrowserIpc };

@@ -337,6 +337,10 @@ class AgentConfig:
 
         if not _os.environ.get("DISPLAY") and not _os.environ.get("WAYLAND_DISPLAY"):
             return False
+        from actionmesh.agent.native_desktop import enabled as native_desktop_enabled
+
+        if native_desktop_enabled():
+            return True
         # The desktop APIs are reached through the system PyGObject. If this process
         # cannot import gi, it cannot inspect or capture regardless of the display.
         # Under a development venv the launcher hands over the system package

@@ -19,7 +19,7 @@ const KEY = 'sk-test-0123456789abcdef';
  * A fake request function. `reply` decides what the "server" does.
  * Records every call so a test can assert that *none* happened.
  */
-function fakeRequest(reply, calls = []) {
+function fakeRequest(reply, calls = [], bodies = []) {
   return function request(options, onResponse) {
     calls.push(options);
     const handlers = {};
@@ -28,7 +28,7 @@ function fakeRequest(reply, calls = []) {
         handlers[event] = handler;
         return req;
       },
-      write() {},
+      write(body) { bodies.push(body); },
       end() {
         // Answer asynchronously, the way a real socket would.
         setImmediate(() => {
@@ -45,6 +45,7 @@ function fakeRequest(reply, calls = []) {
           const listeners = {};
           const res = {
             statusCode: reply.status,
+            headers: reply.headers,
             setEncoding() {},
             on(event, handler) {
               listeners[event] = handler;
@@ -249,6 +250,155 @@ test('a base URL on another port is refused', async () => {
   assert.deepEqual(calls, []);
 });
 
+test('compatible HTTP is confined to numeric loopback and pins localhost', async () => {
+  for (const baseUrl of ['http://localhost:20128/v1', 'http://127.0.0.1:20128/api/v1', 'http://[::1]:20128/v1']) {
+    const calls = [];
+    const out = await providers._withRequest({ provider: 'openai_compatible', model: 'power', apiKey: KEY, baseUrl }, fakeRequest(ok(), calls));
+    assert.equal(out.state, 'connected');
+    assert.equal(calls[0].protocol, 'http:');
+    assert.equal(calls[0].port, 20128);
+    assert.ok(['127.0.0.1', '::1'].includes(calls[0].hostname));
+  }
+  for (const baseUrl of ['http://remote.example/v1', 'http://localhost.evil.test:20128/v1', 'http://192.168.1.10:20128/v1', 'http://user:password@localhost:20128/v1']) {
+    const calls = [];
+    const out = await providers._withRequest({ provider: 'openai_compatible', model: 'power', apiKey: KEY, baseUrl }, fakeRequest(ok(), calls));
+    assert.equal(out.state, 'provider_unavailable');
+    assert.equal(calls.length, 0);
+  }
+});
+
+const AUDIO_CONFIG = { provider: 'router_audio', purpose: 'audio', model: 'groq/whisper-large-v3-turbo', baseUrl: 'http://localhost:20128/api/v1', apiKey: KEY };
+
+test('router lookup returns only bounded HTTPS source cards and uses a fixed provider', async () => {
+  const calls = [];
+  const bodies = [];
+  const request = fakeRequest(ok(JSON.stringify({ results: [
+    { title: 'Flights', url: 'https://example.com/flights', snippet: KEY },
+    { title: 'Bad', url: 'javascript:alert(1)' },
+    { title: 'Bad', url: 'https://name:pass@example.com/' },
+  ] })), calls, bodies);
+  const result = await providers.searchRouter(AUDIO_CONFIG, 'Flights from Mumbai to Chennai', { request });
+  assert.deepEqual(result, { ok: true, results: [
+    { title: 'Flights', url: 'https://example.com/flights', snippet: '' },
+  ] });
+  assert.equal(calls[0].path, '/api/v1/search');
+  assert.equal(JSON.parse(bodies[0]).provider, 'antigravity');
+  assert.equal((await providers.searchRouter({ ...AUDIO_CONFIG, baseUrl: 'https://example.com/v1' },
+    'Flights', { request })).ok, false);
+  assert.equal(calls.length, 1);
+});
+
+test('speech uses a bounded multipart request through the configured router', async () => {
+  const calls = [];
+  const answer = await providers.transcribe(AUDIO_CONFIG, Buffer.from('synthetic audio'), {
+    request: fakeRequest(ok(JSON.stringify({ text: 'list the files' })), calls),
+  });
+  assert.deepEqual(answer, { ok: true, text: 'list the files' });
+  assert.equal(calls[0].path, '/api/v1/audio/transcriptions');
+  assert.equal(calls[0].hostname, '127.0.0.1');
+  assert.match(calls[0].headers['content-type'], /^multipart\/form-data; boundary=/);
+  assert.equal(calls[0].headers.authorization, `Bearer ${KEY}`);
+  assert.equal(JSON.stringify(answer).includes(KEY), false);
+});
+
+test('speech sends the selected language and omits it for auto-detection', async () => {
+  const calls = [];
+  const bodies = [];
+  const request = fakeRequest(ok(JSON.stringify({ text: 'fixture' })), calls, bodies);
+  for (const language of ['en', 'hi', '']) {
+    const answer = await providers.transcribe(AUDIO_CONFIG, Buffer.from('audio'), { language, request });
+    assert.equal(answer.ok, true);
+  }
+  assert.match(bodies[0].toString(), /name="language"\r\n\r\nen\r\n/);
+  assert.match(bodies[1].toString(), /name="language"\r\n\r\nhi\r\n/);
+  assert.doesNotMatch(bodies[2].toString(), /name="language"/);
+  const rejected = await providers.transcribe(AUDIO_CONFIG, Buffer.from('audio'), {
+    language: 'en\r\ninvalid', request,
+  });
+  assert.equal(rejected.ok, false);
+  assert.equal(calls.length, 3);
+});
+
+test('speech refuses missing credentials, oversized audio, and unsafe endpoints before calling', async () => {
+  const calls = [];
+  for (const [config, audio] of [
+    [{ ...AUDIO_CONFIG, apiKey: '' }, Buffer.from('audio')],
+    [{ ...AUDIO_CONFIG, model: '' }, Buffer.from('audio')],
+    [AUDIO_CONFIG, Buffer.alloc(providers.MAX_AUDIO_BYTES + 1)],
+    [AUDIO_CONFIG, Buffer.alloc(0)],
+    [{ ...AUDIO_CONFIG, baseUrl: 'http://remote.example/v1' }, Buffer.from('audio')],
+  ]) {
+    assert.equal((await providers.transcribe(config, audio, { request: fakeRequest(ok(), calls) })).ok, false);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('speech rejects redirects, malformed bodies, and credential echoes', async () => {
+  for (const reply of [
+    { status: 302, body: KEY }, { status: 401, body: KEY },
+    { status: 200, body: 'broken JSON' },
+    { status: 200, body: JSON.stringify({ text: KEY }) },
+  ]) {
+    const answer = await providers.transcribe(AUDIO_CONFIG, Buffer.from('audio'), {
+      request: fakeRequest({ kind: 'response', ...reply }),
+    });
+    assert.equal(answer.ok, false);
+    assert.equal(JSON.stringify(answer).includes(KEY), false);
+  }
+});
+
+test('audio Test Connection exercises transcription with synthetic silence', async () => {
+  const calls = [];
+  const answer = await providers.test(AUDIO_CONFIG, {
+    request: fakeRequest(ok('{"text":""}'), calls),
+  });
+  assert.equal(answer.state, 'connected');
+  assert.equal(calls[0].path, '/api/v1/audio/transcriptions');
+});
+
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j7XcAAAAASUVORK5CYII=';
+const IMAGE_CONFIG = { provider: 'router_image', purpose: 'image', model: 'image-model', baseUrl: 'http://localhost:20128/api/v1', apiKey: KEY };
+
+test('image generation accepts only bounded inline raster output', async () => {
+  const calls = [];
+  const image = await providers.generateImage(IMAGE_CONFIG, 'A blue square', {
+    request: fakeRequest(ok(JSON.stringify({ data: [{ b64_json: PNG }] })), calls),
+  });
+  assert.equal(image.ok, true);
+  assert.equal(image.dataUrl, `data:image/png;base64,${PNG}`);
+  assert.equal(calls[0].path, '/api/v1/images/generations');
+  assert.equal(calls[0].hostname, '127.0.0.1');
+  assert.equal(JSON.stringify(image).includes(KEY), false);
+  for (const data of [
+    [{ url: 'http://private.example/image.png' }],
+    [{ b64_json: Buffer.from('<svg onload="bad()"/>').toString('base64') }],
+    [{ b64_json: 'A'.repeat(4 * 1024 * 1024 + 1) }],
+  ]) {
+    const answer = await providers.generateImage(IMAGE_CONFIG, 'A blue square', {
+      request: fakeRequest(ok(JSON.stringify({ data }))),
+    });
+    assert.equal(answer.ok, false);
+    assert.equal('dataUrl' in answer, false);
+  }
+});
+
+test('image errors cannot echo a provider response or credential', async () => {
+  const answer = await providers.generateImage(IMAGE_CONFIG, 'A blue square', {
+    request: fakeRequest({ kind: 'response', status: 403, body: KEY }),
+  });
+  assert.equal(answer.ok, false);
+  assert.equal(JSON.stringify(answer).includes(KEY), false);
+});
+
+test('image Test Connection requires an actual raster response', async () => {
+  const accepted = await providers.test(IMAGE_CONFIG, {
+    request: fakeRequest(ok(JSON.stringify({ data: [{ b64_json: PNG }] }))),
+  });
+  assert.equal(accepted.state, 'connected');
+  const refused = await providers.test(IMAGE_CONFIG, { request: fakeRequest(ok('{}')) });
+  assert.equal(refused.state, 'provider_unavailable');
+});
+
 test('the timeout is clamped to 1..60 seconds', async () => {
   const seen = [];
   await providers._withRequest({ ...BASE, timeoutSeconds: 999 }, fakeRequest(ok(), seen));
@@ -390,6 +540,9 @@ test('each provider asks its own dialect for the same answer', async () => {
   );
   const c = JSON.parse(compat.bodies[0]);
   assert.equal(c.response_format.type, 'json_object');
+  const described = JSON.parse(c.messages[0].content.split('Required JSON Schema:\n')[1]);
+  assert.equal(described.properties.actions.items.properties.type.type, 'string');
+  assert.equal(described.properties.reply.type, 'string');
 });
 
 test('anthropic: a fenced JSON text block is still read', async () => {
@@ -527,4 +680,85 @@ test('generation refuses a prompt large enough to be a memory hazard', async () 
   );
   assert.equal(out.state, 'not_configured');
   assert.deepEqual(calls, []);
+});
+
+test('conversational plan replies are bounded and preserve the actions schema', async () => {
+  const config = { ...BASE, provider: 'openai_compatible', baseUrl: 'http://localhost:20128/api/v1' };
+  const answer = { actions: [], reply: 'Which file do you mean?' };
+  const out = await providers.generate(config, PLAN_REQUEST, {
+    request: fakeRequest(openAiMessage(JSON.stringify(answer))),
+  });
+  assert.equal(out.state, 'ok');
+  assert.deepEqual(out.content, answer);
+  for (const reply of [123, null, 'x'.repeat(4001)]) {
+    const bad = await providers.generate(config, PLAN_REQUEST, {
+      request: fakeRequest(openAiMessage(JSON.stringify({ actions: [], reply }))),
+    });
+    assert.equal(bad.state, 'malformed');
+    assert.equal(bad.content, undefined);
+  }
+});
+
+test('Todoist uses a fixed read-only endpoint and returns only task titles and due dates', async () => {
+  const calls = [];
+  const writes = [];
+  const answer = await providers.todoistTasks(KEY, { request: fakeRequest(ok(JSON.stringify({
+    results: [
+      { content: 'Buy milk', due: { date: '2026-11-09' }, description: 'private description' },
+      { content: KEY },
+      { content: 'No due date', due: { date: 'javascript:invalid' } },
+    ],
+    next_cursor: 'private cursor',
+  })), calls, writes) });
+  assert.deepEqual(answer, { ok: true, tasks: [
+    { title: 'Buy milk', due: '2026-11-09' }, { title: 'No due date', due: '' },
+  ], hasMore: true });
+  assert.equal(calls[0].method, 'GET');
+  assert.equal(calls[0].hostname, 'api.todoist.com');
+  assert.equal(calls[0].path, '/api/v1/tasks?limit=10');
+  assert.equal(calls[0].headers.authorization, `Bearer ${KEY}`);
+  assert.deepEqual(writes, []);
+  assert.equal((await providers.todoistTasks('bad\r\nvalue', { request: fakeRequest(ok(), calls) })).ok, false);
+  assert.equal(calls.length, 1);
+});
+
+test('GitHub MCP negotiates, calls only the search tool, and filters private repositories', async () => {
+  const calls = [], bodies = [];
+  const payload = {items: [
+    {private: false, full_name: 'owner/example', description: 'Public repository', html_url: 'https://untrusted.test/'},
+    {private: true, full_name: 'owner/private'},
+  ]};
+  const response = (id, result) => ({kind:'response',status:200,
+    body:JSON.stringify({jsonrpc:'2.0',id,result})});
+  const replies = [
+    {...response(1, {protocolVersion:'2025-06-18'}), headers: {'mcp-session-id':'fixture-session'}},
+    {kind:'response',status:202},
+    {...response(2, {}), headers: {'content-type':'text/event-stream'},
+      body:`event: message\ndata: ${JSON.stringify({jsonrpc:'2.0',id:2,
+        result:{content:[{type:'text',text:JSON.stringify(payload)}]}})}\n\n`},
+  ];
+  const request = (options, callback) => fakeRequest(replies.shift(), calls, bodies)(options, callback);
+  const result = await providers.githubRepositories('example', KEY, {request});
+  assert.deepEqual(result, {ok:true, source:'GitHub MCP', results:[
+    {title:'owner/example',url:'https://github.com/owner/example',snippet:'Public repository'},
+  ]});
+  assert.deepEqual(bodies.map((body) => JSON.parse(body).method),
+    ['initialize','notifications/initialized','tools/call']);
+  assert.equal(calls[1].headers['Mcp-Session-Id'], 'fixture-session');
+  assert.equal(calls[2].headers['X-MCP-Readonly'], 'true');
+  assert.equal(JSON.parse(bodies[2]).params.name, 'search_repositories');
+  assert.equal(JSON.parse(bodies[2]).params.arguments.query, 'example is:public');
+  assert.ok(calls.every((call) => call.hostname === 'api.githubcopilot.com'));
+});
+
+test('GitHub repository search uses the public REST API without a token', async () => {
+  const calls = [];
+  const request = fakeRequest(ok(JSON.stringify({items:[]})), calls);
+  assert.deepEqual(await providers.githubRepositories('example', '', {request}),
+    {ok:true,source:'GitHub API',results:[]});
+  assert.equal(calls[0].method, 'GET');
+  assert.equal(calls[0].hostname, 'api.github.com');
+  assert.equal(calls[0].headers.authorization, undefined);
+  assert.equal((await providers.githubRepositories('example', 'bad\r\ntoken', {request})).ok, false);
+  assert.equal(calls.length, 1);
 });

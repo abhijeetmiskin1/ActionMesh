@@ -31,6 +31,7 @@ would be the wrong shape entirely.
 
 from __future__ import annotations
 
+import base64
 import json
 import socket
 from dataclasses import dataclass
@@ -220,11 +221,33 @@ def status(config: BridgeConfig, *, timeout_s: float | None = None) -> dict[str,
     return _exchange(config, {"token": config.token, "op": "status"}, timeout)
 
 
+MAX_WEB_AUDIO_BYTES = 128 * 1024
+
+
+def audio_status(config: BridgeConfig) -> dict[str, Any]:
+    answer = _exchange(config, {"token": config.token, "op": "audio_status"}, 5.0)
+    return {"configured": answer.get("configured") is True, "max_bytes": MAX_WEB_AUDIO_BYTES}
+
+
+def transcribe(config: BridgeConfig, audio: bytes) -> str:
+    if not audio or len(audio) > MAX_WEB_AUDIO_BYTES:
+        raise BridgeError("malformed", "the recording is empty or too large")
+    answer = _exchange(config, {"token": config.token, "op": "transcribe",
+        "audio": base64.b64encode(audio).decode("ascii")}, 60.0)
+    text = answer.get("text")
+    if not isinstance(text, str) or len(text) > 16000:
+        raise BridgeError("malformed", "the bridge returned an invalid transcript")
+    return text.strip()
+
+
 __all__ = [
     "MAX_FRAME_BYTES",
+    "MAX_WEB_AUDIO_BYTES",
     "BridgeConfig",
     "BridgeError",
     "BridgeUnavailable",
+    "audio_status",
     "generate",
     "status",
+    "transcribe",
 ]

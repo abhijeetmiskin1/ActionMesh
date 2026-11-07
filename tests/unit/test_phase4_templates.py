@@ -125,7 +125,7 @@ class TestWebIntentDoesNotShadow(unittest.TestCase):
     Regression pins (Phase 4 full suite): the first broad ``_WEB_SEARCH_RX``
     matched "search for ..." and "look up ...", so
 
-    * "search for speed render near me" (a food discovery request) became
+    * "search Zomato for speed render near me" (a food discovery request) became
       ``web.search`` instead of ``food.discover``, and
     * "look up actionmesh" (a generic search the LLM planner resolves to the
       registered ``search.web`` action) was intercepted by ``_website_step``
@@ -135,7 +135,7 @@ class TestWebIntentDoesNotShadow(unittest.TestCase):
     """
 
     def test_search_speed_render_is_food_discover_not_web_search(self) -> None:
-        text = "search for speed render near me"
+        text = "search Zomato for speed render near me"
         self.assertEqual(match_website_intent(text), "food.discover")
         self.assertEqual(
             extract_website_fields(text, "food.discover"), {"food.query": "speed render"}
