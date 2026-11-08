@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS, MAC_APPS
 from actionmesh.core.graph import graph_from_actions
 from actionmesh.core.graph.errors import GraphValidationError
 from actionmesh.protocol.models import ActionGraph
@@ -158,6 +159,9 @@ def _named(m: re.Match[str], *groups: str) -> dict[str, Any]:
     return out
 
 
+_MAC_APP_NAME = "(?P<app>" + "|".join(map(re.escape, MAC_APPS)) + ")"
+
+
 _RULES: tuple[
     tuple[str, re.Pattern[str], Callable[[re.Match[str]], dict[str, Any] | None]], ...
 ] = (
@@ -251,18 +255,34 @@ _RULES: tuple[
     ("device.project.open", re.compile(
         r"^(?:open|launch)\s+(?:my |the )?project\s+(?P<project>\S+)"
         r"(?:\s+in\s+(?P<ide>\S+))?$", re.I), lambda m: _named(m, "project", "ide")),
+    (MAC_APP_ACTION, re.compile(
+        r"^(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?"
+        + _MAC_APP_NAME + r"(?:\s+app)?[.?!]?$", re.I,
+    ), lambda m: {"app": m["app"].lower()}),
+    (MAC_APP_STATUS, re.compile(
+        r"^is (?:the )?" + _MAC_APP_NAME + r"(?: app)? running[.?!]?$", re.I,
+    ), lambda m: {"app": m["app"].lower()}),
     # application launch (last: it is the broadest pattern)
     ("system.launch_app", re.compile(
         r"^(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?(?P<app>[\w .+-]+)$", re.I), _launch),
 )
 
 
-_CLAUSE_SPLIT = re.compile(r"\s*;\s*|\s+then\s+", re.I)
+_CLAUSE_SPLIT = re.compile(r"\s*;\s*|\s+(?:and\s+)?then\s+", re.I)
 
 
 def _clauses(text: str) -> list[str]:
     """Split a compound intent into clauses on ``;`` or the word "then"."""
-    return [part.strip() for part in _CLAUSE_SPLIT.split(text) if part.strip()]
+    clauses = [part.strip() for part in _CLAUSE_SPLIT.split(text) if part.strip()]
+    expanded: list[str] = []
+    for clause in clauses:
+        launch = re.fullmatch(r"(open|launch|start) (.+)", clause, re.I)
+        apps = re.split(r"\s+and\s+", launch[2].rstrip(".?!"), flags=re.I) if launch else []
+        if len(apps) > 1 and all(app.lower() in MAC_APPS for app in apps):
+            expanded.extend(f"open {app}" for app in apps)
+        else:
+            expanded.append(clause)
+    return expanded
 
 
 def _match(clause: str) -> ProposedAction | None:

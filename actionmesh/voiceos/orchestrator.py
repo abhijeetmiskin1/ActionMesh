@@ -45,6 +45,15 @@ TERMINAL_STATES = frozenset(
 )
 
 
+_STOPPED_STEPS = {
+    "failed": "failed",
+    "denied": "failed",
+    "cancelled": "stopped",
+    "interrupted": "interrupted",
+}
+_FINISHED_SESSIONS = frozenset({"completed", "failed", "stopped", "cancelled", "interrupted"})
+
+
 class Orchestrator:
     """Runs a session's steps, and reports what actually happened to each one."""
 
@@ -57,6 +66,7 @@ class Orchestrator:
         context: PolicyContext,
         *,
         checkpoint: Callable[[TaskSession], None] | None = None,
+        stop_on_unverified: bool = False,
     ) -> dict[str, Any]:
         """Run as far as this caller's authority allows, then stop and report.
 
@@ -72,9 +82,26 @@ class Orchestrator:
         ``running`` -- which is the truth -- rather than at ``pending``, which would be
         a lie the next press would act on by running it a second time.
         """
-        session.status = "running"
         references: list[dict[str, str]] = []
+        if session.status in _FINISHED_SESSIONS or (
+            session.status == "needs_review" and session.pending_step() is None
+        ):
+            return {"session": session, "references": references}
+        session.status = "running"
         while True:
+            stopped = next(
+                (item for item in session.steps if item.state in _STOPPED_STEPS), None
+            )
+            if stopped is not None:
+                session.status = _STOPPED_STEPS[stopped.state]
+                session.summary = self._summary(session)
+                return {"session": session, "references": references}
+            if stop_on_unverified and any(
+                step.state == "succeeded_unverified" for step in session.steps
+            ):
+                session.status = "needs_review"
+                session.summary = self._summary(session)
+                return {"session": session, "references": references}
             step = session.pending_step()
             if step is None:
                 break
@@ -88,6 +115,11 @@ class Orchestrator:
                     return {"session": session, "references": references}
                 references = self._collect(step, references)
                 continue
+            if stop_on_unverified and self._provider_for(step.action_type) == "mock":
+                session.status = "needs_review"
+                step.error = "This action is a simulation. Automatic execution paused before running it."
+                session.summary = step.error
+                return {"session": session, "references": references}
             if not self._condition_met(session, step):
                 step.state = "skipped"
                 step.error = "its condition was not met by the earlier step"
@@ -128,10 +160,6 @@ class Orchestrator:
                 session.status = "awaiting_approval" if step.state == "awaiting_approval" else "running"
                 session.summary = self._summary(session)
                 return {"session": session, "references": references}
-            if step.state in {"failed", "denied", "cancelled"}:
-                session.status = "stopped" if step.state == "cancelled" else "failed"
-                session.summary = self._summary(session)
-                return {"session": session, "references": references}
         session.status = "completed"
         session.summary = self._summary(session)
         return {"session": session, "references": references}
@@ -145,6 +173,11 @@ class Orchestrator:
         `cancelled`, and a control plane that contradicts itself is worse than one that
         says nothing. Nothing here executes: it reads records the caller can already read.
         """
+        if session.status in _FINISHED_SESSIONS:
+            session.summary = self._summary(session)
+            return session
+        if session.status == "needs_review":
+            return session
         for step in session.steps:
             if step.analysis:
                 # An analysis step is a *place* for an explanation, not a capability:
@@ -156,6 +189,10 @@ class Orchestrator:
             record = self.engine.record(step.execution_id)
             if record is not None:
                 self._apply_record(session, step, record)
+        if session.automatic and any(step.state == "succeeded_unverified" for step in session.steps):
+            session.status = "needs_review"
+            session.summary = self._summary(session)
+            return session
         settled = all(step.settled or step.analysis for step in session.steps)
         if settled:
             if any(step.state == "interrupted" for step in session.steps):
@@ -472,6 +509,9 @@ class Orchestrator:
             verified = self._field(node, "verified")
             step.verified = bool(verified) if verified is not None else None
             step.state = "succeeded" if step.verified else "succeeded_unverified"
+        elif record.state is ActionState.REQUIRES_USER:
+            step.state = "succeeded_unverified"
+            step.verified = False
         else:
             step.state = "failed"
         session.touch()
@@ -509,7 +549,9 @@ class Orchestrator:
         # last thing it should do is make a finished run look unfinished.
         analysed = len([step for step in session.steps if step.analysis])
         total = len(session.steps) - analysed
-        unverified = [step.index + 1 for step in session.steps if step.verified is False]
+        unverified = [
+            step.index + 1 for step in session.steps if step.state == "succeeded_unverified"
+        ]
         parts = [f"{len(settled)} of {total} steps settled."]
         if analysed:
             parts.append("The explanation step is filled in when you ask for it.")
@@ -518,7 +560,7 @@ class Orchestrator:
                 "Step(s) " + ", ".join(str(item) for item in unverified)
                 + " ran but were not independently verified."
             )
-        failed = [step for step in session.steps if step.state in {"failed", "denied", "cancelled"}]
+        failed = [step for step in session.steps if step.state in _STOPPED_STEPS]
         if failed:
             last = failed[-1]
             parts.append(f"Stopped at step {last.index + 1} ({last.state}): {last.error or 'no reason given'}.")

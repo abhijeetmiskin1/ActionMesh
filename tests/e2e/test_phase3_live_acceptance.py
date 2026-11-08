@@ -14,13 +14,12 @@ dependencies are absent:
 * for each live site, TCP reachability to that host is probed from this
   process first; failure skips with an explicit BLOCKED reason instead of
   fabricating results (no invented restaurants, prices, or trains);
-* when neither ``DISPLAY`` nor ``WAYLAND_DISPLAY`` is set, tests skip with
-  a BLOCKED "no display" reason — a headless CI box cannot answer a bridge
-  that wants a window.
+* the bridge must actually answer. It may be hosted by Electron on macOS,
+  where X11 and Wayland display variables are normally unset.
 
 When a test does run, success is claimed only from independent read-back:
-``snapshot()`` / ``inspect()`` re-read driver state and must agree with
-``open()`` on url/title. Read-only means: open/inspect/snapshot only —
+``snapshot()`` and ``inspect()`` must agree on URL and title after navigation,
+including when a site updates its URL or title after opening. Read-only means: open/inspect/snapshot only —
 no clicks, no submits, no orders, no booking. Login / CAPTCHA / OTP / MFA
 gates surface as ``needs_user`` and are reported as BLOCKED, never bypassed.
 
@@ -38,6 +37,7 @@ import tarfile
 import unittest
 from contextlib import suppress
 from pathlib import Path
+from urllib.parse import urlsplit
 
 LIVE_ENV = "ACTIONMESH_LIVE_ACCEPTANCE"
 
@@ -78,10 +78,6 @@ def _tcp_reachable(host: str, port: int, timeout_s: float = 3.0) -> bool:
             return True
     except OSError:
         return False
-
-
-def _has_display() -> bool:
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _deb_contents(deb_path: Path) -> list[str]:
@@ -132,13 +128,6 @@ class TestPhase3LiveAcceptance(unittest.TestCase):
 
     # -- gating helpers ----------------------------------------------------
 
-    def _require_display(self) -> None:
-        if not _has_display():
-            self.skipTest(
-                "BLOCKED: no display (DISPLAY/WAYLAND_DISPLAY unset) — "
-                "a headless environment cannot host the Electron browser window"
-            )
-
     def _require_bridge(self) -> object:
         from actionmesh.agent.browser import BridgeDriver, BrowserEngine
         from actionmesh.agent.browser_bridge import (
@@ -180,7 +169,6 @@ class TestPhase3LiveAcceptance(unittest.TestCase):
         from actionmesh.agent.browser import BrowserEngine
 
         assert isinstance(engine, BrowserEngine)
-        self._require_display()
         self._require_network(host)
         opened = run(engine.open(url))
         if opened.get("status") == "unavailable":
@@ -197,33 +185,21 @@ class TestPhase3LiveAcceptance(unittest.TestCase):
             "ok",
             f"open({url}) did not succeed: {opened!r}",
         )
-        observed_url = opened.get("url", "")
-        observed_title = opened.get("title", "")
-        self.assertIn(host, observed_url, f"open reported unexpected url: {observed_url!r}")
-        self.assertTrue(observed_title, "open reported no page title")
-
+        self.assertEqual(urlsplit(opened.get("url", "")).hostname, host)
+        self.assertTrue(opened.get("title"), "open reported no page title")
         snap = run(engine.snapshot())
         if snap.get("status") == "unavailable":
             self.skipTest(f"BLOCKED: bridge unreachable on read-back: {snap.get('reason', '')}")
         self.assertEqual(snap.get("status"), "ok", f"snapshot failed: {snap!r}")
-        self.assertEqual(
-            snap.get("url"),
-            observed_url,
-            "read-back url disagrees with open url — success not claimed",
-        )
-        self.assertEqual(
-            snap.get("title"),
-            observed_title,
-            "read-back title disagrees with open title — success not claimed",
-        )
+        self.assertEqual(urlsplit(snap.get("url", "")).hostname, host)
         self.assertGreaterEqual(snap.get("count", 0), 1, f"read-back saw no elements on {host}")
 
         insp = run(engine.inspect())
         if insp.get("status") == "unavailable":
             self.skipTest(f"BLOCKED: bridge unreachable on inspect: {insp.get('reason', '')}")
         self.assertEqual(insp.get("status"), "ok", f"inspect failed: {insp!r}")
-        self.assertEqual(insp.get("url"), observed_url)
-        self.assertEqual(insp.get("title"), observed_title)
+        self.assertEqual(insp.get("url"), snap.get("url"))
+        self.assertEqual(insp.get("title"), snap.get("title"))
         self.assertTrue(insp.get("title"), "inspect reported no page title")
         return opened
 
@@ -242,7 +218,6 @@ class TestPhase3LiveAcceptance(unittest.TestCase):
         engine = self._require_bridge()
         assert isinstance(engine, BrowserEngine)
         try:
-            self._require_display()
             self._require_network(SEARCH_HOST)
             opened = run(engine.open(EXAMPLE_URL))
             if opened.get("status") != "ok":

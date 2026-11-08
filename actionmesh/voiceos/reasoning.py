@@ -19,6 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS
 from actionmesh.core.planner import Planner
 from actionmesh.voiceos.models import Conversation, TaskSession, TaskStep
 from actionmesh.voiceos.targeting import TargetChoice, describe_choice
@@ -33,6 +34,31 @@ from actionmesh.voiceos.website_workflows import (
     resolve_template,
     substitute,
 )
+
+_SERVICE_PAGES = {
+    "github": "https://github.com/",
+    "google workspace": "https://workspace.google.com/",
+    "google drive": "https://drive.google.com/",
+    "google docs": "https://docs.google.com/document/",
+    "google sheets": "https://docs.google.com/spreadsheets/",
+    "google slides": "https://docs.google.com/presentation/",
+    "gmail": "https://mail.google.com/",
+    "google calendar": "https://calendar.google.com/",
+}
+
+def _browser_url(request: str) -> str | None:
+    service = re.fullmatch(r"(?:open|launch)\s+(?:the\s+)?([\w ]+)[.?!]?", request, re.I)
+    if service and (url := _SERVICE_PAGES.get(service[1].strip().lower())):
+        return url
+    browser = re.fullmatch(
+        r"(?:open|launch)\s+(?:(?:the\s+)?(?:browser|brawser|brower|broswer)"
+        r"(?:\s+(?:to\s+)?(?P<target>https?://\S+)|[.?!])?|(?P<url>https?://\S+))",
+        request, re.I,
+    )
+    if browser:
+        return browser.group("target") or browser.group("url") or "https://duckduckgo.com/"
+    return None
+
 
 #: How a remembered item is addressed, so "the second server" can find it.
 _REFERENCE_ORDINAL = re.compile(
@@ -187,8 +213,11 @@ class Reasoner:
 
     def understand(self, text: str, conversation: Conversation) -> Understanding:
         request = " ".join(text.split())
+        request = re.sub(r"^(?:hey\s+)?jarvis(?:[,!:]\s*|\s+|[.?]?$)", "", request, flags=re.I)
         if not request:
             return Understanding(kind="answer", reply="Say something first — or type it.")
+        awaiting_product = conversation.awaiting_deal_product
+        conversation.awaiting_deal_product = False
         if _CLEAR.match(request):
             return Understanding(
                 kind="clear",
@@ -204,7 +233,20 @@ class Reasoner:
         switched = self._switch(request, conversation)
         if switched is not None:
             return switched
-        return self._task(request, conversation)
+        if awaiting_product:
+            product = request.rstrip(".?!")
+            command = re.match(
+                r"^(?:open|launch|start|check|search|find|show|look|compare|buy|order|book|"
+                r"send|tell|run|delete|close|play|pause|cancel|no|never mind)\b",
+                product, re.I,
+            )
+            if not command and re.fullmatch(r"[\w][\w +.,&/()'-]{0,119}", product):
+                return self._task(f"Find deals for {product}", conversation)
+        answer = self._task(request, conversation)
+        conversation.awaiting_deal_product = (
+            match_website_intent(request) == "deal.search" and answer.unresolved == ("web.query",)
+        )
+        return answer
 
     # -- device selection --------------------------------------------------
 
@@ -422,7 +464,65 @@ class Reasoner:
 
     # -- task decomposition ------------------------------------------------
 
+    def _mixed_workflow(self, request: str, conversation: Conversation) -> Understanding | None:
+        """Combine independently supported commands into a single ordered task."""
+        clauses = re.split(
+            r"(?:,\s*|\s+)(?:and\s+)?then\s+(?=(?:open|launch|start|is|find|check|compare|search)\b)",
+            request,
+            flags=re.I,
+        )
+        if len(clauses) < 2 or not any(
+            _browser_url(clause) or match_website_intent(clause) == "deal.search"
+            for clause in clauses
+        ):
+            return None
+        if len(clauses) > 8:
+            return Understanding(kind="answer", reply="Use up to eight commands in one task.")
+        supported = {MAC_APP_ACTION, MAC_APP_STATUS, "browser.open", "browser.search"}
+        steps: list[TaskStep] = []
+        for index, clause in enumerate(clauses, start=1):
+            answer = self._task(clause, conversation)
+            if answer.session is None:
+                return Understanding(
+                    kind="answer",
+                    reply=f"Command {index} needs attention. {answer.reply}",
+                    unresolved=answer.unresolved,
+                )
+            if answer.notes or any(step.action_type not in supported for step in answer.session.steps):
+                return Understanding(
+                    kind="answer",
+                    reply=f"Command {index} cannot be included in this automatic task.",
+                )
+            for step in answer.session.steps:
+                step.index = len(steps)
+                steps.append(step)
+        if len(steps) > 8:
+            return Understanding(kind="answer", reply="This task needs more than eight steps. Split it into smaller tasks.")
+        session = self._session(request, steps, conversation)
+        return Understanding(
+            kind="task", reply=f"I prepared {len(steps)} steps in order.", session=session,
+            device_id=session.device_id,
+        )
+
     def _task(self, request: str, conversation: Conversation) -> Understanding:
+        mixed = self._mixed_workflow(request, conversation)
+        if mixed is not None:
+            return mixed
+        url = _browser_url(request)
+        if url is not None:
+            if not self.known_action("browser.open"):
+                return Understanding(
+                    kind="answer",
+                    reply="Enable the browser drive in Settings to open pages on this computer.",
+                    unresolved=("browser capability not registered",),
+                )
+            session = self._session(request, [
+                TaskStep(index=0, label="Open browser", action_type="browser.open", parameters={"url": url}),
+            ], conversation)
+            return Understanding(
+                kind="task", reply="I can open that in the browser.", session=session,
+                device_id=session.device_id,
+            )
         step = self._reference_step(request, conversation)
         if step is not None:
             session = self._session(request, [step], conversation)
@@ -468,7 +568,12 @@ class Reasoner:
             steps = [
                 TaskStep(
                     index=index,
-                    label=f"Run {action.type}",
+                    label=(
+                        f"Open {action.parameters['app'].title()}"
+                        if action.type == MAC_APP_ACTION
+                        else f"Check {action.parameters['app'].title()}"
+                        if action.type == MAC_APP_STATUS else f"Run {action.type}"
+                    ),
                     action_type=action.type,
                     parameters=dict(action.parameters),
                 )
@@ -531,21 +636,25 @@ class Reasoner:
         if name is None:
             return None
         template = resolve_template(name)
+        fields = extract_website_fields(request, name)
+        missing_field = clarification_field(template, fields)
+        if name == "deal.search" and missing_field is not None:
+            return Understanding(
+                kind="answer",
+                reply=clarification_prompt(template, missing_field),
+                unresolved=(missing_field,),
+            )
         if not all(self.known_action(str(step.get("action"))) for step in template.steps):
             return Understanding(
                 kind="answer",
                 reply=(
                     f"I understood that as asking for the {name} website workflow, but "
                     "this control service does not offer the browser capabilities it "
-                    "needs, so there is nothing to propose. Enable the laptop agent "
+                    "needs. Enable the laptop agent and browser drive in Settings "
                     "and ask again. Nothing has run."
                 ),
                 unresolved=("browser capability not registered",),
             )
-        fields = extract_website_fields(request, name)
-        # An inline answer to a previous clarification is still on the next
-        # turn's request: only auto-populate here.
-        missing_field = clarification_field(template, fields)
         if missing_field is not None:
             return Understanding(
                 kind="answer",
@@ -587,6 +696,11 @@ class Reasoner:
             if template.submit_action is not None
             else " This is read-only — nothing will be booked or ordered."
         )
+        if name == "deal.search":
+            submit_note = (
+                " I will open search results for comparison."
+                " Prices, sellers, and checkout need separate verification."
+            )
         return Understanding(
             kind="task",
             reply=(

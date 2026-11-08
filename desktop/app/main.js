@@ -20,11 +20,12 @@
  */
 const {
   app, BrowserWindow, Menu, Tray, Notification, globalShortcut, ipcMain,
-  nativeImage, session, shell, safeStorage, screen,
+  nativeImage, session, shell, safeStorage, screen, systemPreferences,
 } = require('electron');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { pathToFileURL } = require('node:url');
 
 const { Backend, newLoopbackKey, os } = require('./backend');
 const { SettingsStore } = require('./settings');
@@ -37,6 +38,8 @@ const { startBridge: startBrowserBridge } = require('./browser_bridge');
 const APP_ID = 'com.actionmesh.voiceos';
 const PRODUCT = 'ActionMesh';
 const VERSION = require('../package.json').version;
+const MAIN_UI_PATH = path.join(__dirname, '..', 'ui', 'index.html');
+const MAIN_UI_URL = pathToFileURL(MAIN_UI_PATH).href;
 const REQUEST_TIMEOUT_MS = 30_000;
 const LONG_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
@@ -78,7 +81,7 @@ let settings = null;
 // The last connection probe's outcome, kept in memory so the header can show what was
 // actually verified rather than inferring "connected" from the presence of a key. It is
 // never persisted: a restart re-tests, and a stale green tick is worse than none.
-let lastProviderTest = null;
+const lastPurposeTests = new Map();
 // C41: the socket server VoiceOS calls to reach a model. `bridgeToken` is minted per
 // launch and handed only to the backend child's environment; it is worth exactly one
 // thing — permission to talk to this socket while this process lives.
@@ -495,8 +498,9 @@ function purposeStatus(purpose) {
   const spec = providers.specFor(fields.provider, purposeId);
   const model = fields.model || (spec ? spec.defaultModel : '');
   const hasKey = Boolean(settings && settings.hasSecret(secretKey));
-  const last = lastProviderTest && lastProviderTest.provider === fields.provider
-    && lastProviderTest.purpose === purposeId ? lastProviderTest : null;
+  const tested = lastPurposeTests.get(purposeId);
+  const last = tested?.provider === fields.provider && tested.model === fields.model
+    && tested.baseUrl === fields.endpoint ? tested : null;
   const legacy = fields.legacy;
 
   let state;
@@ -618,6 +622,9 @@ function registerIpc() {
   ipcMain.handle('settings:update', (_event, patch) => {
     const previousShortcut = currentShortcut();
     const previousEnabled = settings.get('shortcutEnabled');
+    if (patch && Object.keys(patch).some((key) => key.endsWith('ApiKey'))) {
+      lastPurposeTests.clear();
+    }
     settings.update(patch);
     let shortcut = { registered: globalShortcut.isRegistered(currentShortcut()) };
     if (currentShortcut() !== previousShortcut || settings.get('shortcutEnabled') !== previousEnabled) {
@@ -759,7 +766,6 @@ function registerIpc() {
       apiKey,
       timeoutSeconds: Number(patch.timeoutSeconds || settings.get('providerTimeout') || 12),
     });
-    lastProviderTest = { provider: spec.id, ...outcome, at: new Date().toISOString() };
     return { ok: true, provider: spec.id, ...outcome };
   });
 
@@ -788,6 +794,39 @@ function registerIpc() {
     const p = validPurpose(purpose);
     if (!p) return { ok: false, error: 'unknown purpose' };
     return { ok: true, status: purposeStatus(p) };
+  });
+
+  let transcriptionInFlight = false;
+  const fromVoicePage = (event) => event.sender === mainWindow?.webContents
+    && event.senderFrame?.url === MAIN_UI_URL && !event.senderFrame.parent;
+  ipcMain.handle('voice:request-mic', async (event) => {
+    if (!fromVoicePage(event)) return false;
+    if (process.platform !== 'darwin') return true;
+    return systemPreferences.askForMediaAccess('microphone');
+  });
+  ipcMain.handle('voice:transcribe', async (event, recording) => {
+    if (!fromVoicePage(event) || transcriptionInFlight) {
+      return { state: 'provider_unavailable', detail: 'A transcription request cannot start right now.' };
+    }
+    const { provider, model, endpoint: baseUrl, timeout } = purposeFields('audio');
+    if (provider !== 'openai_compatible_stt') {
+      return { state: 'not_configured', detail: 'Configure speech transcription in the Audio settings.' };
+    }
+    const apiKey = settings.secret('audioApiKey');
+    transcriptionInFlight = true;
+    try {
+      const answer = await providers.transcribe({ model, baseUrl, apiKey, timeoutSeconds: timeout },
+        recording?.bytes, recording?.mime);
+      const current = purposeFields('audio');
+      if (current.provider === provider && current.model === model && current.endpoint === baseUrl
+          && settings.secret('audioApiKey') === apiKey) {
+        const { transcript, ...status } = answer;
+        lastPurposeTests.set('audio', { provider, model, baseUrl, ...status, at: new Date().toISOString() });
+      }
+      return answer;
+    } finally {
+      transcriptionInFlight = false;
+    }
   });
 
   ipcMain.handle('purpose:configure', (_event, payload) => {
@@ -822,6 +861,7 @@ function registerIpc() {
       update[`${p}ApiKey`] = key;
     }
     settings.update(update);
+    lastPurposeTests.delete(p);
     return { ok: true, purpose: p, settings: settings.public(), status: purposeStatus(p) };
   });
 
@@ -834,6 +874,7 @@ function registerIpc() {
     const update = { [`${p}ApiKey`]: '' };
     if (p === 'chat') update.providerApiKey = '';
     settings.update(update);
+    lastPurposeTests.delete(p);
     return { ok: true, purpose: p, settings: settings.public(), status: purposeStatus(p) };
   });
 
@@ -846,22 +887,28 @@ function registerIpc() {
     const spec = providers.specFor(provider, p);
     if (!spec || !spec.implemented) {
       // Nothing to call: report it without touching the network or the keyring.
-      return { ok: true, purpose: p, provider, ...providers.test({ provider, model: '' }) };
+      return { ok: true, purpose: p, provider, ...await providers.test({ provider, purpose: p }) };
     }
     // A key typed but not saved is tested ephemerally; otherwise the stored key for
     // this exact purpose is read here and passed straight into the adapter. It never
     // goes to the renderer.
     const typed = typeof payload.apiKey === 'string' ? payload.apiKey.trim() : '';
     const apiKey = typed || settings.secret(purposeSecretKey(p));
+    const model = String(payload.model || fields.model || '');
+    const baseUrl = String(payload.baseUrl || fields.endpoint || '');
     const outcome = await providers.test({
       provider: spec.id,
-      model: String(payload.model || fields.model || ''),
-      baseUrl: String(payload.baseUrl || fields.endpoint || ''),
+      model,
+      baseUrl,
       apiKey,
       timeoutSeconds: Number(payload.timeoutSeconds || fields.timeout || 12),
       purpose: p,
     });
-    lastProviderTest = { purpose: p, provider: spec.id, ...outcome, at: new Date().toISOString() };
+    const current = purposeFields(p);
+    if (current.provider === spec.id && current.model === model && current.endpoint === baseUrl
+        && settings.secret(purposeSecretKey(p)) === apiKey) {
+      lastPurposeTests.set(p, { provider: spec.id, model, baseUrl, ...outcome, at: new Date().toISOString() });
+    }
     return { ok: true, purpose: p, provider: spec.id, ...outcome };
   });
 
@@ -869,6 +916,7 @@ function registerIpc() {
     const p = validPurpose(payload && payload.purpose);
     if (!p) return { ok: false, error: 'unknown purpose' };
     settings.update({ [`purpose_${p}_model`]: String(payload.model || '').slice(0, 120) });
+    lastPurposeTests.delete(p);
     return { ok: true, purpose: p, status: purposeStatus(p) };
   });
 
@@ -977,11 +1025,14 @@ function createMainWindow() {
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
-  mainWindow.webContents.session.setPermissionRequestHandler((_wc, permission, callback) => {
+  mainWindow.webContents.session.setPermissionRequestHandler((wc, permission, callback, details) => {
     // The microphone is requested by the VoiceOS page via getUserMedia. Nothing else
     // is granted, and the request itself is what the page's own push-to-talk does —
     // the app never opens the microphone on its own.
-    callback(permission === 'media');
+    callback(wc === mainWindow?.webContents && permission === 'media'
+      && details?.isMainFrame === true && details.requestingUrl === MAIN_UI_URL
+      && details.mediaTypes?.length === 1
+      && details.mediaTypes[0] === 'audio');
   });
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
@@ -992,7 +1043,7 @@ function createMainWindow() {
     mainWindow = null;
   });
 
-  mainWindow.loadFile(path.join(__dirname, '..', 'ui', 'index.html'));
+  mainWindow.loadFile(MAIN_UI_PATH);
 }
 
 function openAbout() {
@@ -1179,6 +1230,10 @@ app.whenReady().then(async () => {
       settings,
       providers,
       getStatus: providerStatus,
+      noteTestResult(state, { purpose, provider, model, baseUrl }) {
+        const lane = purpose === 'legacy' ? 'chat' : purpose;
+        lastPurposeTests.set(lane, { provider, model, baseUrl, state, at: new Date().toISOString() });
+      },
     });
   } catch (error) {
     providerBridge = null;

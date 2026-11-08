@@ -581,6 +581,7 @@ def create_app(
             app.state.voiceos_store_instance = opened
         return opened
     app.state.voiceos_orchestrator = Orchestrator(engine=engine)
+    active_voice_runs: set[str] = set()
     #: C39 — automations. A sixth store family, beside the VoiceOS one and opened the
     #: same lazy way: a process that never touches an automation should not be holding
     #: a database handle. What it stores is *intent* (a name, a plan, a trigger) plus
@@ -2119,6 +2120,10 @@ def create_app(
                 "request": row.request,
                 "status": row.status,
                 "steps": len(row.steps),
+                "automatic_approval_execution_id": next(
+                    (step.execution_id for step in row.steps if step.state == "awaiting_approval"),
+                    "",
+                ) if row.automatic else "",
                 "settled": sum(1 for step in row.steps if step.settled),
                 "updated_at": row.updated_at,
             }
@@ -2126,13 +2131,14 @@ def create_app(
         ]
 
     @app.get("/voiceos/sessions/{session_id}")
-    def voiceos_session(request: Request, session_id: str) -> dict[str, Any]:
+    async def voiceos_session(request: Request, session_id: str) -> dict[str, Any]:
         session = _voiceos_load(session_id, _record_scope(request))
         # Fold any live step from its execution record first. This reads only -- it
         # cannot start anything -- but it is what stops a cancelled run from being
         # shown as still awaiting approval.
-        session = app.state.voiceos_orchestrator.fold_records(session)
-        _voiceos_store().save_session(session)
+        if session_id not in active_voice_runs:
+            session = app.state.voiceos_orchestrator.fold_records(session)
+            _voiceos_store().save_session(session)
         out = session.to_dict()
         out["description"] = describe_session(session)
         return out
@@ -2145,6 +2151,8 @@ def create_app(
         credential = getattr(request.state, "credential", None)
         _throttle("voiceos", _credential_key(request))
         session = _voiceos_load(session_id, _record_scope(request))
+        if session_id in active_voice_runs:
+            raise HTTPException(status_code=409, detail="this task is already running")
         context = _context(
             payload,
             app.state.consent_store,
@@ -2152,22 +2160,28 @@ def create_app(
             credentials=app.state.credentials,
         )
         store: VoiceOsStore = _voiceos_store()
-        # Write the name of each execution to the step *before* awaiting it. If this
-        # request dies mid-step, the session on disk still points at the run, and the
-        # next reader can ask the durable record what became of it instead of guessing.
-        outcome = await app.state.voiceos_orchestrator.advance(
-            session, context, checkpoint=store.save_session
-        )
-        updated: TaskSession = outcome["session"]
-        store.save_session(updated)
-        conversation = store.get_conversation(updated.actor_id)
-        conversation.active_session_id = updated.session_id
-        if outcome.get("references"):
-            # Remember what was *observed*, so the next turn can say "the second one".
-            conversation.references = list(outcome["references"])
-        conversation.remember("voiceos", updated.summary or describe_session(updated))
-        store.save_conversation(conversation)
-        return updated.to_dict()
+        active_voice_runs.add(session_id)
+        try:
+            # Write the name of each execution to the step *before* awaiting it. If this
+            # request dies mid-step, the session on disk still points at the run, and the
+            # next reader can ask the durable record what became of it instead of guessing.
+            session.automatic = payload.get("stop_on_unverified") is True
+            outcome = await app.state.voiceos_orchestrator.advance(
+                session, context, checkpoint=store.save_session,
+                stop_on_unverified=session.automatic,
+            )
+            updated: TaskSession = outcome["session"]
+            store.save_session(updated)
+            conversation = store.get_conversation(updated.actor_id)
+            conversation.active_session_id = updated.session_id
+            if outcome.get("references"):
+                # Remember what was *observed*, so the next turn can say "the second one".
+                conversation.references = list(outcome["references"])
+            conversation.remember("voiceos", updated.summary or describe_session(updated))
+            store.save_conversation(conversation)
+            return updated.to_dict()
+        finally:
+            active_voice_runs.discard(session_id)
 
     @app.post("/voiceos/sessions/{session_id}/diagnose")
     async def voiceos_session_diagnose(

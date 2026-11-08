@@ -67,3 +67,22 @@ Handlers raise `ProviderError(message, FailureKind)`; confinement
 refusals → `AUTHORIZATION`; missing input → `INVALID_INPUT`; unavailable
 backends return `{"status": "unavailable"}` (e.g. `BrowserEngine._unavailable`
 before `browser.open`). Verification never self-certifies.
+
+## VoiceOS assistant capability review
+
+| User goal | Current coverage | Missing capability |
+| --- | --- | --- |
+| Control the Mac | Supported app launches and running-status checks have live macOS read-back. Workspace, process and editor actions have separate configuration gates. | Broader native app operations need typed capabilities and independent observations. |
+| Complete a request across tools | A command joined with “then” can combine supported Mac app commands, named browser pages and deal discovery. Automatic execution follows the ordered steps and stops on policy or verification failures. | The system cannot yet choose a new tool or revise its plan based on intermediate results. |
+| Research and compare products | Browser search can verify navigation and count result links. | Verified comparisons require structured product identity, seller, price, currency, delivery, availability and time of observation. |
+| Use GitHub or Google Workspace | Voice commands can propose opening their public entry points. | Account operations need authenticated, scoped connectors and tests against real services. |
+| Place an order | The execution system has a critical approval gate and a submit action. | A retailer adapter must observe the exact cart and total, honor approval for the specific action and verify the resulting receipt. |
+| Continue after an approval | The task store keeps the link to a pending automatic approval. A reopened desktop can recover the link and continue after the approved step verifies. | Continuation is initiated by the desktop approval screen and its recovery checks the latest 100 tasks. |
+
+Keep tool calls inside the existing registry, policy, executor and verification
+path. Build each external integration around a small set of typed capabilities
+and test success, denial, unavailable service and incomplete verification. This
+follows the distinction between ordered workflows and adaptive agents in
+[Building effective agents](https://www.anthropic.com/research/building-effective-agents).
+The [MCP tool interface](https://csharp.sdk.modelcontextprotocol.io/v1/concepts/tools/tools.html)
+can be a connector boundary while local policy controls which operations are exposed.

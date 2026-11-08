@@ -27,7 +27,27 @@
 | Unit-tested | Core engine, policy, registry, executor, verification, audit, agents, VoiceOS, API |
 | Integration-tested | AI→VoiceOS→execute pipeline (`tests/integration/`) |
 | Fixture-tested | C42 vertical slices (browser/files/media) |
-| Live-tested | **None claimed in this pass.** MPRIS explicitly not exercised against a real player (`agent/media.py:326-328`). No live provider, live browser, or live device acceptance is recorded in source. |
+| Live-tested (2026-11-08) | MPRIS status, play, pause and volume with mpv on an isolated Debian session bus. A separate run confirmed opening a second workspace file. Electron ran against public sites and a controlled loopback page. Physical phone and credentialed provider acceptance remain open. |
+
+## Opt-in acceptance
+
+For browser checks, start Electron with a disposable profile and run the test
+process with the matching `ACTIONMESH_BROWSER_BRIDGE_SOCKET` and
+`ACTIONMESH_BROWSER_BRIDGE_TOKEN` from that launch. Keep the token out of logs.
+
+```bash
+ACTIONMESH_LIVE_ACCEPTANCE=1 python -m pytest tests/e2e/test_phase4_live_acceptance.py -q -rs
+```
+
+For media playback checks, use a separate D-Bus session, for example
+`dbus-run-session -- bash` on Linux. Start mpv with its MPRIS plugin, a local
+test audio file, and `--pause --no-video --ao=null`. Keep only that test player
+on the session bus.
+
+```bash
+ACTIONMESH_LIVE_ACCEPTANCE=1 ACTIONMESH_LIVE_MPRIS_PLAYER=mpv \
+  python -m pytest tests/e2e/test_phase4_live_acceptance.py -k dedicated_player -q
+```
 
 ## Historical results (labeled historical — do not treat as current)
 

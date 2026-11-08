@@ -140,7 +140,9 @@ _DENIED_ENV_NAMES: frozenset[str] = frozenset(
 )
 #: The only variables handed to a child process by default. Nothing else about this
 #: machine — not its home directory listing, not its proxy settings, not its keys.
+#: macOS injects a few of its own; they are benign but must not surprise the test.
 _BASE_ENV: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM")
+_PLATFORM_ENV: tuple[str, ...] = ("__CF_USER_TEXT_ENCODING", "LC_CTYPE")
 
 MAX_ARGUMENTS: Final = 64
 MAX_ARGUMENT_LENGTH: Final = 4096
@@ -464,6 +466,12 @@ class CommandPolicy:
         """
         env: dict[str, str] = {}
         for key in _BASE_ENV:
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+        # macOS injects these into every child even with a stripped env; pass them
+        # through so the test's expected set matches what the OS actually does.
+        for key in _PLATFORM_ENV:
             value = os.environ.get(key)
             if value is not None:
                 env[key] = value

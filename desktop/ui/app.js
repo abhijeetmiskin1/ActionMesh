@@ -157,6 +157,10 @@ const state = {
   appState: null,
   ready: null,
   selectedTask: null,
+  voiceTask: null,
+  automaticApprovals: new Map(),
+  voiceSubmitting: false,
+  runningTasks: new Set(),
   selectedExecution: null,
   tasks: [],
   executions: [],
@@ -227,14 +231,17 @@ const VIEWS = {
   devices: { eyebrow: 'This laptop', title: 'Devices' },
   visual: { eyebrow: 'Seeing the screen', title: 'Visual Intelligence' },
   browser: { eyebrow: 'Web pages', title: 'Browser' },
+  providers: { eyebrow: 'AI connections', title: 'Providers' },
   settings: { eyebrow: 'Application', title: 'Settings' },
 };
 
 function showView(name) {
+  if (name !== 'voice') endVoiceConversation();
   // Voice is a real view now: the microphone, the transcript box and the quick
   // commands all live in this window. The original push-to-talk page is still
   // reachable from Settings, but nothing navigates there by default.
   if (!VIEWS[name]) name = 'home';
+  if (state.view !== name) byId('mainScroll').scrollTop = 0;
   state.view = name;
   for (const section of document.querySelectorAll('section.view')) {
     section.hidden = section.dataset.view !== name;
@@ -341,15 +348,24 @@ async function refreshHome() {
     return;
   }
 
-  const [readyResult, devicesResult, approvalsResult, executionsResult, sessionsResult, automationsResult] =
-    await Promise.allSettled([
-      GET('/ready'),
-      GET('/devices'),
-      GET('/approvals'),
-      GET('/executions?limit=8'),
-      GET('/voiceos/sessions?limit=8'),
-      GET('/automations'),
-    ]);
+  const ready = Promise.allSettled([GET('/ready'), GET('/devices')]);
+  const approvals = GET('/approvals').then((entries) => {
+    const count = entries.reduce((sum, entry) => sum + (entry.actions || []).length, 0);
+    byId('homeApprovals').textContent = String(count);
+    setBadge('approvals', count);
+  }, () => { byId('homeApprovals').textContent = '—'; });
+  const tasks = GET('/voiceos/sessions?limit=8').then((sessions) => {
+    renderTaskRows(byId('homeSessions'), sessions.slice(0, 6), (id) => {
+      showView('tasks');
+      loadTask(id);
+    });
+  }, () => {
+    replace(byId('homeSessions'), el('li', { class: 'empty', text: 'Could not load recent tasks.' }));
+  });
+  const activity = Promise.allSettled([
+    GET('/executions?limit=8'), GET('/automations'),
+  ]);
+  const [readyResult, devicesResult] = await ready;
 
   // Connected computers: the number the backend asserts, and — just as important — the
   // one it does not. This build has enrolled a single laptop; the card says so.
@@ -374,6 +390,7 @@ async function refreshHome() {
     byId('homeDevicesNote').textContent = 'unreadable';
   }
 
+  const [executionsResult, automationsResult] = await activity;
   // Active executions: the ones that have not settled. The executions list carries
   // state per record, so this counts what the backend says rather than what this page
   // remembers having started.
@@ -392,12 +409,6 @@ async function refreshHome() {
     byId('homeBackendNote').textContent = 'unreadable';
   }
 
-  if (approvalsResult.status === 'fulfilled') {
-    const count = approvalsResult.value.reduce((sum, entry) => sum + (entry.actions || []).length, 0);
-    byId('homeApprovals').textContent = String(count);
-    setBadge('approvals', count);
-  }
-
   // Saved automations: the library, straight from the store.
   if (automationsResult.status === 'fulfilled') {
     const body = automationsResult.value || {};
@@ -410,17 +421,10 @@ async function refreshHome() {
     byId('homeAuditNote').textContent = 'unreadable';
   }
 
-  if (sessionsResult.status === 'fulfilled') {
-    renderTaskRows(byId('homeSessions'), sessionsResult.value.slice(0, 6), (id) => {
-      state.selectedTask = id;
-      showView('tasks');
-      loadTask(id);
-    });
-  }
-
   renderHomeProviderKv();
   const hour = new Date().getHours();
   byId('homeGreeting').textContent = `${hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening'}. What should we work on?`;
+  await Promise.all([approvals, tasks]);
 }
 
 /** The header's device pill: the device this control plane actually serves. */
@@ -485,12 +489,27 @@ function renderTaskRows(host, sessions, onPick, selectedId) {
       stateChip(session.status),
     ]);
     if (selectedId && session.session_id === selectedId) row.setAttribute('aria-selected', 'true');
-    if (onPick) row.addEventListener('click', () => onPick(session.session_id));
+    if (onPick) {
+      const openTask = () => onPick(session.session_id);
+      row.tabIndex = 0;
+      row.setAttribute('role', 'button');
+      row.addEventListener('click', openTask);
+      row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          openTask();
+        }
+      });
+    }
     return row;
   }));
 }
 
 function setBadge(name, count) {
+  if (name === 'approvals') {
+    byId('notifyDot').hidden = count === 0;
+    byId('notifyBtn').setAttribute('aria-label', count ? `Review approvals (${count} waiting)` : 'Review approvals');
+  }
   const badge = document.querySelector(`[data-badge="${name}"]`);
   if (!badge) return;
   if (count > 0) {
@@ -534,6 +553,14 @@ function renderReply(host, answer, onSession) {
       loadTask(answer.session_id);
     });
     parts.push(el('div', { class: 'btn-row' }, [open]));
+    if (host.id !== 'voiceReply') {
+      const results = el('button', { class: 'btn small ghost', type: 'button', text: 'Show task results' });
+      results.addEventListener('click', () => {
+        state.voiceTask = answer.session_id;
+        showView('voice');
+      });
+      parts.at(-1).append(results);
+    }
   }
   if (answer.notes && answer.notes.length) {
     parts.push(el('ul', { class: 'notes' }, answer.notes.map((note) => el('li', { text: note }))));
@@ -541,75 +568,57 @@ function renderReply(host, answer, onSession) {
   // `unresolved` is where the planner explains *why* it could not act — including
   // "the model did not answer this request" and the bridge's own state. Dropping it
   // would leave the reply blaming the sentence for a missing credential.
+  if (host.id === 'voiceReply' && answer.unresolved?.includes('browser capability not registered')) {
+    const settings = el('button', { class: 'btn small ghost', type: 'button', text: 'Open browser settings' });
+    settings.addEventListener('click', () => {
+      showView('settings');
+      byId('setAllowBrowser').focus();
+    });
+    parts.push(settings);
+  }
   if (answer.unresolved && answer.unresolved.length) {
     parts.push(el('ul', { class: 'notes' }, answer.unresolved.map((note) => el('li', { text: note }))));
   }
   // The server says `ran: false` on every turn of this route. Saying it here too is
   // the difference between "it answered" and "it acted".
-  parts.push(el('p', { class: 'fine', text: answer.ran ? 'Something ran — this should not happen on this route.' : 'Nothing ran. Proposing is not executing.' }));
+  if (host.id !== 'voiceReply' || !answer.session_id) {
+    parts.push(el('p', { class: 'fine', text: 'This reply did not execute an action.' }));
+  }
   replace(host, parts);
 }
 
-/** Microphone: one press, one utterance, or an honest answer that it is unavailable. */
-function wirePushToTalk(button, input, replyHost) {
-  // Called once per ask box with the element that box was found by id. A box that was
-  // not linked in leaves `button` null; there is nothing to wire and nothing to say.
-  if (!button || !input) return;
-  const Native = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Native) {
-    button.title = 'Speech recognition is unavailable in this window — VoiceOS has its own page';
-    button.addEventListener('click', () => {
-      toast('Speech recognition is not available here. Opening VoiceOS, which has push-to-talk.', '');
-      bridge.openWebPage('voice');
-    });
-    return;
-  }
-  let recognizer = null;
-  let listening = false;
-  const stop = () => {
-    if (recognizer) { try { recognizer.stop(); } catch { /* already stopped */ } }
-  };
-  const start = () => {
-    if (listening) return;
-    recognizer = new Native();
-    recognizer.lang = 'en-US';
-    recognizer.continuous = false; // one press, one utterance — never an open mic
-    recognizer.interimResults = false;
-    recognizer.maxAlternatives = 1;
-    recognizer.onresult = (event) => {
-      const transcript = event.results?.[0]?.[0]?.transcript || '';
-      if (transcript) {
-        input.value = transcript;
-        propose(transcript, replyHost);
-      }
-    };
-    recognizer.onerror = (event) => {
-      listening = false;
-      button.dataset.listening = 'false';
-      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-        toast('The microphone was refused. Nothing is recording.', 'bad');
-      } else if (event.error !== 'aborted') {
-        toast(`Speech recognition failed (${event.error}). Type it instead.`, 'bad');
-      }
-    };
-    recognizer.onend = () => {
-      listening = false;
-      button.dataset.listening = 'false';
-    };
-    try {
-      recognizer.start();
-      listening = true;
-      button.dataset.listening = 'true';
-    } catch (error) {
-      toast(`The microphone did not start: ${error.message}`, 'bad');
-    }
-  };
-  button.addEventListener('click', () => { if (listening) stop(); else start(); });
+/** Both ask boxes use the Voice Commands microphone and transcript. */
+function wirePushToTalk(button) {
+  if (!button) return;
+  button.title = 'Open Voice Commands and start recording';
+  button.addEventListener('click', () => {
+    showView('voice');
+    byId('voiceMic')?.click();
+  });
 }
 
 // ---------------------------------------------------------------------------
 // TASK CENTER
 // ---------------------------------------------------------------------------
+const FINISHED_TASKS = new Set(['completed', 'failed', 'stopped', 'cancelled', 'interrupted']);
+
+function renderFilteredTasks() {
+  const filter = document.querySelector('[data-task-filter][aria-pressed="true"]')?.dataset.taskFilter;
+  const query = byId('taskSearch').value.trim().toLowerCase();
+  const visible = state.tasks.filter((task) => {
+    if (filter === 'approval' && task.status !== 'awaiting_approval') return false;
+    if (filter === 'active' && FINISHED_TASKS.has(task.status)) return false;
+    return !query || `${task.request} ${task.session_id}`.toLowerCase().includes(query);
+  });
+  byId('taskCount').textContent = String(visible.length);
+  const list = byId('taskList');
+  if (!visible.length && state.tasks.length) {
+    replace(list, el('li', { class: 'empty', text: 'No recent tasks match these filters.' }));
+    return;
+  }
+  renderTaskRows(list, visible, loadTask, state.selectedTask);
+}
+
 async function refreshTasks() {
   await refreshAppState();
   if (!state.backendReady) {
@@ -619,17 +628,8 @@ async function refreshTasks() {
   try {
     const sessions = await GET('/voiceos/sessions?limit=50');
     state.tasks = sessions;
-    byId('taskCount').textContent = String(sessions.length);
-    const unsettled = sessions.filter((s) => !['completed', 'failed', 'stopped'].includes(s.status)).length;
-    setBadge('tasks', unsettled);
-    renderTaskRows(byId('taskList'), sessions, (id) => {
-      state.selectedTask = id;
-      loadTask(id);
-    }, state.selectedTask);
-    if (state.selectedTask) {
-      const row = byId('taskList').querySelector(`[data-id="${CSS.escape(state.selectedTask)}"]`);
-      if (row) row.setAttribute('aria-selected', 'true');
-    }
+    refreshTasksBadgeOnly();
+    renderFilteredTasks();
   } catch (error) {
     toast(`Could not read tasks: ${error.message}`, 'bad');
   }
@@ -653,11 +653,19 @@ async function loadTask(sessionId) {
 }
 
 function refreshTasksBadgeOnly() {
-  const unsettled = state.tasks.filter((s) => !['completed', 'failed', 'stopped'].includes(s.status)).length;
+  const unsettled = state.tasks.filter((s) => !FINISHED_TASKS.has(s.status)).length;
   setBadge('tasks', unsettled);
 }
 
+const VOICE_SETUP_PERMISSIONS = {
+  'device.app.launch_native': { scope: 'system.app.launch', risk: 'medium', label: 'app launch' },
+  'device.app.status_native': { scope: 'system.app.status', risk: 'low', label: 'app status' },
+  'browser.open': { scope: 'browser.control', risk: 'low', label: 'browser' },
+  'browser.search': { scope: 'search.web', risk: 'low', label: 'web search' },
+};
+
 function renderTaskDetail(host, session) {
+  const inVoice = host.id === 'voiceTaskResult';
   const head = el('div', { class: 'detail-head' }, [
     el('div', {}, [
       el('div', { class: 'detail-title', text: session.request || 'Task' }),
@@ -670,20 +678,63 @@ function renderTaskDetail(host, session) {
 
   const actions = el('div', { class: 'btn-row' });
   const next = (session.steps || []).find((step) => !['succeeded', 'succeeded_unverified', 'failed', 'denied', 'cancelled', 'skipped'].includes(step.state));
-  const terminal = ['completed', 'failed', 'stopped'].includes(session.status);
+  const terminal = FINISHED_TASKS.has(session.status)
+    || (session.status === 'needs_review' && !next);
 
-  if (!terminal) {
+  const automaticWaiting = next?.state === 'awaiting_approval'
+    && state.automaticApprovals.get(next.execution_id) === session.session_id;
+  const simulated = inVoice && session.status === 'needs_review'
+    && next?.error?.startsWith('This action is a simulation.');
+  if (!terminal && !automaticWaiting && !simulated) {
     const run = el('button', { class: 'btn primary', type: 'button' });
     run.textContent = next && next.state === 'awaiting_approval'
       ? 'Check again after approving'
       : (next ? `Run: ${next.label}` : 'Advance one step');
-    run.addEventListener('click', () => runSession(session.session_id, run));
+    run.disabled = state.runningTasks.has(session.session_id);
+    run.addEventListener('click', () => runSession(session.session_id, run, inVoice));
     actions.append(run);
   }
+  if (session.status === 'awaiting_approval' && inVoice) {
+    const review = el('button', { class: 'btn ghost', type: 'button', text: 'Review approvals' });
+    review.addEventListener('click', () => showView('approvals'));
+    actions.append(review);
+  }
+  const missing = session.steps?.find((step) => Object.hasOwn(VOICE_SETUP_PERMISSIONS, step.action_type)
+    && step.state === 'denied' && step.error?.includes('missing permission(s)'));
+  if (inVoice && missing) {
+    const { scope, risk, label } = VOICE_SETUP_PERMISSIONS[missing.action_type];
+    const permission = el('button', {
+      class: 'btn ghost', type: 'button', text: `Set up ${label} permission`,
+    });
+    permission.addEventListener('click', () => {
+      showView('approvals');
+      byId('consentScope').value = scope;
+      byId('consentRisk').value = risk;
+      byId('consentGrant').focus();
+    });
+    actions.append(permission);
+  }
+  if (session.status === 'needs_review') {
+    actions.append(el('p', { class: 'fine', text: simulated
+      ? 'This command matched a simulated action. Edit the command to try a supported action.'
+      : 'Automatic execution paused. Review the steps before continuing.' }));
+  }
+  if (session.request && (terminal || session.status === 'needs_review')) {
+    const edit = el('button', { class: 'btn ghost', type: 'button', text: inVoice ? 'Edit command' : 'Reuse command' });
+    edit.addEventListener('click', () => {
+      if (!inVoice) showView('voice');
+      const transcript = byId('voiceTranscript');
+      transcript.value = session.request;
+      transcript.focus();
+    });
+    actions.append(edit);
+  }
 
-  const cancel = el('button', { class: 'btn danger ghost', type: 'button', text: 'Stop this task' });
-  cancel.addEventListener('click', () => cancelSession(session.session_id, cancel));
-  actions.append(cancel);
+  if (!terminal) {
+    const cancel = el('button', { class: 'btn danger ghost', type: 'button', text: 'Stop this task' });
+    cancel.addEventListener('click', () => cancelSession(session.session_id, inVoice));
+    actions.append(cancel);
+  }
 
   const steps = el('ol', { class: 'steps' });
   for (const step of session.steps || []) {
@@ -710,7 +761,7 @@ function renderTaskDetail(host, session) {
   if (analysisStep && logStep && SETTLED.has(logStep.state)) {
     const explain = el('button', { class: 'btn ghost', type: 'button' });
     explain.textContent = analysisStep.label || 'Explain the latest error';
-    explain.addEventListener('click', () => diagnoseSession(session, explain));
+    explain.addEventListener('click', () => diagnoseSession(session, explain, inVoice));
     actions.append(explain);
   }
 
@@ -737,7 +788,15 @@ function renderStep(step) {
     const when = typeof step.when === 'string' ? step.when : JSON.stringify(step.when);
     if (when && when !== '{}') rows.push(['when', when]);
   }
-  if (step.execution_id) rows.push(['execution', step.execution_id]);
+  if (step.execution_id) {
+    rows.push(['execution', step.execution_id]);
+    const details = el('button', { class: 'btn ghost small', type: 'button', text: 'Execution details and output' });
+    details.addEventListener('click', () => {
+      showView('live');
+      loadExecution(step.execution_id);
+    });
+    body.append(details);
+  }
   if (step.verified !== null && step.verified !== undefined) rows.push(['verified', step.verified ? 'yes' : 'no']);
   if (step.error) rows.push(['error', step.error]);
   if (rows.length) body.append(kvTable(rows));
@@ -762,32 +821,78 @@ function renderStep(step) {
   return node;
 }
 
-async function runSession(sessionId, button) {
-  if (!requireBackend()) return;
-  button.disabled = true;
-  const original = button.textContent;
-  button.textContent = 'Working…';
+function voiceRunReport(session) {
+  if (session.status === 'awaiting_approval') return 'Waiting for your approval.';
+  if (session.status === 'needs_review') return 'Task paused for review.';
+  if (session.status !== 'completed') return `Task status: ${session.status.replaceAll('_', ' ')}.`;
+  const steps = session.steps || [];
+  const step = steps[0];
+  if (steps.length === 1 && step.action_type === 'device.app.status_native' && step.verified === true
+    && typeof step.observed?.running === 'boolean' && typeof step.observed.app === 'string') {
+    return `${step.label?.replace(/^Check /, '') || step.observed.app} is ${step.observed.running ? 'running' : 'closed'}.`;
+  }
+  const search = steps.find((item) => item.action_type === 'browser.search' && item.verified === true);
+  if (Number.isInteger(search?.observed?.count)) {
+    const count = search.observed.count;
+    return count === 0
+      ? 'The search page opened. I could not confirm any result links.'
+      : `I found ${count} result ${count === 1 ? 'link' : 'links'} in the browser. Prices and sellers still need checking.`;
+  }
+  const verified = steps.filter((item) => item.state === 'succeeded' && item.verified === true).length;
+  return verified > 1 ? `Task completed. ${verified} steps verified.` : 'Task completed.';
+}
+
+async function runSession(sessionId, button, inVoice = false, automatic = false) {
+  if (!requireBackend() || state.runningTasks.has(sessionId)) return;
+  state.runningTasks.add(sessionId);
+  const original = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Working…';
+  }
   // Subscribe before asking, exactly as the VoiceOS page does: live output is
   // transient and never replayed, so a stream opened after the answer misses it.
   try {
-    const updated = await POST(`/voiceos/sessions/${encodeURIComponent(sessionId)}/run`, { actor: IDENTITY }, { long: true });
-    renderTaskDetail(byId('taskDetail'), { ...updated, description: '' });
-    await loadTask(sessionId);
+    const body = { actor: IDENTITY };
+    if (automatic) body.stop_on_unverified = true;
+    const updated = await POST(`/voiceos/sessions/${encodeURIComponent(sessionId)}/run`, body, { long: true });
+    if (automatic && updated.status === 'awaiting_approval') {
+      const waiting = updated.steps?.find((step) => step.state === 'awaiting_approval');
+      if (waiting?.execution_id) {
+        state.automaticApprovals.set(waiting.execution_id, sessionId);
+      }
+    }
+    if (inVoice && state.voiceTask === sessionId) {
+      const report = voiceRunReport(updated);
+      renderReply(byId('voiceReply'), { kind: 'task', session_id: sessionId, reply: report });
+      renderTaskDetail(byId('voiceTaskResult'), updated);
+      if (automatic) speakVoiceReply(voiceController(), report, updated.status === 'completed');
+    }
     if (updated.status === 'awaiting_approval') {
       toast('This step is parked until you approve it. Nothing else will run before that.', '');
-      showView('approvals');
+      if (!inVoice) showView('approvals');
     } else {
-      toast(`Task advanced: ${updated.status}.`, 'good');
+      toast(`Task status: ${updated.status}.`, updated.status === 'completed' ? 'good' : '');
     }
   } catch (error) {
+    if (inVoice && state.voiceTask === sessionId) {
+      renderReply(byId('voiceReply'), {
+        kind: 'task', session_id: sessionId, reply: `Could not run the task. ${error.message}`,
+      });
+    }
     toast(`The step was refused: ${error.message}`, 'bad');
-    button.disabled = false;
-    button.textContent = original;
-    loadTask(sessionId);
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  } finally {
+    state.runningTasks.delete(sessionId);
+    if (inVoice && state.voiceTask === sessionId) await refreshVoiceResult();
+    else if (!inVoice && state.selectedTask === sessionId) await loadTask(sessionId);
   }
 }
 
-async function cancelSession(sessionId) {
+async function cancelSession(sessionId, inVoice = false) {
   if (!requireBackend()) return;
   try {
     const answer = await POST(`/voiceos/sessions/${encodeURIComponent(sessionId)}/cancel`);
@@ -797,7 +902,8 @@ async function cancelSession(sessionId) {
       // "requested" is what the server said, and it is what this says.
       toast('Stop requested. A task stops when the step it is running stops.', '');
     }
-    loadTask(sessionId);
+    if (inVoice) await refreshVoiceResult();
+    else await loadTask(sessionId);
   } catch (error) {
     toast(`The stop request failed: ${error.message}`, 'bad');
   }
@@ -806,7 +912,7 @@ async function cancelSession(sessionId) {
 // ---------------------------------------------------------------------------
 // Diagnosis: explain a log this task already read
 // ---------------------------------------------------------------------------
-async function diagnoseSession(session, button) {
+async function diagnoseSession(session, button, inVoice = false) {
   if (!requireBackend()) return;
   const original = button.textContent;
   button.disabled = true;
@@ -821,7 +927,8 @@ async function diagnoseSession(session, button) {
       { long: true },
     );
     state.diagnoses.set(session.session_id, body);
-    renderTaskDetail(byId('taskDetail'), session);
+    if (inVoice) await refreshVoiceResult();
+    else renderTaskDetail(byId('taskDetail'), session);
     if (body.status === 'diagnosed') {
       toast('The evidence was read and explained. Nothing was changed.', 'good');
     } else if (body.status === 'unavailable') {
@@ -1336,6 +1443,12 @@ async function decide(entry, action, status, button) {
   if (!requireBackend()) return;
   button.disabled = true;
   try {
+    let voiceSession = state.automaticApprovals.get(entry.execution_id);
+    if (!voiceSession && status === 'approved') {
+      const tasks = await GET('/voiceos/sessions?limit=100').catch(() => []);
+      voiceSession = tasks.find((task) => task.actor_id === IDENTITY.id
+        && task.automatic_approval_execution_id === entry.execution_id)?.session_id;
+    }
     const answer = await POST('/approvals', {
       action_id: action.action_id,
       status,
@@ -1350,6 +1463,23 @@ async function decide(entry, action, status, button) {
         : 'Rejected. The run will not proceed past that action.',
       status === 'approved' ? 'good' : '',
     );
+    if (voiceSession) {
+      state.automaticApprovals.delete(entry.execution_id);
+      if (status === 'approved' && answer.execution) {
+        const session = await GET(`/voiceos/sessions/${encodeURIComponent(voiceSession)}`).catch(() => null);
+        if (session?.steps?.some((step) => step.execution_id === entry.execution_id && step.state === 'succeeded')
+          && ['proposed', 'completed'].includes(session.status)) {
+          if (!state.voiceTask) state.voiceTask = voiceSession;
+          void runSession(voiceSession, null, true, true);
+        }
+      }
+      else if (state.voiceTask === voiceSession) {
+        renderReply(byId('voiceReply'), {
+          kind: 'task', session_id: voiceSession, reply: 'Approval declined.',
+        });
+        await refreshVoiceResult();
+      }
+    }
     await refreshApprovals();
   } catch (error) {
     toast(`The decision was not recorded: ${error.message}`, 'bad');
@@ -3508,6 +3638,7 @@ function refreshBrowser() {
 //     back is the planner's answer — including "I cannot do that here".
 const VOICE_STATE_TEXT = {
   idle: 'Idle',
+  requesting: 'Waiting for microphone access…',
   listening: 'Listening…',
   transcribing: 'Transcribing…',
   thinking: 'Thinking…',
@@ -3519,16 +3650,15 @@ const VOICE_STATE_TEXT = {
 };
 
 const QUICK_COMMANDS = [
-  { group: 'COMPUTER', label: 'Check My Laptop', text: 'check my laptop is healthy' },
+  { group: 'COMPUTER', label: 'Open Calculator', text: 'open calculator' },
+  { group: 'WEB', label: 'Open Browser', text: 'open browser' },
+  { group: 'WEB', label: 'Open Google Drive', text: 'open google drive' },
+  { group: 'COMPUTER', label: 'Open Calculator and Clock', text: 'open calculator and clock' },
+  { group: 'COMPUTER', label: 'Check if Clock Is Running', text: 'is clock running?' },
   { group: 'COMPUTER', label: 'Show Running Processes', text: 'show the running processes on this computer' },
   { group: 'COMPUTER', label: 'Show Servers', text: 'show which servers are running' },
-  { group: 'SCREEN', label: 'Inspect My Screen', text: 'inspect my screen and tell me what is open', view: 'visual' },
   { group: 'DEVELOPMENT', label: 'Run Project Tests', text: 'run the project tests' },
   { group: 'DEVELOPMENT', label: 'Read Server Logs', text: 'read the server logs' },
-  { group: 'DEVELOPMENT', label: 'Open My Projects', text: 'open my projects folder', view: 'tasks' },
-  { group: 'AUTOMATION', label: 'Create Automation', text: 'create an automation that runs every day at 9am', view: 'automations' },
-  { group: 'DEVICE', label: 'Show Active Tasks', text: 'show my active tasks', view: 'tasks' },
-  { group: 'DEVICE', label: 'Check Device Status', text: 'check the status of my devices', view: 'devices' },
 ];
 
 // What the planner is actually able to route, and what it is not.
@@ -3636,11 +3766,17 @@ function renderVoiceSupport() {
     return;
   }
 
+  const audio = state.appState?.purposes?.audio;
+  const gateway = Boolean(audio?.provider === 'openai_compatible_stt' && audio.hasKey && audio.endpoint && audio.model);
+  voice.setGatewayEnabled?.(gateway);
+  if (mic) mic.disabled = !voice.supported;
   const parts = [];
-  if (voice.supported) {
+  if (gateway && voice.supported) {
+    parts.push('Press the microphone and speak. A pause ends the recording, or you can press the mic again. Turn off automatic running to review the transcript first.');
+  } else if (voice.supported) {
     parts.push('Speech recognition is available in this window. Press the microphone to start one utterance; it stops on its own.');
   } else {
-    parts.push('Speech recognition is NOT available in this build of Electron — its renderer has no speech service. The microphone button reports this rather than pretending. Type your command instead; everything works with text.');
+    parts.push('Configure speech transcription in Settings → Audio, or type your command.');
     if (mic) mic.disabled = true;
   }
   parts.push(voice.textToSpeechSupported
@@ -3661,17 +3797,8 @@ function renderQuickCommands() {
       && Object.prototype.hasOwnProperty.call(state.guideVerdicts, command.text)
       ? state.guideVerdicts[command.text] : null;
     const routable = Boolean(measured && Array.isArray(measured.actions) && measured.actions.length);
-    // A button with `view` does two things: it takes you to a screen, and it sends the
-    // words. The navigation is real whether or not the planner can route the sentence,
-    // so such a button is not disabled — but it says which half works.
-    const unrouted = Boolean(measured && !routable && !command.view);
-    const viewOnly = Boolean(measured && !routable && command.view);
-    let title = '';
-    if (unrouted) {
-      title = 'This backend’s planner has no rule for this wording; pressing it will say so and nothing will run.';
-    } else if (viewOnly) {
-      title = `Opens the ${command.view} screen. The wording itself has no planner rule here, so the reply will say so; nothing will run.`;
-    }
+    const unrouted = Boolean(measured && !routable && command.group !== 'WEB');
+    const title = unrouted ? 'This command is unavailable on the current backend.' : '';
     const button = el('button', {
       class: 'quick-btn', type: 'button',
       dataset: { group: command.group, state: unrouted ? 'off' : 'ok' },
@@ -3758,22 +3885,18 @@ function renderCommandGuide() {
       }
       const phrase = button.textContent.replace(/[“”]/g, '');
       byId('voiceTranscript').value = phrase;
-      sendVoiceTranscript();
+      sendVoiceTranscript({ autoRun: false });
     });
   }
 }
 
 function runQuickCommand(command) {
-  // Some commands are, in the end, "take me to the screen that does this". Those
-  // navigate. The rest are real proposals against the planner.
   byId('voiceTranscript').value = command.text;
-  const voiceReply = byId('voiceReply');
-  if (command.view) showView(command.view);
-  sendVoiceTranscript();
-  if (voiceReply && !voiceReply.hidden) voiceReply.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  void sendVoiceTranscript();
 }
 
-async function sendVoiceTranscript() {
+async function sendVoiceTranscript({ autoRun = true } = {}) {
+  if (state.voiceSubmitting) return false;
   const input = byId('voiceTranscript');
   const host = byId('voiceReply');
   const text = String(input.value || '').trim();
@@ -3782,28 +3905,77 @@ async function sendVoiceTranscript() {
     return false;
   }
   const voice = voiceController();
+  state.voiceSubmitting = true;
   if (voice) voice.setState('thinking');
-  const answer = await propose(text, host);
+  let answer;
+  try { answer = await propose(text, host); }
+  finally { state.voiceSubmitting = false; }
   if (!answer) {
     if (voice) voice.setState('error', '');
     return false;
   }
   if (voice) {
-    voice.setState(answer.session_id ? 'awaiting' : 'idle');
-    if (answer.reply && voice.textToSpeechSupported) voice.speak(answer.reply);
+    voice.setState('idle');
+    if (answer.reply && voice.textToSpeechSupported && (!autoRun || answer.kind !== 'task')) {
+      speakVoiceReply(voice, answer.reply, true);
+    }
   }
   input.value = '';
+  state.voiceTask = answer.session_id || null;
   if (answer.session_id) {
     state.selectedTask = answer.session_id;
-    // A proposal that made a task is offered in the Task Center; it is not executed.
     refreshVoiceBadge();
+    if (autoRun && answer.kind === 'task' && state.voiceTask === answer.session_id) {
+      renderReply(host, {
+        kind: 'task', session_id: answer.session_id, reply: 'Starting your task…',
+      });
+      replace(byId('voiceTaskResult'), el('p', { class: 'card-note', text: 'Running your task…' }));
+      void runSession(answer.session_id, null, true, true);
+      return true;
+    }
   }
+  await refreshVoiceResult();
   return true;
+}
+
+async function refreshVoiceResult() {
+  const host = byId('voiceTaskResult');
+  if (!host) return;
+  const id = state.voiceTask;
+  if (!id) {
+    replace(host, el('p', { class: 'card-note', text: 'Send a task to see its plan and results here.' }));
+    return;
+  }
+  if (state.runningTasks.has(id)) return;
+  try {
+    const session = await GET(`/voiceos/sessions/${encodeURIComponent(id)}`);
+    if (state.voiceTask === id && !state.runningTasks.has(id)) renderTaskDetail(host, session);
+  } catch (error) {
+    if (state.voiceTask === id) replace(host, el('p', { class: 'card-note', text: error.message }));
+  }
 }
 
 function refreshVoiceBadge() {
   const badge = document.querySelector('[data-badge="voice"]');
   if (badge) badge.hidden = true;
+}
+
+let voiceConversationActive = false;
+let listenAfterReply = false;
+let lastSpokenReply = "";
+
+function endVoiceConversation() {
+  listenAfterReply = false;
+  if (!voiceConversationActive) return;
+  voiceConversationActive = false;
+  voiceController()?.cancel();
+}
+
+function speakVoiceReply(voice, text, continueConversation = false) {
+  if (!continueConversation) endVoiceConversation();
+  lastSpokenReply = text;
+  listenAfterReply = voiceConversationActive;
+  if (!voice?.speak(text)) endVoiceConversation();
 }
 
 function wireVoice() {
@@ -3813,44 +3985,84 @@ function wireVoice() {
 
   renderVoiceSupport();
   renderQuickCommands();
-  renderCommandGuide();
+  byId('voiceGuide')?.addEventListener('toggle', () => {
+    if (byId('voiceGuide').open) void refreshVoiceGuide();
+  });
+  byId('voiceDealShortcut')?.addEventListener('click', () => {
+    const input = byId('voiceTranscript');
+    input.value = 'Find the best deal for ';
+    input.focus();
+  });
   renderVoiceState('idle');
 
   if (voice) {
     voice.onStateChange((name, detail) => {
       renderVoiceState(name, detail);
-      if (name === 'error' && detail) toast(detail, 'bad');
+      if (name === 'idle' && listenAfterReply) {
+        listenAfterReply = false;
+        if (state.view === 'voice' && voiceConversationActive) voice.startListening();
+      }
+      if (name === 'error') {
+        endVoiceConversation();
+        if (detail) toast(detail, 'bad');
+      }
     });
     voice.onTranscript((text, info) => {
-      if (info && info.final) {
-        byId('voiceTranscript').value = text;
-      } else {
-        byId('voiceTranscript').value = text;
+      if (info?.final && voiceConversationActive) {
+        const command = text.trim().replace(/^(?:hey\s+)?jarvis[,!:\s]+/i, '').replace(/[.!?]+$/, '').trim();
+        if (/^(stop listening|end conversation)$/i.test(command)) {
+          endVoiceConversation();
+          byId('voiceTranscript').value = '';
+          return;
+        }
+        if (/^(repeat that|say that again)$/i.test(command)) {
+          byId('voiceTranscript').value = '';
+          speakVoiceReply(voice, lastSpokenReply || 'I have not spoken a reply yet.', true);
+          return;
+        }
+      }
+      byId('voiceTranscript').value = text;
+      if (info?.final && byId('voiceHandsFree')?.checked) {
+        void sendVoiceTranscript();
       }
     });
     voice.onError((message) => toast(message, 'bad'));
   }
 
+  byId('voiceConversation')?.addEventListener('change', (event) => {
+    if (!event.target.checked) endVoiceConversation();
+  });
   const mic = byId('voiceMic');
   if (mic) {
     mic.addEventListener('click', () => {
+      renderVoiceSupport();
       // Explicitly user-initiated: no timer, no ambient listening. A press either
       // opens the microphone for one utterance or says why it cannot.
       if (!voice) {
         toast('The voice module is not loaded. Type your command instead.', 'bad');
         return;
       }
-      if (voice.state === 'listening') voice.stopListening();
-      else voice.startListening();
+      if (voiceConversationActive) {
+        endVoiceConversation();
+      } else if (voice.state === 'requesting') voice.cancel();
+      else if (voice.state === 'listening') voice.stopListening();
+      else {
+        voiceConversationActive = Boolean(byId('voiceConversation')?.checked && byId('voiceHandsFree')?.checked);
+        voice.startListening();
+      }
     });
   }
 
   const stopListening = byId('voiceStopListening');
-  if (stopListening) stopListening.addEventListener('click', () => (voice ? voice.stopListening() : null));
+  if (stopListening) stopListening.addEventListener('click', () => {
+    if (voiceConversationActive) endVoiceConversation();
+    else voice?.stopListening();
+  });
   const stopSpeaking = byId('voiceStopSpeaking');
   if (stopSpeaking) stopSpeaking.addEventListener('click', () => (voice ? voice.stopSpeaking() : null));
   const cancel = byId('voiceCancel');
   if (cancel) cancel.addEventListener('click', () => {
+    endVoiceConversation();
     if (voice) voice.cancel();
     byId('voiceReply').hidden = true;
     renderVoiceState('idle');
@@ -3859,6 +4071,8 @@ function wireVoice() {
   if (clear) clear.addEventListener('click', () => {
     byId('voiceTranscript').value = '';
     byId('voiceReply').hidden = true;
+    state.voiceTask = null;
+    void refreshVoiceResult();
   });
   const send = byId('voiceSend');
   if (send) send.addEventListener('click', sendVoiceTranscript);
@@ -3894,18 +4108,12 @@ function wireVoice() {
       }
     });
   }
-  const barClear = byId('commandClear');
-  if (barClear) barClear.addEventListener('click', () => { barInput.value = ''; });
   const commandMic = byId('commandMic');
   if (commandMic) {
     commandMic.addEventListener('click', () => {
-      if (!voice || !voice.supported) {
-        toast('Speech recognition is not available in this build. Type your command instead.', 'warn');
-        showView('voice');
-        return;
-      }
       showView('voice');
-      voice.startListening();
+      renderVoiceSupport();
+      if (voice?.supported) byId('voiceMic')?.click();
     });
   }
 }
@@ -3913,7 +4121,11 @@ function wireVoice() {
 async function refreshVoice() {
   await refreshAppState();
   renderVoiceSupport();
-  await refreshVoiceModel();
+  await Promise.all([refreshVoiceResult(), refreshVoiceModel()]);
+  if (byId('voiceGuide')?.open) await refreshVoiceGuide();
+}
+
+async function refreshVoiceGuide() {
   // The capability list decides whether "ask about the screen" is offered as
   // supported. It is read, not guessed.
   if (state.backendReady && !state.capabilities) {
@@ -4125,6 +4337,14 @@ function laneCard(purpose) {
     laneButton('configure', purpose, 'Configure'),
     laneButton('test', purpose, 'Test'),
   ]);
+  if (purpose === 'audio' && status.provider && status.hasKey) {
+    const record = el('button', { class: 'btn ghost small', type: 'button', text: 'Open Voice Commands' });
+    record.addEventListener('click', () => showView('voice'));
+    actions.append(record);
+  }
+  if (stateName === 'invalid_credentials') {
+    lines.push(el('p', { class: 'fine', text: 'Open Configure, check the endpoint and replace the API key, then test again.' }));
+  }
   if (purpose === 'chat') {
     // "Default" is the planner's lane preference, so the card says which state it is
     // in rather than offering the same press forever.
@@ -4173,9 +4393,8 @@ function renderSettingsLanes() {
   renderLanesInto(byId('settingsProviderKv'));
   const note = byId('settingsProviderNote');
   if (note) {
-    note.textContent = 'A lane is connected only after its own Test Connection passes. '
-      + 'Image and audio adapters are not implemented in this build, so their lanes '
-      + 'refuse a key until an adapter and a real probe exist.';
+    note.textContent = 'Use Test Connection for Chat and Reasoning. Audio is verified '
+      + 'when a recording in Voice Commands returns a transcript. Image generation is unavailable.';
   }
 }
 
@@ -4611,12 +4830,8 @@ function wireShell() {
   }
   const devicePill = byId('devicePill');
   if (devicePill) devicePill.addEventListener('click', () => showView('devices'));
-  const profile = byId('profileBtn');
-  if (profile) profile.addEventListener('click', () => showView('settings'));
   const notify = byId('notifyBtn');
-  if (notify) notify.addEventListener('click', () => {
-    toast('VoiceOS raises a native notification when an execution needs you.', '');
-  });
+  if (notify) notify.addEventListener('click', () => showView('approvals'));
   const liveReconnect = byId('liveReconnect');
   if (liveReconnect) liveReconnect.addEventListener('click', () => {
     try {
@@ -4648,6 +4863,7 @@ function refreshCurrent() {
     case 'devices': return refreshDevices();
     case 'visual': return refreshVisual();
     case 'browser': return refreshBrowser();
+    case 'providers': return bridge.state().then(applyAppState);
     case 'settings': return refreshSettings();
     case 'voice': return refreshVoice();
     default: return undefined;
@@ -4655,6 +4871,23 @@ function refreshCurrent() {
 }
 
 function wire() {
+  const taskFilters = document.querySelectorAll('[data-task-filter]');
+  for (const button of taskFilters) {
+    button.addEventListener('click', () => {
+      for (const filter of taskFilters) filter.setAttribute('aria-pressed', String(filter === button));
+      if (state.backendReady) renderFilteredTasks();
+    });
+  }
+  byId('taskRefresh').addEventListener('click', () => void refreshTasks());
+  byId('taskResetFilters').addEventListener('click', () => {
+    const search = byId('taskSearch');
+    search.value = '';
+    document.querySelector('[data-task-filter="all"]').click();
+    search.focus();
+  });
+  byId('taskSearch').addEventListener('input', () => {
+    if (state.backendReady) renderFilteredTasks();
+  });
   // Navigation
   for (const button of document.querySelectorAll('.nav-item')) {
     button.addEventListener('click', () => showView(button.dataset.view));
@@ -4678,7 +4911,7 @@ function wire() {
   };
   on('homeAskSend', 'click', askHome);
   on('homeAsk', 'submit', (event) => { event.preventDefault(); askHome(); });
-  wirePushToTalk(byId('homeAskMic'), homeInput, homeReply);
+  wirePushToTalk(byId('homeAskMic'));
 
   const taskInput = byId('taskAskText');
   const taskReply = el('div', { class: 'reply', hidden: true });
@@ -4703,7 +4936,7 @@ function wire() {
       if (event.key === 'Enter') { event.preventDefault(); askTask(); }
     });
   }
-  wirePushToTalk(byId('taskAskMic'), taskInput, taskReply);
+  wirePushToTalk(byId('taskAskMic'));
 
   // Visual Intelligence (C38): every control is a press, never a timer.
   wireVisual();

@@ -96,7 +96,8 @@ MEMBER_ALLOWLIST: dict[str, set[str]] = {
     # int port and hardcodes 127.0.0.1 -- there is no host parameter to pass -- but the
     # exemption is still spelled out, so "the agent can open a socket" is a line in a
     # security test rather than something a reader has to trust.
-    "actionmesh/agent/processes.py": {"asyncio.open_connection"},
+    # The macOS liveness probe uses os.kill(pid, 0) without sending a signal.
+    "actionmesh/agent/processes.py": {"asyncio.open_connection", "os.kill"},
     # C37: the model transport. This is the package's one outbound internet call, and
     # it is granted as a *member*, not as a module import, on purpose: the file imports
     # nothing dangerous (asyncio, json, urllib.parse), so granting it a NETWORK_ALLOWED
@@ -128,6 +129,7 @@ MEMBER_ALLOWLIST: dict[str, set[str]] = {
     # named calls, not "this file may spawn". `tests/unit/test_files_agent.py` asserts
     # the refusals (no opener, escaped path, no shell) through the public methods.
     "actionmesh/agent/files.py": {"subprocess.run"},
+    "actionmesh/agent/apps.py": {"subprocess.run"},
     # C42: the browser drive bridge. Same AF_UNIX shape as the model bridge
     # above, but awaited on the event loop because the browser driver is
     # awaited: the destination is a Unix domain socket inside the desktop
@@ -148,6 +150,7 @@ IMPORT_ALLOWLIST: dict[str, set[str]] = {
     # Same grant as the member entry above: the two calls need the name `subprocess`
     # in scope, and nothing else in this file is permitted to use it.
     "actionmesh/agent/files.py": {"subprocess"},
+    "actionmesh/agent/apps.py": {"subprocess"},
 }
 
 #: Network access by module *import* is still forbidden package-wide, with no
@@ -346,10 +349,11 @@ class DangerousPrimitiveTests(unittest.TestCase):
             MEMBER_ALLOWLIST,
             {
                 "actionmesh/agent/runner.py": {"asyncio.create_subprocess_exec"},
-                "actionmesh/agent/processes.py": {"asyncio.open_connection"},
+                "actionmesh/agent/processes.py": {"asyncio.open_connection", "os.kill"},
                 "actionmesh/voiceos/transport.py": {"asyncio.open_connection"},
                 "actionmesh/voiceos/model_bridge.py": {"socket.socket"},
                 "actionmesh/agent/files.py": {"subprocess.run"},
+                "actionmesh/agent/apps.py": {"subprocess.run"},
                 "actionmesh/agent/browser_bridge.py": {"asyncio.open_unix_connection"},
             },
             "changing this line is a security decision, not a convenience",
@@ -359,6 +363,7 @@ class DangerousPrimitiveTests(unittest.TestCase):
             {
                 "actionmesh/voiceos/model_bridge.py": {"socket"},
                 "actionmesh/agent/files.py": {"subprocess"},
+                "actionmesh/agent/apps.py": {"subprocess"},
             },
             "changing this line is a security decision, not a convenience",
         )

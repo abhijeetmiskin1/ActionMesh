@@ -29,6 +29,7 @@
         <span class="nav-glyph" aria-hidden="true">◎</span><span class="nav-label">Voice Commands</span>
         <span class="nav-badge live" data-badge="voice" hidden></span>
       </button>
+      <div class="nav-divider" aria-hidden="true">Tools</div>
       <button class="nav-item" data-view="visual" type="button" title="Visual Intelligence">
         <span class="nav-glyph" aria-hidden="true">◉</span><span class="nav-label">Visual Intelligence</span>
         <span class="nav-badge live" data-badge="visual" hidden></span>
@@ -59,6 +60,10 @@
       </button>
       <button class="nav-item" data-view="history" type="button" title="History">
         <span class="nav-glyph" aria-hidden="true">≡</span><span class="nav-label">History</span>
+      </button>
+      <div class="nav-divider" aria-hidden="true">Setup</div>
+      <button class="nav-item" data-view="providers" type="button" title="Providers">
+        <span class="nav-glyph" aria-hidden="true">◇</span><span class="nav-label">Providers</span>
       </button>
       <button class="nav-item" data-view="settings" type="button" title="Settings">
         <span class="nav-glyph" aria-hidden="true">⚙</span><span class="nav-label">Settings</span>
@@ -113,12 +118,11 @@
           <span class="stream-pill" id="streamPill" data-state="closed">stream …</span>
           <button class="btn ghost small" id="providerConfigure" type="button" data-configure-purpose="chat">CONFIGURE</button>
         </div>
-        <button class="icon-btn" id="notifyBtn" type="button" title="Notifications" aria-label="Notifications">
-          <span aria-hidden="true">🔔</span>
+        <button class="icon-btn" id="notifyBtn" type="button" title="Review approvals" aria-label="Review approvals">
+          <span aria-hidden="true">✓</span>
           <span class="badge-dot" id="notifyDot" hidden></span>
         </button>
         <button class="icon-btn" id="refreshAll" type="button" title="Refresh" aria-label="Refresh">⟳</button>
-        <button class="icon-btn" id="profileBtn" type="button" title="Settings" aria-label="Settings">⚙</button>
       </div>
     </header>
 
@@ -134,8 +138,9 @@
         <div class="btn-row">
           <button class="btn primary" data-goto="voice" type="button">Start Voice Command</button>
           <button class="btn ghost" data-goto="visual" type="button">Inspect Screen</button>
-          <button class="btn ghost" data-goto="tasks" type="button">New Task</button>
-          <button class="btn ghost" data-goto="automations" type="button">Create Automation</button>
+          <button class="btn ghost" data-goto="tasks" type="button">Task Center</button>
+          <button class="btn ghost" data-goto="approvals" type="button">Review Approvals</button>
+          <button class="btn ghost" data-goto="providers" type="button">Providers</button>
         </div>
       </div>
 
@@ -162,8 +167,8 @@
         </article>
       </div>
 
-      <article class="card">
-        <h2 class="card-title">Ask for something</h2>
+      <details class="card secondary-panel">
+        <summary class="card-title">Preview a task plan</summary>
         <p class="card-note">
           Type it or hold the microphone. Asking only <em>proposes</em> a plan — nothing runs
           until you press Run on a step, and any action the policy marks risky waits for a
@@ -175,7 +180,7 @@
           <button class="btn mic" id="homeAskMic" type="button" title="Hold to talk">◉</button>
         </form>
         <div class="reply" id="homeReply" hidden></div>
-      </article>
+      </details>
 
       <div class="grid two">
         <article class="card">
@@ -198,15 +203,14 @@
         <div class="card-head">
           <h2 class="card-title">Provider lanes</h2>
           <div class="btn-row">
+            <button class="btn ghost small" data-goto="providers" type="button">Manage providers →</button>
             <button class="btn ghost small" id="homeProviderConfigure" type="button">Configure chat</button>
             <button class="btn ghost small" id="homeProviderDefault" type="button" disabled>Set default</button>
           </div>
         </div>
         <p class="card-note">
-          Four separate jobs, four separate keys in the OS keyring. A lane is “connected”
-          only after its own Test Connection passes. Image and audio adapters are not
-          implemented in this build — their lanes exist so a key is never stored for
-          a surface that cannot use it.
+          Each provider uses its own encrypted credential slot. Test Chat and Reasoning
+          in Providers. Test Audio by recording an utterance in Voice Commands.
         </p>
         <div class="purpose-lanes" id="homeProviderKv"></div>
       </article>
@@ -224,11 +228,14 @@
               Microphone access starts only when you press the button.
             </p>
           </div>
-          <p class="mic-transcript-label">Transcript — edit it before sending if you like</p>
+          <label class="check"><input type="checkbox" id="voiceHandsFree" checked> Run spoken commands after transcription</label>
+          <label class="check"><input type="checkbox" id="voiceConversation"> Keep listening after replies</label>
+          <p class="fine">Turn this on and press the microphone to start a conversation. Say “Jarvis, stop listening” or leave Voice Commands to end it.</p>
+          <p class="mic-transcript-label">Transcript</p>
           <textarea class="textarea" id="voiceTranscript" rows="3"
                     placeholder="What would you like VoiceOS to do?"></textarea>
           <div class="btn-row">
-            <button class="btn primary" id="voiceSend" type="button">Send Transcript</button>
+            <button class="btn primary" id="voiceSend" type="button">Send &amp; run</button>
             <button class="btn ghost" id="voiceStopListening" type="button" disabled>Stop Listening</button>
             <button class="btn ghost" id="voiceStopSpeaking" type="button" disabled>Stop Speaking</button>
             <button class="btn subtle" id="voiceClear" type="button">Clear</button>
@@ -239,32 +246,38 @@
                the answer is the deterministic planner rather than a model. -->
           <p class="fine" id="voiceModel" data-mode="deterministic">Checking which planner will answer…</p>
           <p class="fine" id="voiceSupport"></p>
-          <div class="reply" id="voiceReply" hidden></div>
         </article>
 
-        <article class="card">
-          <div class="card-head">
-            <h2 class="card-title">Quick commands</h2>
-            <span class="chip">one click</span>
+        <article class="card" aria-labelledby="voiceResultHeading">
+          <h2 class="card-title" id="voiceResultHeading">Task results</h2>
+          <div class="reply" id="voiceReply" hidden></div>
+          <div id="voiceTaskResult">
+            <p class="card-note">Send a command to start it and see its steps and results here. Approvals and unverified steps pause the task.</p>
           </div>
-          <p class="card-note">
-            Each button writes a real request and sends it through the same pipeline as
-            typing. Nothing here is simulated — if a command needs a device or an
-            approval, you will be taken to the screen that asks.
-          </p>
-          <div class="quick-grid" id="quickGrid"></div>
         </article>
       </div>
 
       <article class="card">
-        <h2 class="card-title">Command guide</h2>
-        <p class="card-note">
-          Example phrasings. Whether each one works is not a promise written here — the
-          running backend is asked what its own planner does with it, and the verdict
-          shown is that answer. A phrasing it cannot route says why.
-        </p>
-        <div class="command-help" id="commandHelp"></div>
+        <div class="card-head">
+          <h2 class="card-title">Quick commands</h2>
+          <span class="chip">one click</span>
+        </div>
+        <p class="card-note">Pick a command to start a task and see its results.</p>
+        <div class="quick-grid" id="quickGrid"></div>
+        <div class="btn-row quick-followups">
+          <button class="btn ghost small" id="voiceDealShortcut" type="button">Find a deal…</button>
+          <button class="btn ghost small" data-goto="browser" type="button">Browser controls</button>
+          <button class="btn ghost small" data-goto="tasks" type="button">Recent tasks</button>
+          <button class="btn ghost small" data-goto="approvals" type="button">Approvals</button>
+          <button class="btn ghost small" data-goto="providers" type="button">Voice provider setup</button>
+        </div>
       </article>
+
+      <details class="card secondary-panel" id="voiceGuide">
+        <summary class="card-title">Command guide</summary>
+        <p class="card-note">See which example commands this computer supports.</p>
+        <div class="command-help" id="commandHelp"></div>
+      </details>
     </section>
 
     <!-- TASK CENTER ------------------------------------------------------ -->
@@ -284,6 +297,16 @@
           <div class="card-head">
             <h2 class="card-title">Tasks</h2>
             <span class="chip" id="taskCount">0</span>
+          </div>
+          <div class="btn-row task-filters" aria-label="Filter recent tasks">
+            <button class="btn ghost small" data-task-filter="all" aria-pressed="true" type="button">All</button>
+            <button class="btn ghost small" data-task-filter="active" aria-pressed="false" type="button">Active</button>
+            <button class="btn ghost small" data-task-filter="approval" aria-pressed="false" type="button">Needs approval</button>
+          </div>
+          <div class="task-search-row">
+            <input class="form-input" id="taskSearch" type="search" aria-label="Search recent tasks" placeholder="Search recent tasks">
+            <button class="btn ghost small" id="taskResetFilters" type="button">Reset</button>
+            <button class="btn ghost small" id="taskRefresh" type="button">Refresh</button>
           </div>
           <ul class="rows selectable" id="taskList"><li class="empty">No tasks yet.</li></ul>
         </aside>
@@ -666,19 +689,22 @@
       </div>
     </section>
 
-    <!-- SETTINGS --------------------------------------------------------- -->
-    <section class="view" data-view="settings" hidden>
-      <div class="grid two">
+    <section class="view" data-view="providers" hidden>
         <article class="card" id="settingsProviderCard">
-          <h2 class="card-title">AI providers</h2>
+          <h2 class="card-title">Providers and models</h2>
           <p class="card-note">
-            A provider only ever <em>proposes</em>; policy, consent and approval decide what
-            happens. Each purpose has its own key, stored in the operating system's keyring
-            by the main process and never sent back to this page.
+            Choose a provider and model for each job. Configure its endpoint and API key,
+            then test the connection. API keys are stored in the operating system’s keyring.
           </p>
           <div class="purpose-lanes" id="settingsProviderKv"></div>
           <p class="fine" id="settingsProviderNote"></p>
         </article>
+    </section>
+
+    <!-- SETTINGS --------------------------------------------------------- -->
+    <section class="view" data-view="settings" hidden>
+      <div class="grid two">
+
 
         <article class="card">
           <h2 class="card-title">Backend</h2>
@@ -757,8 +783,7 @@
       <input id="commandInput" autocomplete="off" spellcheck="false"
              placeholder="What would you like VoiceOS to do?" aria-label="Command">
       <span class="command-status" id="commandStatus" data-state="idle">Idle</span>
-      <button class="btn primary" id="commandSend" type="button">Send</button>
-      <button class="btn subtle" id="commandClear" type="button">Clear</button>
+      <button class="btn primary" id="commandSend" type="button">Send &amp; run</button>
     </div>
   </main>
 </div>

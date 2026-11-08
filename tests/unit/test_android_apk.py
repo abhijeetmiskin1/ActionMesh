@@ -20,10 +20,12 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import tarfile
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 import zipfile
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "build_apk.py"
@@ -48,6 +50,28 @@ class BuildScriptTests(unittest.TestCase):
         if not SCRIPT.exists():  # pragma: no cover - repository guard
             raise unittest.SkipTest("scripts/build_apk.py is absent")
         cls.mod = _load_build_module()
+
+    def test_executable_tools_do_not_need_write_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tool = pathlib.Path(tmp) / "javac"
+            tool.touch(mode=0o755)
+            tool.chmod(0o755)
+            with patch.object(pathlib.Path, "chmod", side_effect=PermissionError):
+                self.mod._chmod_x(tool)
+
+    def test_stage_jdk_from_macos_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            toolchain = pathlib.Path(tmp)
+            bundle = toolchain / "jdk-17"
+            javac = bundle / "Contents" / "Home" / "bin" / "javac"
+            javac.parent.mkdir(parents=True)
+            javac.write_text("test executable", encoding="utf-8")
+            with tarfile.open(toolchain / "jdk.tar.gz", "w:gz") as archive:
+                archive.add(bundle, arcname=bundle.name)
+            destination = toolchain / "jdk"
+            with patch.multiple(self.mod, TOOLCHAIN=toolchain, JDK=destination):
+                self.mod.ensure_jdk()
+            self.assertEqual((destination / "bin" / "javac").read_text(), "test executable")
 
     def test_patch_default_url_replaces_only_that_value(self):
         original = (

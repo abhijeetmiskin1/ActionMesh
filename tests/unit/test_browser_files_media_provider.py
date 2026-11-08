@@ -257,7 +257,8 @@ class TestBrowserThroughProvider(unittest.TestCase):
         self.assertEqual(result.data["status"], "ok")
         observed = self.provider.observe(action)
         self.assertIsNotNone(observed)
-        self.assertIn("results", observed["state"])
+        self.assertEqual(observed["state"]["count"], result.data["count"])
+        self.assertNotIn("results", observed["state"])
         # Search navigated; it never clicked.
         new_kinds = [a["action"] for a in drv.actions[len(before):]]
         self.assertNotIn("click", new_kinds)

@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS, MAC_APPS
 from actionmesh.core.permissions.risk import max_risk
 from actionmesh.protocol.models import (
     ActionDefinition,
@@ -210,6 +211,16 @@ def device_definitions() -> list[ActionDefinition]:
             "Run a documented editor command-line operation",
         ),
         # --- applications -------------------------------------------------
+        _def(
+            MAC_APP_ACTION, RiskLevel.MEDIUM, ["system.app.launch"],
+            {"app": {"type": "string", "enum": list(MAC_APPS)}}, ["app"],
+            "Open a supported Mac application",
+        ),
+        _def(
+            MAC_APP_STATUS, RiskLevel.LOW, ["system.app.status"],
+            {"app": {"type": "string", "enum": list(MAC_APPS)}}, ["app"],
+            "Check whether a supported Mac application is running",
+        ),
         _def(
             "device.app.open", RiskLevel.MEDIUM, ["system.app.launch"],
             {"app": _S, "arguments": _ARGS}, ["app"],
@@ -575,6 +586,8 @@ REQUIRING_SHELL: frozenset[str] = frozenset(
 #: test — see ``tests/unit/test_agent_provider.py``.
 IMPLEMENTED: frozenset[str] = frozenset(
     {
+        MAC_APP_ACTION,
+        MAC_APP_STATUS,
         "device.file.list",
         "device.file.read",
         "device.file.write",

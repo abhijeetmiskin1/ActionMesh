@@ -450,6 +450,14 @@ TEMPLATES: dict[str, Template] = {
         },
         submit_action=ORDER_PLACE_ACTION,
     ),
+    "deal.search": Template(
+        name="deal.search",
+        site="web",
+        steps=tuple(_web_search()[:2]),
+        required_fields=("web.query",),
+        prompts={"web.query": "Which product should I look for? Include the model if you know it."},
+        submit_action=None,
+    ),
     "web.search": Template(
         name="web.search",
         site="web",
@@ -647,6 +655,12 @@ _BOOK_TRIGGERS = ("book", "booking", "reserve", "ticket")
 # registered ``search.web`` action through the normal policy path). Routing
 # those here would shadow both — see the pinned regressions in
 # tests/unit/test_phase4_templates.py::TestWebIntentDoesNotShadow.
+_DEAL_SEARCH_RX = re.compile(
+    r"^(?:find|check|compare|look for|show me) (?:me )?(?:the )?"
+    r"(?:best )?(?:(?:verified|vrified) )?deals?(?: for (.*))?[.?!]*$",
+    re.I,
+)
+_DEAL_FOLLOW_UP_RX = re.compile(r"\s+(?:and|then)\s+(?:then\s+)?(?:order|buy)\b", re.I)
 _WEB_SEARCH_RX = re.compile(
     r"\b(?:search the web for|search the internet for|web search for|"
     r"browse the web for|google)\s+(.+?)\s*$",
@@ -684,6 +698,8 @@ def match_website_intent(text: str) -> str | None:
     reach for a browser template here at all.
     """
     cleaned = " ".join(text.lower().split())
+    if _DEAL_SEARCH_RX.fullmatch(cleaned):
+        return "deal.search"
     if _FOOD_ORDER_RX.search(cleaned) and _food_query_from(cleaned):
         return "food.order"
     if _TRAIN_BOOK_RX.search(cleaned):
@@ -704,6 +720,10 @@ def extract_website_fields(text: str, template_name: str) -> dict[str, Any]:
     field, and the caller runs :func:`clarification_field` to ask for it.
     """
     cleaned = " ".join(text.lower().split())
+    if template_name == "deal.search":
+        match = _DEAL_SEARCH_RX.fullmatch(" ".join(text.split()))
+        product = _DEAL_FOLLOW_UP_RX.split(match[1] or "", maxsplit=1)[0].strip(" .?!") if match else ""
+        return {"web.query": f"{product} deals prices reputable retailers"} if product else {}
     if template_name == "web.search":
         query = _web_query_from(cleaned)
         web_fields: dict[str, Any] = {}

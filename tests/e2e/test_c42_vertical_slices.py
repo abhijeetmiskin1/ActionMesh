@@ -394,7 +394,8 @@ class TestOrchestratorFoodDiscoverSlice(unittest.TestCase):
             # the fixture registered — here an honest empty list, never invented.
             self.assertEqual(done.steps[1].observed["url"],
                              "https://duckduckgo.com/?q=pizza")
-            self.assertEqual(done.steps[1].observed["results"], [])
+            self.assertEqual(done.steps[1].observed["count"], 0)
+            self.assertNotIn("results", done.steps[1].observed)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

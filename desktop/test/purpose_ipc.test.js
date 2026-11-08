@@ -19,6 +19,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { pathToFileURL } = require('node:url');
 
 const { boot, APP_DIR } = require('./main_harness.js');
 
@@ -200,12 +201,12 @@ test('a provider this build does not implement cannot be saved for image or audi
     const specs = await invoke('purpose:specs', purpose);
     assert.equal(specs.ok, true);
     assert.ok(specs.specs.length > 0, `${purpose} has a table`);
-    assert.ok(specs.specs.every((spec) => spec.implemented === false));
-    assert.ok(specs.specs.every((spec) => typeof spec.unavailableReason === 'string' && spec.unavailableReason.length > 10));
+    const unsupported = specs.specs.find((spec) => !spec.implemented);
+    assert.ok(unsupported && unsupported.unavailableReason.length > 10);
 
     // Even a real-looking id is refused, and nothing is written.
     const refused = await invoke('purpose:configure', {
-      purpose, provider: specs.specs[0].id, model: 'x', apiKey: KEY,
+      purpose, provider: unsupported.id, model: 'x', apiKey: KEY,
     });
     assert.equal(refused.ok, false);
     assert.match(refused.error, /not wired|not implemented/i);
@@ -283,6 +284,44 @@ test('the settings file and the crash log never receive plaintext key material',
     assert.equal(raw.includes(secret), false);
   }
   assert.equal(fs.existsSync(path.join(USER_DATA, 'crash.log')), false);
+});
+
+test('connection checks stay scoped to the saved model in each purpose', async (t) => {
+  const { invoke } = await app();
+  t.mock.method(require('../app/providers'), 'test', async () => ({ state: 'connected' }));
+  const baseUrl = 'http://localhost:20128/v1';
+  for (const purpose of ['chat', 'reasoning']) {
+    await invoke('purpose:configure', { purpose, provider: 'openai_compatible', model: purpose, baseUrl, apiKey: KEY });
+    assert.equal((await invoke('purpose:test', { purpose })).state, 'connected');
+  }
+  assert.equal((await invoke('purpose:status', 'chat')).status.state, 'connected');
+  assert.equal((await invoke('purpose:status', 'reasoning')).status.state, 'connected');
+  await invoke('purpose:model', { purpose: 'chat', model: 'different' });
+  assert.equal((await invoke('purpose:status', 'chat')).status.state, 'not_configured');
+  assert.equal((await invoke('purpose:status', 'reasoning')).status.state, 'connected');
+});
+
+test('voice transcription accepts audio from the app page and uses only the Audio slot', async (t) => {
+  const { invoke, store } = await app();
+  const providers = require('../app/providers');
+  const transcribe = t.mock.method(providers, 'transcribe', async () => ({
+    state: 'connected', transcript: 'Review this transcript.',
+  }));
+  const sender = store.windows[0].webContents;
+  const url = pathToFileURL(path.join(APP_DIR, '..', 'ui', 'index.html')).href;
+  const handler = store.handlers.get('voice:transcribe');
+  const recording = { bytes: new Uint8Array([1, 2]), mime: 'audio/webm' };
+  await invoke('purpose:configure', {
+    purpose: 'audio', provider: 'openai_compatible_stt', model: 'fixture-stt',
+    baseUrl: 'http://localhost:20128/v1', apiKey: OTHER_KEY,
+  });
+  assert.equal((await handler({ sender, senderFrame: { url: 'file:///other.html' } }, recording)).transcript, undefined);
+  assert.equal(transcribe.mock.callCount(), 0);
+  assert.equal((await handler({ sender, senderFrame: { url, parent: null } }, recording)).transcript, 'Review this transcript.');
+  assert.equal(transcribe.mock.calls[0].arguments[0].apiKey, OTHER_KEY);
+  const status = (await invoke('purpose:status', 'audio')).status;
+  assert.equal(status.state, 'connected');
+  assert.equal(JSON.stringify(status).includes('Review this transcript.'), false);
 });
 
 test('preload exposes no credential getter at all', () => {

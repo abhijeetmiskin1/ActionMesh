@@ -135,14 +135,22 @@ def _alive(record: ProcessRecord) -> bool:
     pid = record.pid
     if pid is None:
         return record.state == RUNNING
-    if not os.path.exists("/proc"):
-        return record.state == RUNNING
+    if os.path.exists("/proc"):
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                state = handle.read().rsplit(b")", 1)[-1].split()
+        except OSError:
+            return False
+        return bool(state) and state[0] != b"Z"
+    # macOS: no /proc. kill(pid, 0) with EPERM means the pid is gone (or not ours);
+    # success means it exists. Zombies are handled by the caller's reaper.
     try:
-        with open(f"/proc/{pid}/stat", "rb") as handle:
-            state = handle.read().rsplit(b")", 1)[-1].split()
-    except OSError:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
-    return bool(state) and state[0] != b"Z"
+    except PermissionError:
+        return False
+    return True
 
 
 async def is_listening(port: int, *, timeout_s: float = PROBE_TIMEOUT_S) -> bool:

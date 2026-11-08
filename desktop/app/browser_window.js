@@ -235,6 +235,7 @@ let loading = false;
 // in open/navigate so a DNS/connection failure is surfaced instead of being
 // collapsed to the generic "drive failed" in handleDrive.
 let failedLoad = null;
+let storageCleared = Promise.resolve();
 
 function prefs() {
   return {
@@ -251,7 +252,6 @@ function prefs() {
 
 function ensureWindow() {
   if (win && !win.isDestroyed()) return win;
-  const driveSession = session.fromPartition(WEB_DRIVE_SESSION);
   // Memory-only posture: nothing survives the window.
   win = new BrowserWindow({
     width: 1200,
@@ -260,7 +260,6 @@ function ensureWindow() {
     title: 'ActionMesh browser',
     webPreferences: { ...prefs(), partition: WEB_DRIVE_SESSION },
   });
-  driveSession.clearStorageData().catch(() => {});
 
   win.webContents.on('did-start-navigation', (event, url, isInPlace, isMainFrame) => {
     if (isMainFrame) {
@@ -309,8 +308,9 @@ function ensureWindow() {
 
   win.on('closed', () => {
     win = null;
+    loading = false;
     // Memory-only: wipe the drive partition when the window goes away.
-    session.fromPartition(WEB_DRIVE_SESSION).clearStorageData().catch(() => {});
+    storageCleared = session.fromPartition(WEB_DRIVE_SESSION).clearStorageData().catch(() => {});
   });
   return win;
 }
@@ -378,6 +378,20 @@ function validId(raw) {
   return Number.isSafeInteger(n) && n >= 1 ? String(n) : null;
 }
 
+async function loadPage(window, url) {
+  failedLoad = null;
+  try {
+    await window.loadURL(url);
+  } catch {
+    // Cancelled provisional loads can reject without a did-fail-load event.
+    return { status: 'error', note: failedLoad ? `load failed: ${failedLoad.note}` : 'navigation did not complete' };
+  }
+  if (failedLoad) {
+    return { status: 'error', note: `load failed: ${failedLoad.note}` };
+  }
+  return result({ url: window.webContents.getURL(), title: window.getTitle(), epoch: navEpoch });
+}
+
 // ---------------------------------------------------------------------------
 // The drive handlers — one per named op. Every return is a plain object with
 // status ∈ ok | stale | needs_user | unavailable | error, matching
@@ -387,34 +401,16 @@ function validId(raw) {
 const handlers = {
   async open({ url }) {
     if (!isHttpUrl(url)) return { status: 'error', note: 'url must be absolute http(s)' };
-    ensureWindow();
-    win.show(); // a prior stop() hides it
-    failedLoad = null;
-    try {
-      await win.loadURL(url);
-    } catch {
-      // loadURL rejects on ERR_* network failures; did-fail-load carries the
-      // browser-authored name. Fall through to the failedLoad check below.
-    }
-    if (failedLoad) {
-      return { status: 'error', note: `load failed: ${failedLoad.note}` };
-    }
-    return result({ url: win.webContents.getURL(), title: win.getTitle(), epoch: navEpoch });
+    await storageCleared;
+    const window = ensureWindow();
+    window.show();
+    return loadPage(window, url);
   },
 
   async navigate({ url }) {
     requireSession();
     if (!isHttpUrl(url)) return { status: 'error', note: 'url must be absolute http(s)' };
-    failedLoad = null;
-    try {
-      await win.loadURL(url);
-    } catch {
-      // See open(): did-fail-load is the source of truth.
-    }
-    if (failedLoad) {
-      return { status: 'error', note: `load failed: ${failedLoad.note}` };
-    }
-    return result({ url: win.webContents.getURL(), title: win.getTitle(), epoch: navEpoch });
+    return loadPage(win, url);
   },
 
   async back() {
@@ -545,11 +541,9 @@ const handlers = {
 
   async stop() {
     if (!win || win.isDestroyed()) return { status: 'unavailable', note: 'no session' };
-    win.webContents.stop();
-    win.webContents.stopPainting && win.webContents.stopPainting();
-    win.hide();
-    // Memory-only: cookies never persist past a stop.
-    session.fromPartition(WEB_DRIVE_SESSION).clearStorageData().catch(() => {});
+    // A hidden page can still run scripts and navigate.
+    win.destroy();
+    await storageCleared;
     return { status: 'ok' };
   },
 

@@ -43,6 +43,7 @@ it as ``FailureKind.AUTHORIZATION``, exactly like every other confined capabilit
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -323,11 +324,9 @@ class MprisMediaDriver(MediaDriver):
     Properties read, so a command that did not take effect is read as not having
     taken effect.
 
-    ⚠ MARKED ADAPTER — the integration lead wires this at runtime. The code below is
-    written against the MPRIS 2.0 spec but was NOT exercised against a live player in
-    this environment (no session bus for the unit-test user); treat first live use as
-    its integration test. If ``gi`` or the bus is missing, every method reports no
-    players — the engine then answers "unavailable", never a simulation.
+    Live acceptance on 2026-11-08 exercised status, play, pause, volume and
+    local file opening with mpv on a Debian session bus. If ``gi`` or the bus
+    is missing, the engine reports no reachable player.
 
     Privacy of the label: only ``xesam:title`` and ``xesam:artist`` become the track
     label. ``xesam:url`` (a filesystem path or stream URL) is deliberately dropped.
@@ -372,7 +371,7 @@ class MprisMediaDriver(MediaDriver):
 
     def _call(
         self, destination: str, path: str, interface: str, method: str,
-        signature: str = "", parameters: Any = None,
+        signature: str = "()", parameters: Any = None, *, reply_signature: str = "()",
     ) -> Any:
         import gi
 
@@ -388,7 +387,7 @@ class MprisMediaDriver(MediaDriver):
             interface,
             method,
             GLib.Variant(signature, parameters or ()),
-            GLib.VariantType("(s)"),
+            GLib.VariantType(reply_signature),
             0,
             2000,  # 2s ceiling: a player that cannot answer in 2s is not reachable
             None,
@@ -396,7 +395,8 @@ class MprisMediaDriver(MediaDriver):
 
     def _get_all(self, destination: str, path: str, interface: str) -> dict[str, Any]:
         reply = self._call(
-            destination, path, self._PROPS_IFACE, "GetAll", "(s)", (interface,)
+            destination, path, self._PROPS_IFACE, "GetAll", "(s)", (interface,),
+            reply_signature="(a{sv})",
         )
         raw = reply.unpack()[0]
         return {str(key): _unwrap(value) for key, value in raw.items()}
@@ -542,7 +542,7 @@ class MprisMediaDriver(MediaDriver):
         return False
 
     def open_file(self, absolute_path: str) -> str:
-        """AddTrack a file:// URI to a running player; "unavailable" if none is.
+        """Open a file:// URI in a running player and confirm its current track.
 
         No downloader, no transcode, no DRM handling — a protected file is refused
         by the player, and the refusal is what gets reported. Any bus timeout
@@ -569,19 +569,32 @@ class MprisMediaDriver(MediaDriver):
             try:
                 self._call(
                     destination, "/org/mpris/MediaPlayer2", self._PLAYER_IFACE,
-                    "AddTrack", "(ss)", (uri, "/c42"),
+                    "OpenUri", "(s)", (uri,),
                 )
-                self._call(destination, "/org/mpris/MediaPlayer2", self._PLAYER_IFACE, "Play")
             except MediaTimeoutError:
                 raise
             except Exception as exc:
                 if _is_timeout_error(exc):
                     raise MediaTimeoutError(str(exc)) from exc
                 continue
-            # One player took the track. Broadcasting to every player on the
-            # bus would play the same file N times; the first confirmed
-            # hand-over is the result.
-            return "opened"
+            # OpenUri can reply before the track changes. Read the URI privately
+            # for confirmation and never send it to another player after dispatch.
+            for _ in range(10):
+                try:
+                    current = self._get_all(
+                        destination, "/org/mpris/MediaPlayer2", self._PLAYER_IFACE,
+                    )
+                except MediaTimeoutError:
+                    raise
+                except Exception as exc:
+                    if _is_timeout_error(exc):
+                        raise MediaTimeoutError(str(exc)) from exc
+                    break
+                observed = (current.get("Metadata") or {}).get("xesam:url")
+                if isinstance(observed, str) and urllib.parse.unquote(observed) == "file://" + absolute_path:
+                    return "opened"
+                time.sleep(0.05)
+            return "rejected"
         return "rejected"
 
     def close(self) -> None:

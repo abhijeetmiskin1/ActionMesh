@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 
 import pytest
 
@@ -37,7 +38,7 @@ def anyio_backend() -> str:
 
 
 def _config(tmp_path, token: str = "test-token-32-bytes") -> BrowserBridgeConfig:
-    return BrowserBridgeConfig(socket_path=str(tmp_path / "browser-bridge.sock"), token=token)
+    return BrowserBridgeConfig(socket_path=f"/tmp/bb-{os.getpid()}.sock", token=token)
 
 
 async def _run_server(sock_path: str, respond):
@@ -152,7 +153,7 @@ async def test_bridge_driver_snapshot_records_carry_driver_id(tmp_path) -> None:
     from actionmesh.agent.browser import BridgeDriver
 
     server, _seen = await _run_server(
-        str(tmp_path / "browser-bridge.sock"),
+        f"/tmp/bb-{os.getpid()}.sock",
         lambda _frame: {
             "status": "ok",
             "request_id": "snapshot",
@@ -184,7 +185,7 @@ async def test_bridge_driver_type_forwards_witnessed_inserted(tmp_path) -> None:
         (None, None),
     ):
         server, _seen = await _run_server(
-            str(tmp_path / "browser-bridge.sock"),
+            f"/tmp/bb-{os.getpid()}.sock",
             lambda _frame, _reply=reply_inserted: {
                 "status": "ok",
                 "request_id": "type",
@@ -222,7 +223,7 @@ async def test_engine_snapshot_counts_bridge_elements(tmp_path) -> None:
                     "url": "https://example.test/", "title": "Example"}
         return {"status": "error", "request_id": op}
 
-    server, _seen = await _run_server(str(tmp_path / "browser-bridge.sock"), _respond)
+    server, _seen = await _run_server(f"/tmp/bb-{os.getpid()}.sock", _respond)
     try:
         drv = BridgeDriver(make_request(_config(tmp_path)))
         engine = BrowserEngine(drv)

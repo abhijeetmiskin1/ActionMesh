@@ -302,6 +302,7 @@ class Backend {
       env.ACTIONMESH_WORKSPACE_ROOT = workspace;
       env.ACTIONMESH_DEVICE_ID = s.deviceId || 'laptop-1';
       env.ACTIONMESH_DEVICE_NAME = s.deviceName || 'This laptop';
+      env.ACTIONMESH_ALLOW_NATIVE_APPS = process.platform === 'darwin' ? '1' : '0';
       env.ACTIONMESH_ALLOW_SHELL = s.allowShell ? '1' : '0';
       // Not derived from allowShell: seeing the screen is its own boundary.
       env.ACTIONMESH_ALLOW_DESKTOP = s.allowDesktop ? '1' : '0';

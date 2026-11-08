@@ -110,7 +110,7 @@ class TestConfig(unittest.TestCase):
             - set(REQUIRING_DESKTOP)
             - set(REQUIRING_PAYMENT)
             - set(REQUIRING_BROWSER)
-            - set(REQUIRING_MEDIA),
+            - set(REQUIRING_MEDIA) - {"device.app.launch_native", "device.app.status_native"},
         )
         self.assertIn("device.terminal.execute", rooted.advertise())
         self.assertIn("device.file.read", rooted.advertise())
@@ -127,12 +127,12 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(
             advertised,
             set(CAPABILITIES) - set(REQUIRING_DESKTOP) - set(REQUIRING_PAYMENT)
-            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA),
+            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA) - {"device.app.launch_native", "device.app.status_native"},
         )
         self.assertEqual(
             advertised,
             set(IMPLEMENTED) - set(REQUIRING_DESKTOP) - set(REQUIRING_PAYMENT)
-            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA),
+            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA) - {"device.app.launch_native", "device.app.status_native"},
         )
         for capability in advertised:
             self.assertTrue(registry.has(capability), capability)

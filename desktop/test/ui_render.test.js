@@ -17,8 +17,26 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const { install } = require('./dom_harness.js');
+
+test('the scripts in index.html can register the renderer boot together', () => {
+  const uiDir = path.join(__dirname, '..', 'ui');
+  const html = fs.readFileSync(path.join(uiDir, 'index.html'), 'utf8');
+  const scripts = html.matchAll(/<script\s+src="([^"]+)"><\/script>/g);
+  const listeners = new Map();
+  const context = vm.createContext({
+    document: { addEventListener: (event, listener) => listeners.set(event, listener) },
+  });
+  context.window = context;
+  for (const [, filename] of scripts) {
+    const source = fs.readFileSync(path.join(uiDir, filename), 'utf8');
+    vm.runInContext(source, context, { filename });
+  }
+  assert.equal(typeof listeners.get('DOMContentLoaded'), 'function');
+  assert.equal(typeof context.ActionMeshHistory?.refreshExecHistory, 'function');
+});
 
 const PURPOSE_LABELS = { chat: 'Chat', reasoning: 'Reasoning', image: 'Image', audio: 'Audio' };
 
@@ -182,10 +200,11 @@ function fakeBridge() {
  * which is the only way to test a starting state, since the renderer reads the bridge
  * at load and each test gets a fresh module instance.
  */
-async function bootPage({ beforeLoad } = {}) {
+async function bootPage({ beforeLoad, setupWindow } = {}) {
   const bridge = fakeBridge();
   if (beforeLoad) beforeLoad(bridge);
   const page = install({ bridge });
+  if (setupWindow) setupWindow(page.window);
   const app = page.load();
   await app.boot();
   return { ...page, app, bridge };
@@ -367,8 +386,215 @@ test('a Configure click on a lane reaches the main process for that purpose only
 test('the Settings lane card names the keyring boundary honestly', async () => {
   const { document } = await bootPage();
   const note = document.getElementById('settingsProviderNote').textContent;
-  assert.match(note, /own Test Connection/);
-  assert.match(note, /Image and audio adapters are not implemented/);
+  assert.match(note, /Test Connection for Chat and Reasoning/);
+  assert.match(note, /Audio is verified when a recording/);
+});
+
+test('hands-free dictation runs a final transcript and speaks the result', async () => {
+  const calls = [];
+  const spoken = [];
+  let transcript;
+  let ran = false;
+  const { document } = await bootPage({ setupWindow(window) {
+    window.VoiceOSVoice = {
+      supported: true, textToSpeechSupported: true, setState() {},
+      onStateChange() {}, onError() {}, onTranscript(fn) { transcript = fn; },
+      speak(text) { spoken.push(text); },
+    };
+  }, beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => {
+      const value = await readState();
+      return { ...value, backend: { ...value.backend, status: 'ready' } };
+    };
+    bridge.request = async ({ method, path, body }) => {
+      calls.push([method, path, body]);
+      if (path === '/voiceos/messages') {
+        return { ok: true, body: { kind: 'task', session_id: 'task-1', reply: 'Review this plan.', ran: false } };
+      }
+      if (path === '/voiceos/sessions/task-1/run') ran = true;
+      if (path.startsWith('/voiceos/sessions/task-1')) {
+        return { ok: true, body: {
+          session_id: 'task-1', status: ran ? 'completed' : 'planned', request: 'List workspace',
+          steps: [{
+            label: 'List workspace', action_type: 'device.file.list', state: ran ? 'succeeded' : 'pending',
+            verified: ran ? true : null, observed: ran ? { count: 1 } : null,
+          }],
+        } };
+      }
+      return { ok: false, status: 503, error: 'fixture route unavailable' };
+    };
+  } });
+  document.getElementById('voiceHandsFree').checked = true;
+  transcript('List workspace', { final: false });
+  assert.equal(calls.some(([, path]) => path === '/voiceos/messages'), false);
+  transcript('List workspace', { final: true });
+  await new Promise(setImmediate);
+  const result = document.getElementById('voiceTaskResult');
+  const runs = calls.filter(([, path]) => path === '/voiceos/sessions/task-1/run');
+  assert.deepEqual(runs, [['POST', '/voiceos/sessions/task-1/run', {
+    actor: { id: 'voiceos-local' }, stop_on_unverified: true,
+  }]]);
+  assert.match(result.textContent, /verifiedyes/);
+  assert.match(result.textContent, /"count": 1/);
+  assert.match(document.getElementById('voiceReply').textContent, /Task completed/);
+  assert.doesNotMatch(document.getElementById('voiceReply').textContent, /Review this plan/);
+  assert.deepEqual(spoken, ['Task completed.']);
+});
+
+test('automatic voice tasks continue after their specific approval', async () => {
+  let approved = false;
+  const runs = [];
+  const waiting = {
+    session_id: 'voice-approval', status: 'awaiting_approval', request: 'Run a task',
+    steps: [{ label: 'Run a step', state: 'awaiting_approval', execution_id: 'approval-run' }],
+  };
+  const completed = { ...waiting, status: 'completed', steps: [
+    { ...waiting.steps[0], state: 'succeeded', verified: true },
+  ] };
+  const options = { beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => {
+      const value = await readState();
+      return { ...value, backend: { ...value.backend, status: 'ready' } };
+    };
+    bridge.request = async ({ method, path, body }) => {
+      if (path === '/voiceos/messages') {
+        return { ok: true, body: { kind: 'task', session_id: waiting.session_id } };
+      }
+      if (path === '/voiceos/sessions/voice-approval/run') {
+        runs.push(body);
+        return { ok: true, body: approved ? completed : waiting };
+      }
+      if (path === '/voiceos/sessions?limit=100') {
+        return { ok: true, body: [{
+          actor_id: 'voiceos-local', session_id: waiting.session_id,
+          automatic_approval_execution_id: 'approval-run',
+        }] };
+      }
+      if (path === '/voiceos/sessions/voice-approval') {
+        return { ok: true, body: approved ? completed : waiting };
+      }
+      if (path === '/approvals' && method === 'POST') {
+        assert.equal(body.action_id, 'action-to-approve');
+        approved = body.status === 'approved';
+        return { ok: true, body: { execution: { state: 'completed' } } };
+      }
+      if (path === '/approvals') {
+        return { ok: true, body: approved ? [] : [{
+          execution_id: 'approval-run', actions: [{
+            action_type: 'device.file.write', action_id: 'action-to-approve',
+            parameters: {}, risk_level: 'high',
+          }],
+        }] };
+      }
+      if (path.startsWith('/consents') || path === '/capabilities') return { ok: true, body: [] };
+      return { ok: false, status: 503, error: 'fixture route unavailable' };
+    };
+  } };
+  const { document } = await bootPage(options);
+  document.getElementById('voiceTranscript').value = 'Run a task';
+  document.getElementById('voiceSend').click();
+  await new Promise(setImmediate);
+  assert.match(document.getElementById('voiceReply').textContent, /Waiting for your approval/);
+  assert.equal(runs.length, 1);
+  const result = document.getElementById('voiceTaskResult');
+  assert.doesNotMatch(result.textContent, /Check again after approving/);
+  const reopened = (await bootPage(options)).document;
+  reopened.querySelector('.nav-item[data-view="approvals"]').click();
+  await new Promise(setImmediate);
+  reopened.querySelector('#approvalList .btn.primary').click();
+  await new Promise(setImmediate);
+  assert.equal(runs.length, 2);
+  assert.ok(runs.every((body) => body.stop_on_unverified === true));
+  assert.match(reopened.getElementById('voiceReply').textContent, /Task completed/);
+});
+
+test('voice reads the verified app status in plain language', async () => {
+  const spoken = [];
+  const status = {
+    session_id: 'clock-status', status: 'completed', request: 'Is Clock running?',
+    steps: [{
+      label: 'Check Clock', action_type: 'device.app.status_native', state: 'succeeded',
+      verified: true, observed: { app: 'clock', running: false },
+    }],
+  };
+  const { document } = await bootPage({ setupWindow(window) {
+    window.VoiceOSVoice = {
+      textToSpeechSupported: true, setState() {}, onStateChange() {}, onError() {},
+      onTranscript() {}, speak(text) { spoken.push(text); },
+    };
+  }, beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => {
+      const value = await readState();
+      return { ...value, backend: { ...value.backend, status: 'ready' } };
+    };
+    bridge.request = async ({ path }) => {
+      if (path === '/voiceos/messages') {
+        return { ok: true, body: { kind: 'task', session_id: status.session_id } };
+      }
+      if (path.startsWith('/voiceos/sessions/clock-status')) return { ok: true, body: status };
+      return { ok: false, status: 503, error: 'fixture route unavailable' };
+    };
+  } });
+  document.getElementById('voiceTranscript').value = 'Is Clock running?';
+  document.getElementById('voiceSend').click();
+  await new Promise(setImmediate);
+  assert.match(document.getElementById('voiceReply').textContent, /Clock is closed/);
+  assert.match(document.getElementById('voiceTaskResult').textContent, /verifiedyes/);
+  assert.deepEqual(spoken, ['Clock is closed.']);
+  const edit = Array.from(document.getElementById('voiceTaskResult').querySelectorAll('button'))
+    .find((button) => button.textContent === 'Edit command');
+  edit.click();
+  assert.equal(document.getElementById('voiceTranscript').value, 'Is Clock running?');
+  assert.deepEqual(spoken, ['Clock is closed.']);
+});
+
+test('conversation listens again after speaking and stops when leaving Voice Commands', async () => {
+  let transcript;
+  let stateChanged;
+  let starts = 0;
+  let stops = 0;
+  const spoken = [];
+  const { document } = await bootPage({ setupWindow(window) {
+    window.VoiceOSVoice = {
+      supported: true, textToSpeechSupported: true, state: 'idle', setState() {},
+      onStateChange(fn) { stateChanged = fn; }, onTranscript(fn) { transcript = fn; },
+      onError() {}, startListening() { starts++; }, cancel() { stops++; },
+      speak(text) { spoken.push(text); return true; },
+    };
+  }, beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => {
+      const value = await readState();
+      return { ...value, backend: { ...value.backend, status: 'ready' } };
+    };
+    bridge.request = async ({ path }) => path === '/voiceos/messages'
+      ? { ok: true, body: { kind: 'answer', reply: 'Hello.' } }
+      : { ok: false, status: 503, error: 'fixture route unavailable' };
+  } });
+  document.querySelector('.nav-item[data-view="voice"]').click();
+  document.getElementById('voiceConversation').checked = true;
+  document.getElementById('voiceHandsFree').checked = true;
+  document.getElementById('voiceMic').click();
+  assert.equal(starts, 1);
+  transcript('Hello', { final: true });
+  await new Promise(setImmediate);
+  assert.equal(starts, 1);
+  stateChanged('idle');
+  assert.equal(starts, 2);
+  transcript('Jarvis, repeat that.', { final: true });
+  assert.deepEqual(spoken, ['Hello.', 'Hello.']);
+  stateChanged('idle');
+  assert.equal(starts, 3);
+  transcript('Jarvis, stop listening.', { final: true });
+  assert.equal(stops, 1);
+  stateChanged('idle');
+  assert.equal(starts, 3);
+  document.getElementById('voiceMic').click();
+  document.querySelector('.nav-item[data-view="settings"]').click();
+  assert.equal(stops, 2);
 });
 
 test('the renderer source is syntactically valid and keeps its two promises', async () => {
@@ -395,4 +621,88 @@ test('the renderer source is syntactically valid and keeps its two promises', as
   for (const label of Object.values(PURPOSE_LABELS)) {
     assert.ok(source.includes(label), `${label} has a label`);
   }
+});
+
+test('Providers has its own tab with all four model lanes', async () => {
+  const { document } = await bootPage();
+  assert.ok(document.querySelector('.nav-item[data-view="providers"]'));
+  document.querySelector('[data-goto="providers"]').click();
+  await new Promise(setImmediate);
+  const view = document.querySelector('section[data-view="providers"]');
+  assert.equal(view.hidden, false);
+  for (const purpose of ['chat', 'reasoning', 'image', 'audio']) {
+    assert.ok(view.querySelector(`[data-lane-action="configure"][data-purpose="${purpose}"]`));
+  }
+});
+
+test('deal shortcut prepares an editable command without running it', async () => {
+  const { document } = await bootPage();
+  document.querySelector('.nav-item[data-view="voice"]').click();
+  document.getElementById('voiceDealShortcut').click();
+  assert.equal(document.getElementById('voiceTranscript').value, 'Find the best deal for ');
+  assert.equal(document.getElementById('voiceReply').hidden, true);
+});
+
+test('the header approval shortcut opens the approval workspace', async () => {
+  const { document } = await bootPage();
+  document.getElementById('notifyBtn').click();
+  assert.equal(document.querySelector('section[data-view="approvals"]').hidden, false);
+  assert.equal(document.querySelector('section[data-view="home"]').hidden, true);
+});
+
+test('Task Center filters pending approvals without refetching tasks', async () => {
+  let reads = 0;
+  const { document } = await bootPage({ beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => {
+      const value = await readState();
+      return { ...value, backend: { ...value.backend, status: 'ready' } };
+    };
+    bridge.request = async ({ path }) => {
+      if (path === '/voiceos/sessions?limit=50') {
+        reads++;
+        return { ok: true, body: [
+          { session_id: 'waiting', request: 'Waiting request', status: 'awaiting_approval' },
+          { session_id: 'done', request: 'Finished request', status: 'completed' },
+        ] };
+      }
+      return { ok: false, status: 503, error: 'fixture route unavailable' };
+    };
+  } });
+  document.querySelector('.nav-item[data-view="tasks"]').click();
+  await new Promise(setImmediate);
+  const list = document.getElementById('taskList');
+  assert.match(list.textContent, /Finished request/);
+  document.querySelector('[data-task-filter="approval"]').click();
+  assert.match(list.textContent, /Waiting request/);
+  assert.doesNotMatch(list.textContent, /Finished request/);
+  assert.equal(list.querySelector('[role="button"]').tabIndex, 0);
+  document.getElementById('taskResetFilters').click();
+  assert.match(list.textContent, /Finished request/);
+  assert.equal(reads, 1);
+});
+
+test('a completed task can be reused as an editable voice command', async () => {
+  const { document } = await bootPage({ beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => {
+      const value = await readState();
+      return { ...value, backend: { ...value.backend, status: 'ready' } };
+    };
+    const task = { session_id: 'done', request: 'Open Calculator', status: 'completed', steps: [] };
+    bridge.request = async ({ path }) => {
+      if (path === '/voiceos/sessions?limit=50') return { ok: true, body: [task] };
+      if (path === '/voiceos/sessions/done') return { ok: true, body: task };
+      return { ok: false, status: 503, error: 'fixture route unavailable' };
+    };
+  } });
+  document.querySelector('.nav-item[data-view="tasks"]').click();
+  await new Promise(setImmediate);
+  document.querySelector('#taskList [data-id="done"]').click();
+  await new Promise(setImmediate);
+  Array.from(document.getElementById('taskDetail').querySelectorAll('button'))
+    .find((button) => button.textContent === 'Reuse command').click();
+  assert.equal(document.querySelector('section[data-view="voice"]').hidden, false);
+  assert.equal(document.getElementById('voiceTranscript').value, 'Open Calculator');
+  assert.equal(document.getElementById('voiceReply').hidden, true);
 });

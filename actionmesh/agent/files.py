@@ -449,19 +449,18 @@ class FilesEngine:
         copied = 0
         try:
             with os.fdopen(read_fd, "rb") as source, os.fdopen(write_fd, "wb") as dest:
-                offset = 0
                 while True:
-                    moved = os.sendfile(dest.fileno(), source.fileno(), offset, 64 * 1024)
-                    if moved == 0:
+                    chunk = source.read(64 * 1024)
+                    if not chunk:
                         break
-                    offset += moved
-                    copied += moved
+                    copied += len(chunk)
                     if copied > MAX_WRITE_BYTES:
                         raise ProviderError(
                             f"{path!r} is larger than the {MAX_WRITE_BYTES} byte "
                             "copy limit",
                             FailureKind.INVALID_INPUT,
                         )
+                    dest.write(chunk)
                 dest.flush()
                 os.fsync(dest.fileno())
         except OSError as exc:

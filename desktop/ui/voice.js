@@ -2,7 +2,7 @@
 /**
  * Push-to-talk for the desktop shell.
  *
- * The microphone opens only when a click handler calls startListening(). Nothing here
+ * The desktop starts listening after a user gesture or in an opted-in conversation. Nothing here
  * starts a timer, watches a page, or retries on its own, so a window left open is never
  * recording by accident. Both capabilities are feature-detected and reported as they
  * are: in Electron the synthesiser's API usually exists while SpeechRecognition usually
@@ -15,7 +15,7 @@
  */
 (function () {
   const STATES = new Set([
-    'idle', 'listening', 'transcribing', 'thinking', 'planning',
+    'idle', 'requesting', 'listening', 'transcribing', 'thinking', 'planning',
     'awaiting', 'executing', 'speaking', 'error',
   ]);
   const ERROR_IDLE_DELAY = 2200;
@@ -30,7 +30,7 @@
   };
 
   const NativeRecognition = window.SpeechRecognition || window.webkitSpeechRecognition || null;
-  const supported = typeof NativeRecognition === 'function';
+  const supported = !window.actionmesh?.transcribeVoice && typeof NativeRecognition === 'function';
 
   // Chromium exposes the synthesis API whether or not the platform has a voice
   // installed, and the voice list loads asynchronously — so this flag means exactly
@@ -46,7 +46,7 @@
 
   /** Human-readable labels for screen-reader announcements. Text only. */
   const STATE_LABELS = {
-    idle: 'Idle', listening: 'Listening', transcribing: 'Transcribing',
+    idle: 'Idle', requesting: 'Waiting for microphone access', listening: 'Listening', transcribing: 'Transcribing',
     thinking: 'Thinking', planning: 'Planning', awaiting: 'Waiting for approval',
     executing: 'Executing', speaking: 'Speaking', error: 'Error',
   };
@@ -85,7 +85,16 @@
     return node;
   }
 
-  const api = { supported, textToSpeechSupported, state: 'idle', ensureLiveRegion, announce };
+  let gatewayEnabled = false;
+  let recording = null;
+  const api = {
+    get supported() { return supported || gatewayEnabled; },
+    textToSpeechSupported, state: 'idle', ensureLiveRegion, announce,
+    setGatewayEnabled(enabled) {
+      gatewayEnabled = Boolean(enabled && window.actionmesh?.transcribeVoice
+        && window.navigator?.mediaDevices?.getUserMedia && window.MediaRecorder?.isTypeSupported('audio/webm;codecs=opus'));
+    },
+  };
 
   // One handler per event, matching the app's single-controller usage; a non-function
   // detaches it. Kept module-level so a listener's own bug can never stop the mic.
@@ -136,9 +145,120 @@
     if (api.state === 'speaking') emitState('idle');
   }
 
+  function releaseRecording(current) {
+    clearTimeout(current.timer);
+    clearInterval(current.silenceTimer);
+    if (current.audioContext) {
+      void current.audioContext.close().catch(() => {});
+      current.audioContext = null;
+    }
+    current.stream?.getTracks().forEach((track) => track.stop());
+  }
+
+  function stopAfterSpeech(current) {
+    if (!window.AudioContext) return;
+    const context = new window.AudioContext();
+    current.audioContext = context;
+    const analyser = context.createAnalyser();
+    const source = context.createMediaStreamSource(current.stream);
+    source.connect(analyser);
+    void context.resume().catch(() => {});
+    const samples = new Float32Array(analyser.fftSize);
+    let lastSound = 0;
+    current.silenceTimer = setInterval(() => {
+      analyser.getFloatTimeDomainData(samples);
+      const power = samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length;
+      const now = performance.now();
+      if (power > 0.000225) {
+        lastSound = now;
+        current.heardSpeech = true;
+      }
+      else if (lastSound && now - lastSound >= 1200) stopListening();
+    }, 100);
+  }
+
+  async function recordUtterance() {
+    const current = {};
+    recording = current;
+    emitState('requesting');
+    current.timer = setTimeout(() => {
+      if (recording !== current) return;
+      recording = null;
+      fail('Microphone access did not finish. Check the macOS permission prompt or microphone settings.');
+    }, 30000);
+    try {
+      if (!await window.actionmesh.requestVoiceMic()) {
+        if (recording !== current) return;
+        const error = new Error();
+        error.name = 'NotAllowedError';
+        throw error;
+      }
+      if (recording !== current) return;
+      current.stream = await window.navigator.mediaDevices.getUserMedia({ audio: true });
+      if (recording !== current) {
+        releaseRecording(current);
+        return;
+      }
+      const chunks = [];
+      const recorder = new window.MediaRecorder(current.stream, { mimeType: 'audio/webm;codecs=opus' });
+      current.recorder = recorder;
+      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      recorder.onerror = () => {
+        if (recording !== current) return;
+        recording = null;
+        releaseRecording(current);
+        fail('The microphone recording failed.');
+      };
+      recorder.onstop = async () => {
+        const noSpeech = current.audioContext?.state === 'running' && !current.heardSpeech;
+        releaseRecording(current);
+        if (recording !== current) return;
+        if (noSpeech) {
+          recording = null;
+          fail(ERROR_MESSAGES['no-speech']);
+          return;
+        }
+        emitState('transcribing');
+        try {
+          const audio = new Blob(chunks, { type: 'audio/webm' });
+          if (!audio.size || audio.size > 1024 * 1024) throw new Error('Record a shorter utterance.');
+          const bytes = new Uint8Array(await audio.arrayBuffer());
+          if (recording !== current) return;
+          const answer = await window.actionmesh.transcribeVoice({ mime: 'audio/webm', bytes });
+          if (recording !== current) return;
+          if (answer.state !== 'connected') throw new Error(answer.detail || 'Transcription failed.');
+          emitState('idle');
+          call(onTranscriptFn, answer.transcript, { final: true });
+        } catch (error) {
+          if (recording === current) fail(error.message || 'Transcription failed.');
+        } finally {
+          if (recording === current) recording = null;
+        }
+      };
+      recorder.start();
+      clearTimeout(current.timer);
+      current.timer = setTimeout(stopListening, 15000);
+      quietly(() => stopAfterSpeech(current));
+      emitState('listening');
+    } catch (error) {
+      releaseRecording(current);
+      if (recording !== current) return;
+      recording = null;
+      fail(error.name === 'NotAllowedError' ? ERROR_MESSAGES['not-allowed'] : 'The microphone did not start.');
+    }
+  }
+
   function startListening() {
+    if (recording) return false;
+    if (gatewayEnabled && !session) {
+      silence();
+      void recordUtterance();
+      return true;
+    }
     if (!supported) {
-      fail(UNSUPPORTED_MESSAGE);
+      fail(window.actionmesh?.transcribeVoice
+        ? 'Configure a speech transcription provider in Providers → Audio, then try again.'
+        : UNSUPPORTED_MESSAGE);
       return false;
     }
 
@@ -220,6 +340,11 @@
 
   /** Stop after this utterance: unlike abort(), stop() still delivers the final result. */
   function stopListening() {
+    if (recording) {
+      if (recording.recorder?.state === 'recording') recording.recorder.stop();
+      else if (!recording.recorder) cancel();
+      return;
+    }
     const current = session;
     if (current) quietly(() => current.recognizer.stop());
   }
@@ -231,6 +356,12 @@
       errorTimer = 0;
     }
     stopSpeaking();
+    const captured = recording;
+    recording = null;
+    if (captured) {
+      if (captured.recorder?.state === 'recording') quietly(() => captured.recorder.stop());
+      releaseRecording(captured);
+    }
     const current = session;
     session = null;
     if (current) quietly(() => current.recognizer.abort()); // abort discards the utterance
