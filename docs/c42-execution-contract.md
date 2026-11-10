@@ -156,6 +156,7 @@ absolute, `..`, drive-letter and percent-encoded-separator paths are refused (se
 | `device.files.list` | MEDIUM | `device.file.list` | `path` (S), `limit` (N, opt) | `path, entries[], count, hidden_outside_root, truncated` |
 | `device.files.search` | LOW | `device.file.list` | `path` (S), `pattern` (S), `limit` (N, opt) | `path, matches[], count, truncated` |
 | `device.files.read` | MEDIUM | `file.read` | `path` (S) | `path, size, sha256, truncated, binary` + transient `content` |
+| `device.files.compare` | MEDIUM | `file.read` | `left, right` (S) | `changed` (boolean), independently checked by rereading both complete files up to 256 KiB each |
 | `device.files.open` | MEDIUM | `device.file.list` | `path` (S) | `status, path, kind, opened` — opens in the default app/OS |
 | `device.files.info` | LOW | `device.file.list` | `path` (S) | `path, exists, is_dir, size, mtime, kind` |
 | `device.files.create` | HIGH | `file.write` | `path` (S), `content` (S) | `path, bytes, sha256` (a write) |

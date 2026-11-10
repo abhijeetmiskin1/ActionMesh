@@ -147,6 +147,7 @@ class FilesEngine:
         "list": "device.files.list",
         "search": "device.files.search",
         "read": "device.files.read",
+        "compare": "device.files.compare",
         "open": "device.files.open",
         "info": "device.files.info",
         "create": "device.files.create",
@@ -304,6 +305,33 @@ class FilesEngine:
             "binary": binary,
             "content": text if not binary else "",
         }
+
+    def compare(self, left: str, right: str) -> bool:
+        """Compare complete regular files within the bounded workspace."""
+        return self._comparison_bytes(left) != self._comparison_bytes(right)
+
+    def _comparison_bytes(self, path: str) -> bytes:
+        resolved = _resolve(self.workspace, path, must_exist=True)
+        try:
+            fd = _open_fd(self.workspace, resolved, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_READ_BYTES:
+                    raise ProviderError(
+                        "Choose regular files no larger than 256 KiB.",
+                        FailureKind.INVALID_INPUT,
+                    )
+                body = handle.read(MAX_READ_BYTES + 1)
+                after = os.fstat(handle.fileno())
+        except OSError as exc:
+            raise ProviderError("Could not read a comparison file.", FailureKind.PROVIDER) from exc
+        if (
+            len(body) != before.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            raise ProviderError("A file changed during comparison.", FailureKind.PROVIDER)
+        return body
 
     def info(self, path: str) -> dict[str, Any]:
         """Stat one confined path without ever following a symlink or opening it."""

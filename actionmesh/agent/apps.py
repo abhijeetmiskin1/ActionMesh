@@ -26,6 +26,7 @@ MAC_APPS = {
     "stickies": "com.apple.Stickies",
     "system settings": "com.apple.systempreferences",
     "textedit": "com.apple.TextEdit",
+    "whatsapp": "net.whatsapp.WhatsApp",
 }
 
 

@@ -42,6 +42,12 @@
         <span class="nav-glyph" aria-hidden="true">✦</span><span class="nav-label">Tasks</span>
         <span class="nav-badge" data-badge="tasks" hidden></span>
       </button>
+      <button class="nav-item" data-view="continuum" type="button" title="Continuum Lab">
+        <span class="nav-glyph" aria-hidden="true">◉</span><span class="nav-label">Continuum Lab</span>
+      </button>
+      <button class="nav-item" data-view="parallelworld" type="button" title="ParallelWorld">
+        <span class="nav-glyph" aria-hidden="true">⧉</span><span class="nav-label">ParallelWorld</span>
+      </button>
       <button class="nav-item" data-view="automations" type="button" title="Automations">
         <span class="nav-glyph" aria-hidden="true">↻</span><span class="nav-label">Automations</span>
         <span class="nav-badge" data-badge="automations" hidden></span>
@@ -216,6 +222,52 @@
       </article>
     </section>
 
+    <section class="view" data-view="parallelworld" hidden>
+      <div class="page-header">
+        <div>
+          <h2 class="page-title">ParallelWorld — Preview Before Execution</h2>
+          <p class="page-sub">Run a bounded shadow rehearsal, inspect the real diff, then submit the exact plan through ActionMesh approvals.</p>
+        </div>
+      </div>
+      <article class="card">
+        <label for="parallelWorkspace">Configured workspace</label>
+        <input class="input" id="parallelWorkspace" readonly value="Loading workspace…">
+        <label for="parallelOperations">Typed operation plan (JSON)</label>
+        <textarea class="input" id="parallelOperations" rows="10" spellcheck="false">[
+  {"op":"edit","path":"release.txt","find":"candidate","replace":"ready"},
+  {"op":"copy","path":"candidate.txt","to":"candidate-copy.txt"}
+]</textarea>
+        <p class="card-note">Supported: create, edit, copy, rename, move and trash. File paths stay inside the configured workspace. Preview requires file.read; each real operation is separately re-authorized.</p>
+        <div class="btn-row">
+          <button class="btn primary" id="parallelPreview" type="button">Preview Changes</button>
+          <button class="btn ghost" id="parallelRefresh" type="button" disabled>Check Preview / Approval</button>
+          <button class="btn ghost" id="parallelApply" type="button" disabled>Apply Approved Plan</button>
+          <button class="btn ghost" id="parallelApprovals" type="button">Open Approvals</button>
+        </div>
+        <p id="parallelMessage" role="status"></p>
+      </article>
+      <div class="grid two">
+        <article class="card">
+          <h3 class="card-title">Preview evidence</h3>
+          <div class="metric-grid" id="parallelMetrics"></div>
+          <p id="parallelPermissions" class="card-note">No permission decision yet.</p>
+          <p id="parallelConflict" class="card-note">No conflicts detected.</p>
+          <p id="parallelIsolation" class="card-note">Preview not run.</p>
+        </article>
+        <article class="card">
+          <h3 class="card-title">Independent verification</h3>
+          <div id="parallelVerification" class="empty">No real changes applied.</div>
+          <h3 class="card-title spaced">Execution history</h3>
+          <div id="parallelHistory" class="empty">No ParallelWorld executions yet.</div>
+        </article>
+      </div>
+      <article class="card">
+        <h3 class="card-title">Before / After diff</h3>
+        <p class="card-note">Diff text is transient output; it is not stored in the audit record.</p>
+        <pre class="parallel-diff" id="parallelDiff">Preview a plan to see its actual shadow-workspace diff.</pre>
+      </article>
+    </section>
+
     <!-- VOICE COMMANDS --------------------------------------------------- -->
     <section class="view" data-view="voice" hidden>
       <div class="voice-layout">
@@ -244,6 +296,7 @@
                     placeholder="What would you like VoiceOS to do?"></textarea>
           <div class="btn-row">
             <button class="btn primary" id="voiceSend" type="button">Send &amp; run</button>
+            <button class="btn ghost" id="voicePreviewPlan" type="button">Preview plan</button>
             <button class="btn ghost" id="voiceStopListening" type="button" disabled>Finish recording</button>
             <button class="btn ghost" id="voiceStopSpeaking" type="button" disabled>Stop Speaking</button>
             <button class="btn subtle" id="voiceClear" type="button">Clear</button>
@@ -343,6 +396,75 @@
     </section>
 
     <!-- AUTOMATIONS (C39) ------------------------------------------------ -->
+    <section class="view" data-view="continuum" hidden>
+      <div class="lab-tabs" role="tablist" aria-label="Continuum Lab workspaces">
+        <button class="lab-tab" data-lab-tab="mission" role="tab" aria-selected="true" type="button">Mission Control</button>
+        <button class="lab-tab" data-lab-tab="chaos" role="tab" aria-selected="false" type="button">ChaosStage</button>
+        <button class="lab-tab" data-lab-tab="proof" role="tab" aria-selected="false" type="button">ProofLens</button>
+        <button class="lab-tab" data-lab-tab="intent" role="tab" aria-selected="false" type="button">IntentCanvas</button>
+        <button class="lab-tab" data-lab-tab="goalguard" role="tab" aria-selected="false" type="button">GoalGuard</button>
+      </div>
+      <div class="lab-panel" data-lab-panel="mission">
+        <div class="page-header"><div><h2 class="page-title">Mission Control</h2><p class="page-sub">Live status from ActionMesh, Continuum, approvals, and device records.</p></div>
+          <div class="btn-row"><button id="missionRefresh" class="btn ghost" type="button">Refresh status</button><button id="missionApprovals" class="btn ghost" type="button">Review approvals</button></div></div>
+        <div class="metric-grid" id="missionMetrics" aria-live="polite"></div>
+        <div class="grid two"><article class="card"><h3 class="card-title">Goal state timeline</h3><div id="missionGoal" class="empty">Loading current goal…</div></article>
+          <article class="card"><h3 class="card-title">Recent verified outcomes</h3><div id="missionExecutions" class="empty">Loading execution records…</div></article></div>
+        <article class="card"><div class="card-head"><div><h3 class="card-title">Operator controls</h3><p class="card-note">Emergency Stop requests cancellation for active executions. Already completed side effects may remain; check each execution record.</p></div>
+          <div class="btn-row"><button id="missionCreateGoal" class="btn primary" type="button">Create Goal</button><button id="missionVerify" class="btn ghost" type="button">Verify Now</button><button id="missionOpenChaos" class="btn ghost" type="button">Open ChaosStage</button><button id="missionEvidence" class="btn ghost" type="button">Evidence Vault</button><button id="missionStop" class="btn danger" type="button">Emergency Stop</button></div></div>
+        <p id="missionMessage" role="status"></p></article>
+      </div>
+      <div class="lab-panel" data-lab-panel="chaos" hidden>
+        <div class="page-header"><div><h2 class="page-title">ChaosStage</h2><p class="page-sub">Controlled fault injection against ActionMesh’s dedicated disposable HTTP service at 127.0.0.1:18743.</p></div><span id="chaosAvailability" class="state" data-s="unknown">Checking service</span></div>
+        <div class="grid two"><article class="card"><h3 class="card-title">Service stopped</h3><p>This affects only the named ActionMesh demo service. The stop and any recovery run through the registered server actions, policy, and exact action approvals.</p><p class="card-note">Expected observation: the local health probe fails. Recovery: bounded managed restart, followed by a fresh HTTP health probe.</p><p id="chaosGoalSummary" class="card-note">Load or create the server health goal before starting.</p>
+          <div class="btn-row"><button id="chaosPrepare" class="btn ghost" type="button">Prepare Environment</button><button id="chaosFault" class="btn danger" type="button">Inject Controlled Fault</button><button id="chaosVerify" class="btn primary" type="button">Verify State</button><button id="chaosPause" class="btn ghost" type="button">Pause Monitoring</button><button id="chaosReset" class="btn ghost" type="button">Reset Demo</button><button id="chaosApprovals" class="btn ghost" type="button">Open Approvals</button></div><p id="chaosMessage" role="status"></p></article>
+          <article class="card"><h3 class="card-title">Live experiment</h3><ol id="chaosTimeline" class="lab-timeline"><li class="empty">No challenge activity recorded.</li></ol><div id="chaosGraph" class="lab-graph" aria-label="Demo service health graph"><span class="lab-node" data-s="unknown">Managed demo service</span><span class="lab-edge">observed by ↓</span><span class="lab-node" data-s="unknown">Independent HTTP health probe</span></div></article></div>
+      </div>
+      <div class="lab-panel" data-lab-panel="proof" hidden>
+        <div class="page-header"><div><h2 class="page-title">ProofLens</h2><p class="page-sub">Compare a controlled dashboard claim with the managed-service observation from ActionMesh’s independent verifier.</p></div><button id="proofRefresh" class="btn primary" type="button">Double-Check Reality</button></div>
+        <div class="grid two"><article class="card"><h3 class="card-title">Evidence comparison</h3><div id="proofEvidence" class="empty">Run a fresh observation to compare sources.</div></article><article class="card"><h3 class="card-title">Conclusion</h3><div id="proofConclusion" class="empty">No conclusion until evidence is observed.</div><p class="card-note">The dashboard claim is a labeled demo fixture, not an independent observer. Process and HTTP observations share the ActionMesh managed-service adapter and are not counted as fully independent sources.</p><button id="proofAudit" class="btn ghost" type="button">Open Audit Record</button></article></div>
+      </div>
+      <div class="lab-panel" data-lab-panel="intent" hidden>
+        <div class="page-header"><div><h2 class="page-title">IntentCanvas</h2><p class="page-sub">Select a supported first-party target and bind it to an existing typed observer.</p></div></div>
+        <div class="grid two"><article class="card"><h3 class="card-title">Controlled demo dashboard</h3><button id="intentTarget" class="intent-target" type="button" aria-pressed="false"><span class="dot" id="intentTargetDot"></span><span><strong>ActionMesh demo service health</strong><small>127.0.0.1:18743 · HTTP health probe · supported target</small></span><span id="intentTargetState" class="state" data-s="unknown">Not observed</span></button><p id="intentTargetNote" class="card-note">Select this first-party demo indicator to create a goal with a verified server_health mapping.</p><button id="intentInspect" class="btn ghost" type="button">Inspect Target</button></article>
+          <article class="card"><h3 class="card-title">Goal draft</h3><label for="intentDescription">What should ActionMesh ensure?</label><input id="intentDescription" class="input" maxlength="120" value="Keep my demonstration server healthy"><label>Observation mapping</label><p class="card-note">Condition: server answers HTTP 200 · Observer: registered device.server.status + fresh loopback health probe · Recovery: GoalGuard bounded managed restart · Permission: file/process policy as evaluated at execution.</p><div id="intentPreview" class="empty">Select a supported target to preview the typed Goal Contract.</div><div class="btn-row"><button id="intentCreate" class="btn primary" type="button" disabled>Save Goal Contract</button><button id="intentMonitor" class="btn ghost" type="button" disabled>Start Monitoring</button><button id="intentGoalGuard" class="btn ghost" type="button">Open GoalGuard</button></div><p id="intentMessage" role="status"></p></article></div>
+      </div>
+      <div class="lab-panel" data-lab-panel="goalguard" hidden>
+      <article class="card">
+        <h2>Goal contract</h2>
+        <p>Monitor the dedicated local demonstration service at 127.0.0.1:18743.</p>
+        <form id="continuumForm">
+          <label for="continuumDescription">Goal description</label>
+          <input id="continuumDescription" class="input" value="Keep my demonstration server healthy" required maxlength="120">
+          <label for="continuumInvariant">Condition</label>
+          <select id="continuumInvariant" class="input">
+            <option value="server_health">Demo server answers HTTP 200</option>
+            <option value="app_running">Mac app running state</option>
+            <option value="file_exists">Workspace file exists</option>
+          </select>
+          <label for="continuumResource">App name or workspace file path</label>
+          <input id="continuumResource" class="input" maxlength="240">
+          <label for="continuumExpected">Expected value</label>
+          <select id="continuumExpected" class="input">
+            <option value="true">True</option>
+            <option value="false">False</option>
+          </select>
+          <label for="continuumInterval">Observation interval in seconds</label>
+          <input id="continuumInterval" class="input" type="number" value="5" min="3" max="60" required>
+          <label><input id="continuumEnabled" type="checkbox" checked> Enable monitoring</label>
+          <button class="btn primary" type="submit">Save goal</button>
+        </form>
+        <div class="btn-row">
+          <button id="continuumCheck" class="btn ghost" type="button">Verify now</button>
+          <button id="continuumStop" class="btn ghost" type="button">Stop demo service</button>
+          <button id="continuumApprovals" class="btn ghost" type="button">Open approvals</button>
+        </div>
+        <p id="continuumMessage" role="status"></p>
+      </article>
+      <div id="continuumEvidence"></div>
+      </div>
+    </section>
+
     <section class="view" data-view="automations" hidden>
       <div class="page-header">
         <div>

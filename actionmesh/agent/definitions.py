@@ -421,6 +421,11 @@ def device_definitions() -> list[ActionDefinition]:
             "Read one file inside the workspace root",
         ),
         _def(
+            "device.files.compare", RiskLevel.MEDIUM, ["file.read"],
+            {"left": _S, "right": _S}, ["left", "right"],
+            "Compare two workspace files without exposing their contents",
+        ),
+        _def(
             "device.files.open", RiskLevel.MEDIUM, ["device.file.list"],
             {"path": _S}, ["path"],
             "Open a file in its default application",
@@ -460,6 +465,11 @@ def device_definitions() -> list[ActionDefinition]:
             "device.files.trash", RiskLevel.HIGH, ["file.delete"],
             {"path": _S}, ["path"],
             "Move one file to the OS trash",
+        ),
+        _def(
+            "device.files.preview_plan", RiskLevel.MEDIUM, ["file.read"],
+            {"operations": {"type": "array"}}, ["operations"],
+            "Preview a bounded file operation plan in an isolated shadow workspace",
         ),
         # --- media (C42, contract §2.3) ------------------------------------
         # Playback is only claimed after the real player state is read back;
@@ -547,6 +557,7 @@ REQUIRING_FILE_ROOT: frozenset[str] = frozenset(
         "device.files.list",
         "device.files.search",
         "device.files.read",
+        "device.files.compare",
         "device.files.open",
         "device.files.info",
         "device.files.create",
@@ -555,6 +566,7 @@ REQUIRING_FILE_ROOT: frozenset[str] = frozenset(
         "device.files.copy",
         "device.files.edit",
         "device.files.trash",
+        "device.files.preview_plan",
         # C42: media.open_file opens a confined local file.
         "media.open_file",
     }
@@ -654,6 +666,7 @@ IMPLEMENTED: frozenset[str] = frozenset(
         "device.files.list",
         "device.files.search",
         "device.files.read",
+        "device.files.compare",
         "device.files.open",
         "device.files.info",
         "device.files.create",
@@ -662,6 +675,7 @@ IMPLEMENTED: frozenset[str] = frozenset(
         "device.files.copy",
         "device.files.edit",
         "device.files.trash",
+        "device.files.preview_plan",
         "media.status",
         "media.play",
         "media.pause",

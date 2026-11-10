@@ -527,11 +527,9 @@ class TestAgentInTheService(unittest.TestCase):
         client = TestClient(create_app())
         offered = client.get("/capabilities", params={"provider": "laptop"}).json()
         names = [item["action"] for item in offered]
-        # File and project capabilities only: this app was configured with a
-        # workspace root and no shell flag. The C42 file verbs (11) are part of
-        # the workspace-root boundary too, so the count is 7 + 11 = 18; the
-        # browser/media ones stay behind their own flags (none set here).
-        self.assertEqual(len(offered), 18)
+        # This app has a workspace root and no browser, media or shell flags.
+        self.assertEqual(len(offered), 20)
+        self.assertIn("device.files.compare", names)
         self.assertIn("device.project.list", names)
         self.assertNotIn("device.terminal.execute", names)
         self.assertNotIn("device.ide.open", names)

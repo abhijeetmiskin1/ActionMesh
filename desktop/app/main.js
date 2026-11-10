@@ -53,7 +53,7 @@ const ALLOWED_PREFIXES = [
   // edited from the Automations and History views. The whole family lives under this
   // one prefix, so it is admitted once and the segment boundary in `assertAllowed`
   // keeps `/automationsX` out.
-  '/automations',
+  '/automations', '/continuum', '/parallelworld',
   '/voiceos', '/manifest.webmanifest',
 ];
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from actionmesh.agent.apps import MAC_APP_STATUS
 from actionmesh.core.devices import EXECUTION_KINDS
 from actionmesh.core.executor.engine import ExecutionEngine, ExecutionResult
 from actionmesh.core.graph.serialization import graph_from_dict
@@ -96,7 +97,7 @@ class Orchestrator:
                 session.status = _STOPPED_STEPS[stopped.state]
                 session.summary = self._summary(session)
                 return {"session": session, "references": references}
-            if stop_on_unverified and any(
+            if (stop_on_unverified or self._requires_verified_steps(session)) and any(
                 step.state == "succeeded_unverified" for step in session.steps
             ):
                 session.status = "needs_review"
@@ -189,7 +190,9 @@ class Orchestrator:
             record = self.engine.record(step.execution_id)
             if record is not None:
                 self._apply_record(session, step, record)
-        if session.automatic and any(step.state == "succeeded_unverified" for step in session.steps):
+        if (session.automatic or self._requires_verified_steps(session)) and any(
+            step.state == "succeeded_unverified" for step in session.steps
+        ):
             session.status = "needs_review"
             session.summary = self._summary(session)
             return session
@@ -383,6 +386,10 @@ class Orchestrator:
         )
         return replace(context, policy=policy, approvals=list(context.approvals))
 
+    @staticmethod
+    def _requires_verified_steps(session: TaskSession) -> bool:
+        return any("running" in step.when for step in session.steps)
+
     def _condition_met(self, session: TaskSession, step: TaskStep) -> bool:
         when = step.when
         if not when:
@@ -410,6 +417,16 @@ class Orchestrator:
                 continue
             if key == "verified":
                 if earlier.verified != expected:
+                    return False
+                continue
+            if key == "running":
+                if (
+                    earlier.action_type != MAC_APP_STATUS
+                    or earlier.state != "succeeded"
+                    or earlier.verified is not True
+                    or type(expected) is not bool
+                    or observed.get("running") is not expected
+                ):
                     return False
                 continue
             actual = observed.get(key)

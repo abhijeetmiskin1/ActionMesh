@@ -439,9 +439,67 @@ test('hands-free dictation runs a final transcript and speaks the result', async
   }]]);
   assert.match(result.textContent, /verifiedyes/);
   assert.match(result.textContent, /"count": 1/);
+  assert.match(result.textContent, /Verification timeline · 1\/1 verified/);
+  assert.match(result.textContent, /List workspaceVerified/);
   assert.match(document.getElementById('voiceReply').textContent, /Task completed/);
   assert.doesNotMatch(document.getElementById('voiceReply').textContent, /Review this plan/);
   assert.deepEqual(spoken, ['Task completed.']);
+});
+
+test('preview creates a plan without running it, and finished tasks expose only receipt metadata', async () => {
+  let runs = 0;
+  const pending = { label: 'Check Calculator', action_type: 'device.app.status_native', state: 'pending' };
+  const done = {
+    ...pending, state: 'succeeded', verified: true, execution_id: 'exec-1',
+    observed: { running: true }, parameters: { app: 'calculator' },
+  };
+  const { document } = await bootPage({
+    beforeLoad(bridge) {
+      const readState = bridge.state;
+      bridge.state = async () => ({ ...await readState(), backend: { status: 'ready' } });
+      bridge.request = async ({ path }) => {
+        if (path === '/voiceos/messages') {
+          return { ok: true, body: { kind: 'task', session_id: 'preview-1' } };
+        }
+        if (path === '/voiceos/sessions/preview-1/run') runs += 1;
+        if (path.startsWith('/voiceos/sessions/preview-1')) {
+          return { ok: true, body: {
+            session_id: 'preview-1', request: 'Is Calculator running?',
+            status: runs ? 'completed' : 'proposed', steps: [runs ? done : pending],
+          } };
+        }
+        if (path === '/audit/verify') {
+          return { ok: true, body: { ok: false, broken_at: 0 } };
+        }
+        return { ok: false, status: 503, error: 'fixture route unavailable' };
+      };
+    },
+  });
+  document.getElementById('voiceTranscript').value = 'Is Calculator running?';
+  document.getElementById('voicePreviewPlan').click();
+  await new Promise(setImmediate);
+  const result = document.getElementById('voiceTaskResult');
+  const button = (label) => Array.from(result.querySelectorAll('button'))
+    .find((item) => item.textContent === label);
+  assert.equal(runs, 0);
+  assert.match(result.textContent, /Plan ready for review/);
+  assert.equal(result.querySelector('textarea'), null);
+
+  button('Run: Check Calculator').click();
+  await new Promise(setImmediate);
+  assert.equal(runs, 1);
+  button('Check audit integrity').click();
+  await new Promise(setImmediate);
+  assert.deepEqual(JSON.parse(result.querySelector('textarea').textContent), {
+    schema: 'actionmesh.execution-receipt.v1',
+    task_id: 'preview-1',
+    status: 'completed',
+    steps: [{
+      action_type: 'device.app.status_native', execution_id: 'exec-1',
+      state: 'succeeded', verified: true,
+    }],
+  });
+  assert.match(result.textContent, /failed verification at record 0/);
 });
 
 test('automatic voice tasks continue after their specific approval', async () => {
@@ -502,6 +560,8 @@ test('automatic voice tasks continue after their specific approval', async () =>
   assert.equal(runs.length, 1);
   const result = document.getElementById('voiceTaskResult');
   assert.doesNotMatch(result.textContent, /Check again after approving/);
+  assert.match(result.textContent, /Verification timeline · 0\/1 verified/);
+  assert.match(result.textContent, /Run a stepawaiting approval/);
   const reopened = (await bootPage(options)).document;
   reopened.querySelector('.nav-item[data-view="approvals"]').click();
   await new Promise(setImmediate);

@@ -490,3 +490,34 @@ entries of `GUIDE_MAX_PHRASE_CHARS` (200) characters, blank entries refused with
 400, and each string echoed back only as the string that was sent. **The route
 proposes nothing, authorizes nothing and runs nothing** — it creates no session and
 no execution, which `tests/unit/test_command_guide.py` asserts directly.
+
+## Local Continuum goal
+
+`GET `/continuum`` returns the saved local Goal Contract and its current observation,
+if one exists. `POST `/continuum`` validates and saves a typed contract. `POST
+`/continuum/check`` requests one observation cycle through the existing ActionMesh
+orchestrator. `POST `/continuum/stop-demo`` requests stopping only the dedicated demo
+service. These routes are available only to the local desktop service. A risky repair
+or stop still pauses for its exact action approval in the normal Approvals flow.
+
+The supported demo invariant is `server_health` for the fixed loopback service. Goal
+state distinguishes unavailable or unknown evidence from a verified healthy result;
+the planner does not directly execute an action.
+
+## ParallelWorld preview and apply
+
+`POST `/parallelworld/previews`` validates a typed file-operation plan and evaluates
+it in a bounded temporary shadow. The real workspace is read to capture a source
+snapshot; preview returns metadata and a transient diff. `GET
+`/parallelworld/previews`` lists available preview summaries, and `GET
+`/parallelworld/previews/{preview_id}`` returns the selected preview metadata and
+whether its source snapshot is still current. Preview contents are held in memory
+with bounded count and lifetime.
+
+`POST `/parallelworld/previews/{preview_id}/apply`` checks the expected source
+snapshot again and submits the stored operations as registered actions through the
+normal policy, approval, execution, and independent verification pipeline. Each
+operation is authorized separately. Application is sequential, so earlier completed
+operations may remain if a later operation fails. A stale preview is refused and must
+be generated again. See [the ParallelWorld guide](parallelworld/README.md) for
+supported operations and limits.

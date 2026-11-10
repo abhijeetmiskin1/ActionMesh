@@ -17,7 +17,7 @@ Speak or type a request. Follow the task as it runs. See what was verified, what
 
 <br>
 
-[⚡ Quick demo](#quick-demo) · [🎬 Demo script](docs/DEMO_RUN_OF_SHOW.md) · [🧭 How it works](#from-request-to-result) · [✅ Capabilities](#capabilities) · [🗺️ Roadmap](#roadmap) · [🛠️ Setup](#run-locally)
+[⚡ Quick demo](#quick-demo) · [🧪 Continuum Lab](#continuum-lab-v5) · [🌐 ParallelWorld](#parallelworld) · [🎬 Demo scripts](docs/DEMO_RUN_OF_SHOW.md) · [🧭 How it works](#from-request-to-result) · [✅ Capabilities](#capabilities) · [🗺️ Roadmap](#roadmap) · [🛠️ Setup](#run-locally)
 
 </div>
 
@@ -43,8 +43,29 @@ Open **Voice Commands**, press the microphone, and try these. For a quiet room, 
 | **“Open browser”** | Opens a page in the controlled browser and reports the observed navigation. |
 | **“Check the best deal”** → **“USB-C charger”** | Asks for the product, then opens search links. These are discovery links, not verified offers. |
 | **“Show open issues in abhijeetmiskin1/ActionMesh”** | Looks up public repository issues and returns a source-linked result. |
+| **Compare workspace files** | In a configured workspace, compares two supported files and reports a verified match/difference result without displaying their contents. |
 
 In **Task Results**, check whether each step succeeded, failed, needs approval, or could not be verified. Enable **Keep listening after replies** to try **“Jarvis, repeat that”** and **“Jarvis, stop listening.”**
+
+## 🧪 Continuum Lab V5
+
+The Continuum Lab adds judge-ready control and evidence views to the existing ActionMesh pipeline:
+
+| Workspace | What it demonstrates |
+|---|---|
+| **Mission Control** | Live backend readiness, goal state, approvals, active executions, devices, and verified receipts. |
+| **ChaosStage** | A controlled fault against a dedicated local HTTP demo service, followed by a bounded repair proposal through registered actions and exact-action approvals. |
+| **ProofLens** | Compares the managed-service observation with a clearly labeled, untrusted healthy fixture claim; shows when they conflict and when the service is observed healthy again. |
+| **IntentCanvas** | Selects a supported first-party target and previews a typed `server_health` Goal Contract before saving it. |
+| **GoalGuard** | Retains the existing goal contract, bounded recovery, and evidence timeline. |
+
+The packaged native macOS rehearsal demonstrated the service fault, the contradictory observation, approval of the specific recovery action, and a fresh HTTP 200 health observation afterward. ProofLens labels the dashboard claim as a fixture, not a live independent dashboard. Process and HTTP observations share the managed-service adapter, so the UI does not claim fully independent sources.
+
+Start with the [Continuum Lab demo and setup guide](docs/continuum-demo/V5_CONTINUUM_LAB.md). It uses only a disposable local workspace and a loopback service. Broader proposed concepts such as TrustSwitch, AgentArena, CausalXRay, and RealityForks are not implemented features.
+
+## 🌐 ParallelWorld
+
+ParallelWorld previews supported file-operation plans in a bounded temporary shadow, shows the proposed diff, then can submit the exact operations through the normal ActionMesh policy, approval, execution, and verification path. It checks the source snapshot again before apply. A changed source invalidates the preview. Real operations run sequentially, so a later failure may leave earlier verified changes in place. See the [ParallelWorld guide](docs/parallelworld/README.md) for supported operations, limits, and a disposable-workspace rehearsal.
 
 ## 🧭 From request to result
 
@@ -80,6 +101,9 @@ The proposal cannot grant itself authority. If the result is uncertain, the task
 | **Browser** | Controlled open, search, and page observation | Login, CAPTCHA, and MFA remain for you to handle. |
 | **Voice** | Microphone capture, transcription, spoken replies, and follow-up turns | Requires microphone access and a configured transcription service. |
 | **Typed fallback** | Submit the same request path from the Voice Commands screen | Useful for rehearsal or noisy rooms. |
+| **Workspace comparison** | Compare two bounded regular files and report a verified boolean result | File contents do not cross the result boundary; workspace and size limits apply. |
+| **ParallelWorld** | Preview and review bounded file operations in a shadow before applying them | Each real action remains policy-checked and separately approvable; apply is sequential, not transactional. |
+| **Continuum Lab** | Monitor a typed local service goal, inspect a controlled fault, and propose bounded recovery | This V5 demo target is the supported local service. Risky start/stop actions still require exact-action approval. |
 | **GitHub** | Public repository and issue lookup | Private repository reads need a scoped connection. |
 | **Google Drive** | File search adapter and fixture coverage | Live search needs a read-only OAuth connection. |
 | **Shopping research** | Product search links | Seller checks, offer matching, and delivered totals are not yet verified. |
@@ -88,6 +112,7 @@ The proposal cannot grant itself authority. If the result is uncertain, the task
 
 ```text
 READY TO TRY       Mac app control · controlled browser · voice and typed tasks
+DEMO WORKSPACES    Continuum Lab V5 · ParallelWorld bounded file preview
 CONNECT WHEN READY GitHub reads · Google Drive read-only search
 IN DEVELOPMENT    Natural multi-step follow-through · richer deal comparison
 NOT CONNECTED     Image creation
