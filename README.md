@@ -17,7 +17,7 @@ Speak or type a request. Follow the task as it runs. See what was verified, what
 
 <br>
 
-[⚡ Quick demo](#quick-demo) · [🧭 How it works](#from-request-to-result) · [✅ Capabilities](#capabilities) · [🗺️ Roadmap](#roadmap) · [🛠️ Setup](#run-locally)
+[⚡ Quick demo](#quick-demo) · [🎬 Demo script](docs/DEMO_RUN_OF_SHOW.md) · [🧭 How it works](#from-request-to-result) · [✅ Capabilities](#capabilities) · [🗺️ Roadmap](#roadmap) · [🛠️ Setup](#run-locally)
 
 </div>
 
@@ -136,7 +136,8 @@ From the project root:
 
 | Start here | Learn more |
 |---|---|
-| [Project overview](docs/project/PROJECT_OVERVIEW.md) | [One-page solution pitch](docs/SOLUTION_PITCH.md) |
+| [Three-minute demo script](docs/DEMO_RUN_OF_SHOW.md) | [Project overview](docs/project/PROJECT_OVERVIEW.md) |
+| [One-page solution pitch](docs/SOLUTION_PITCH.md) | [Quick demo commands](#quick-demo) |
 | [System architecture](docs/project/SYSTEM_ARCHITECTURE.md) | [Security model](docs/project/SECURITY_MODEL.md) |
 | [Development guide](docs/project/DEVELOPMENT_GUIDE.md) | [Execution contract](docs/c42-execution-contract.md) |
 | [Integrations](docs/project/INTEGRATIONS.md) | [Testing and acceptance](docs/project/TESTING_AND_ACCEPTANCE.md) |
