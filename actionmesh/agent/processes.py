@@ -153,6 +153,30 @@ def _alive(record: ProcessRecord) -> bool:
     return True
 
 
+CONTINUUM_NAME = "actionmesh-continuum-demo"
+CONTINUUM_PORT = 18743
+CONTINUUM_ARGUMENTS = (
+    "-m", "http.server", str(CONTINUUM_PORT), "--bind", "127.0.0.1",
+    "--directory", "continuum-demo",
+)
+
+
+async def continuum_http_ready() -> bool:
+    """Probe only the fixed loopback demonstration endpoint."""
+    try:
+        async with asyncio.timeout(1):
+            reader, writer = await asyncio.open_connection("127.0.0.1", CONTINUUM_PORT)
+            try:
+                writer.write(b"HEAD /health.txt HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                await writer.drain()
+                status = (await reader.readline()).split()
+                return len(status) >= 2 and status[0].startswith(b"HTTP/") and status[1] == b"200"
+            finally:
+                writer.close()
+    except (OSError, TimeoutError, ValueError):
+        return False
+
+
 async def is_listening(port: int, *, timeout_s: float = PROBE_TIMEOUT_S) -> bool:
     """Ask the loopback address whether anything is accepting on ``port``.
 

@@ -1920,6 +1920,15 @@ class ExecutionEngine:
                             },
                         )
                     )
+                # A pending human decision is a boundary in a sequential graph.
+                # Do not dispatch later dependent work while an earlier action is
+                # waiting; resume() re-enters the same graph after the named
+                # action_id has been approved and policy is evaluated again.
+                if any(
+                    result.nodes[nid].state is ActionState.WAITING_PERMISSION
+                    for nid in layer
+                ):
+                    break
                 done = sum(1 for o in result.nodes.values() if o.node_type != "end")
                 self.events.publish(
                     MeshEvent(

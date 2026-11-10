@@ -11,9 +11,9 @@ below was verified to exist.*
 | `desktop/` | Electron app (`app/`, `ui/`, `test/`) | Production |
 | `tests/` | pytest suites (`unit/`, `security/`, `integration/`, `e2e/`, `fixtures/`) | Tests |
 | `docs/` | Existing design docs (see note) | Documentation |
-| `scripts/` | `build_apk.py`, `snapshot.py`, `handoff_pdf.py`, `bundle_runtime.py`, `make_icons.py`, `android_toolchain.ps1`, `fetch_resumable.ps1` | Tooling |
+| `scripts/` | `build_apk.py`, `snapshot.py`, `bundle_runtime.py`, `make_icons.py`, `android_toolchain.ps1`, `fetch_resumable.ps1` | Tooling |
 | `android/` | WebView APK shell, `android/README.md` | Production |
-| `PROJECT.md`, `HANDOFF.md`, `TASK_BOARD.md`, `CHANGELOG.md`, `README.md`, `SECURITY.md` | Existing root docs | Documentation (see discrepancies) |
+| `PROJECT.md`, `CHANGELOG.md`, `README.md`, `SECURITY.md` | Existing root docs | Documentation (see discrepancies) |
 | `.env.example` | 33 `ACTIONMESH_*` env vars (host/port, DB, API key, LLM, agent, workspace, commands, pairing) | Config template |
 | `pyproject.toml` | Python ≥3.11, `fastapi>=0.115`; dev: pytest/ruff/mypy/httpx; server: uvicorn | Config |
 | `desktop/package.json` | Electron 45.2.1, electron-builder 26.18.0; scripts: `start`, `test`, `pack`, `dist:*` | Config |

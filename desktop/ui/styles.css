@@ -1258,6 +1258,18 @@ li.empty {
 }
 .detail-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
 
+.verification-timeline {
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.verification-timeline h3 { margin: 0 0 var(--sp-2); font-size: 13px; }
+.verification-timeline ol { margin: 0; padding-inline-start: 1.5rem; }
+.verification-row { padding-block: 3px; font-size: 13px; }
+.verification-outcome { margin-inline-start: var(--sp-2); color: var(--ink-dim); font-weight: 600; }
+
 /* Steps read as a numbered pipeline: the index is a token, the body a card. */
 .steps {
   list-style: none;
@@ -1697,6 +1709,28 @@ pre.mono,
   color: var(--ink-soft);
 }
 .mic-card .textarea { margin-bottom: var(--sp-1); }
+
+/* ParallelWorld: the plan remains editable text, while the diff is rendered as
+   inert preformatted content from the transient ActionMesh output stream. */
+.parallel-diff {
+  max-height: 34rem;
+  overflow: auto;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+#parallelOperations { font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+#parallelConflict[data-state="conflict"] { color: var(--danger, #a43232); }
+#parallelConflict[data-state="ok"] { color: var(--good, #28764c); }
+#parallelMetrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .65rem; }
+.metric-card { display: grid; gap: .25rem; padding: .8rem; border: 1px solid var(--line); border-radius: var(--radius); }
+.metric-label { color: var(--muted); font-size: .78rem; }
+.metric-value { font-size: 1.4rem; }
 
 /* ---------------------------------------------------------- quick commands */
 .quick-grid {
@@ -2553,3 +2587,30 @@ summary:focus-visible,
   background: var(--green-soft);
   color: var(--ink);
 }
+
+/* Continuum Lab: one compact workspace switcher for the advanced control surfaces. */
+.lab-tabs { display:flex; flex-wrap:wrap; gap:.45rem; padding:.2rem 0 1rem; }
+.lab-tab { border:1px solid var(--line); border-radius:999px; padding:.55rem .9rem; background:var(--surface); color:var(--ink-soft); font:inherit; cursor:pointer; }
+.lab-tab[aria-selected="true"] { border-color:var(--green); background:var(--green-soft); color:var(--ink); font-weight:650; }
+.lab-panel[hidden] { display:none !important; }
+.lab-panel { animation: lab-enter 180ms ease-out; }
+@keyframes lab-enter { from { opacity:.65; transform:translateY(3px); } to { opacity:1; transform:translateY(0); } }
+.lab-timeline { display:grid; gap:.5rem; padding-left:1.25rem; }
+.lab-timeline li { padding:.45rem .6rem; border-left:2px solid var(--line); color:var(--ink-soft); }
+.lab-receipt, .evidence-row { display:grid; gap:.3rem; padding:.75rem 0; border-bottom:1px solid var(--line); }
+.lab-receipt small { color:var(--ink-soft); overflow-wrap:anywhere; }
+.evidence-row p { margin:0; color:var(--ink-soft); }
+.lab-graph { display:flex; flex-direction:column; align-items:center; gap:.4rem; margin:1.25rem 0; }
+.lab-node { border:1px solid var(--line); border-radius:var(--radius); padding:.8rem 1rem; background:var(--surface); }
+.lab-node[data-s="success"] { border-color:var(--green); background:var(--green-soft); }
+.lab-node[data-s="failed"] { border-color:#D66; background:#FDECEC; }
+.lab-edge { color:var(--ink-soft); font-size:.85rem; }
+.intent-target { display:flex; width:100%; align-items:center; gap:.8rem; border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); color:var(--ink); padding:1rem; text-align:left; cursor:pointer; }
+.intent-target[aria-pressed="true"] { outline:2px solid var(--green); outline-offset:2px; }
+.intent-target small { display:block; color:var(--ink-soft); margin-top:.2rem; }
+.intent-target .state { margin-left:auto; }
+.state[data-s="contradicted"], .state[data-s="unhealthy"] { background:#FDECEC; color:#B23C3C; }
+.state[data-s="verified"], .state[data-s="healthy"] { background:#DDF0E3; color:var(--green-dark); }
+.state[data-s="stale"], .state[data-s="insufficient_evidence"], .state[data-s="untrusted"] { background:var(--yellow-soft); color:var(--warn-ink); }
+@media (prefers-reduced-motion:reduce) { .lab-panel { animation:none; } }
+@media (max-width:760px) { .lab-tabs { overflow-x:auto; flex-wrap:nowrap; } .lab-tab { white-space:nowrap; } .intent-target { flex-wrap:wrap; } }

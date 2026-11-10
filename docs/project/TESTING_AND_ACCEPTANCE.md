@@ -51,7 +51,7 @@ ACTIONMESH_LIVE_ACCEPTANCE=1 ACTIONMESH_LIVE_MPRIS_PLAYER=mpv \
 
 ## Historical results (labeled historical — do not treat as current)
 
-- **PROJECT.md / HANDOFF.md (2026-10-19):** 1,168 tests OK (unittest
+- **Historical test record (2026-10-19):** 1,168 tests OK (unittest
   discover), ruff clean, mypy clean (89 modules), warning-clean.
 - **C42 historical report** (from the project brief): Python **1,758
   passed, 3 skipped, 888 subtests**; Desktop **106 passed**.

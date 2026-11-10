@@ -167,6 +167,11 @@ const state = {
   executions: [],
   approvals: [],
   output: new Map(), // execution_id -> { node_id: { stdout: text, stderr: text } }
+  parallelDiffs: new Map(),
+  parallelExecutionId: '',
+  parallelPreviewId: '',
+  labTab: 'mission',
+  intentTargetSelected: false,
   // session_id -> the diagnosis body the person asked for. Held in the renderer only:
   // the excerpt it came from is transient, and re-deriving it on every refresh would
   // spend another model call (and another decision to share context) without being
@@ -225,6 +230,8 @@ const VIEWS = {
   home: { eyebrow: 'Control plane', title: 'Home' },
   voice: { eyebrow: 'Voice', title: 'Voice Commands' },
   tasks: { eyebrow: 'VoiceOS', title: 'Task Center' },
+  continuum: { eyebrow: 'Autonomous systems', title: 'Continuum Lab' },
+  parallelworld: { eyebrow: 'Shadow execution', title: 'ParallelWorld' },
   automations: { eyebrow: 'Personal automation', title: 'Automations' },
   live: { eyebrow: 'Execution', title: 'Live Control' },
   approvals: { eyebrow: 'Human in the loop', title: 'Approvals' },
@@ -244,6 +251,7 @@ function showView(name) {
   if (!VIEWS[name]) name = 'home';
   if (state.view !== name) byId('mainScroll').scrollTop = 0;
   state.view = name;
+  if (name === 'continuum') setLabTab(state.labTab || 'mission');
   for (const section of document.querySelectorAll('section.view')) {
     section.hidden = section.dataset.view !== name;
   }
@@ -661,6 +669,7 @@ function refreshTasksBadgeOnly() {
 const VOICE_SETUP_PERMISSIONS = {
   'device.app.launch_native': { scope: 'system.app.launch', risk: 'medium', label: 'app launch' },
   'device.app.status_native': { scope: 'system.app.status', risk: 'low', label: 'app status' },
+  'device.files.compare': { scope: 'file.read', risk: 'medium', label: 'workspace file read' },
   'github.repositories.search': { scope: 'github.read', risk: 'low', label: 'GitHub read' },
   'github.issues.list': { scope: 'github.read', risk: 'low', label: 'GitHub read' },
   'google.drive.search': { scope: 'google.drive.read', risk: 'low', label: 'Google Drive read' },
@@ -774,12 +783,14 @@ function renderTaskDetail(host, session) {
   }
 
   if (inVoice) {
+    if (session.steps?.length) parts.push(renderVerificationTimeline(session.steps));
     parts.push(el('details', { class: 'secondary-panel' }, [
       el('summary', { text: 'Execution details' }), steps,
     ]));
   } else {
     parts.push(steps);
   }
+  if (terminal && session.steps?.length) parts.push(renderTaskEvidence(session));
 
   const diagnosis = state.diagnoses.get(session.session_id);
   if (diagnosis) {
@@ -790,6 +801,84 @@ function renderTaskDetail(host, session) {
     parts.push(el('p', { class: 'fine', text: session.summary }));
   }
   replace(host, parts);
+}
+
+function renderTaskEvidence(session) {
+  const verify = el('button', { class: 'btn ghost small', type: 'button', text: 'Check audit integrity' });
+  const result = el('p', { class: 'fine', role: 'status' });
+  // Keep requests, parameters and provider data out of the shareable receipt.
+  const receipt = {
+    schema: 'actionmesh.execution-receipt.v1',
+    task_id: session.session_id,
+    status: session.status,
+    steps: session.steps.map((step) => ({
+      action_type: step.action_type || null,
+      execution_id: step.execution_id || null,
+      state: step.state,
+      verified: step.verified ?? null,
+    })),
+  };
+  verify.addEventListener('click', async () => {
+    verify.disabled = true;
+    result.textContent = 'Checking the backend audit ledger…';
+    try {
+      const chain = await GET('/audit/verify');
+      if (chain.ok === true) {
+        result.textContent = `Backend audit chain intact · ${chain.records} records checked.`;
+      } else if (chain.ok === false) {
+        result.textContent = `Backend audit chain failed verification at record ${chain.broken_at}.`;
+      } else {
+        result.textContent = 'The backend did not report an audit result.';
+      }
+    } catch {
+      result.textContent = 'Could not check the backend audit chain.';
+    } finally {
+      verify.disabled = false;
+    }
+  });
+  return el('section', { class: 'verification-timeline', 'aria-label': 'Execution evidence' }, [
+    el('h3', { text: 'Execution evidence' }),
+    verify,
+    result,
+    el('details', { class: 'secondary-panel' }, [
+      el('summary', { text: 'Execution receipt' }),
+      el('textarea', {
+        class: 'textarea', rows: 6, readonly: true, 'aria-label': 'Execution receipt JSON',
+      }, JSON.stringify(receipt, null, 2)),
+    ]),
+  ]);
+}
+
+function renderVerificationTimeline(steps) {
+  let verifiedCount = 0;
+  const rows = steps.map((step) => {
+    let outcome = (step.state || 'pending').replaceAll('_', ' ');
+    if (step.state === 'succeeded' || step.state === 'succeeded_unverified') {
+      outcome = 'Unverified';
+    }
+    if (step.state === 'succeeded' && step.verified === true) {
+      verifiedCount += 1;
+      outcome = 'Verified';
+      if (step.action_type === 'device.app.status_native' && typeof step.observed?.running === 'boolean') {
+        outcome += step.observed.running ? ' · Running' : ' · Closed';
+      }
+      if (step.action_type === 'browser.search' && Number.isSafeInteger(step.observed?.count)
+        && step.observed.count >= 0) {
+        outcome += ` · ${step.observed.count} result links`;
+      }
+      if (step.action_type === 'device.files.compare' && typeof step.observed?.changed === 'boolean') {
+        outcome += step.observed.changed ? ' · Files differ' : ' · Files match';
+      }
+    }
+    return el('li', { class: 'verification-row' }, [
+      el('span', { text: step.label || 'Step' }),
+      el('span', { class: 'verification-outcome', text: outcome }),
+    ]);
+  });
+  return el('section', { class: 'verification-timeline', 'aria-label': 'Verification timeline' }, [
+    el('h3', { text: `Verification timeline · ${verifiedCount}/${steps.length} verified` }),
+    el('ol', {}, rows),
+  ]);
 }
 
 function renderStep(step) {
@@ -849,6 +938,7 @@ function renderStep(step) {
 }
 
 function voiceRunReport(session) {
+  if (session.status === 'proposed') return 'Plan ready for review.';
   if (session.status === 'awaiting_approval') return 'Waiting for your approval.';
   if (session.status === 'needs_review') {
     if (session.steps?.some((step) => step.observed?.status === 'needs_user')) {
@@ -863,7 +953,16 @@ function voiceRunReport(session) {
   if (session.status !== 'completed') return `Task status: ${session.status.replaceAll('_', ' ')}.`;
   const steps = session.steps || [];
   const step = steps[0];
-  if (session.status === 'proposed') return 'Ready to run.';
+  if (steps.length === 1 && step.action_type === 'device.files.compare'
+    && step.verified === true && typeof step.observed?.changed === 'boolean') {
+    return step.observed.changed ? 'The files differ.' : 'The files match byte for byte.';
+  }
+  if (steps.length === 2 && step.action_type === 'device.app.status_native'
+    && step.verified === true && step.observed?.running === true
+    && steps[1].action_type === 'device.app.launch_native' && steps[1].state === 'skipped'
+    && steps[1].when?.running === false) {
+    return `${step.label.replace(/^Check /, '')} was already running. Launch skipped.`;
+  }
   if (steps.length === 1 && step.action_type === 'browser.open' && step.verified === true) {
     return 'I opened the browser.';
   }
@@ -1315,6 +1414,15 @@ function handleStreamEvent(event) {
     const executionId = data.execution_id;
     const payload = data.payload || {};
     if (!executionId || !payload.node_id) return;
+    if (payload.stream === 'parallelworld.diff') {
+      const diff = state.parallelDiffs.get(executionId) || '';
+      state.parallelDiffs.set(executionId, diff + String(payload.chunk || ''));
+      if (state.parallelExecutionId === executionId || state.view === 'parallelworld') {
+        state.parallelExecutionId = executionId;
+        byId('parallelDiff').textContent = state.parallelDiffs.get(executionId) || '(No file content changed.)';
+      }
+      return;
+    }
     // The accessibility walk's element list arrives on the same transient channel a
     // file body does. It is not stdout, so it does not belong in the output console --
     // but it is the *only* place element names exist, because the result payload is
@@ -1360,6 +1468,10 @@ function handleStreamEvent(event) {
       loadExecution(data.execution_id);
     }
     refreshLive();
+  } else if (state.view === 'continuum' && type === 'execution.completed') {
+    refreshContinuum();
+  } else if (state.view === 'parallelworld' && type === 'execution.completed') {
+    refreshParallelWorld();
   } else if (state.view === 'approvals') {
     refreshApprovals();
   } else if (state.view === 'tasks') {
@@ -3736,6 +3848,12 @@ const QUICK_COMMANDS = [
   { group: 'WEB', label: 'Open Browser', text: 'open browser' },
   { group: 'WEB', label: 'Open Google Drive', text: 'open google drive' },
   { group: 'COMPUTER', label: 'Open Calculator and Clock', text: 'open calculator and clock' },
+  { group: 'SHOWCASE', label: 'Ensure Calculator is running', text: 'Ensure Calculator is running' },
+  {
+    group: 'SHOWCASE',
+    label: 'Open Calculator, search, and verify Calculator',
+    text: 'Open Calculator, then check the best deal for USB-C charger, then is Calculator running?',
+  },
   { group: 'COMPUTER', label: 'Check if Clock Is Running', text: 'is clock running?' },
   { group: 'COMPUTER', label: 'Show Running Processes', text: 'show the running processes on this computer' },
   { group: 'COMPUTER', label: 'Show Servers', text: 'show which servers are running' },
@@ -4199,6 +4317,8 @@ function wireVoice() {
   });
   const send = byId('voiceSend');
   if (send) send.addEventListener('click', sendVoiceTranscript);
+  const preview = byId('voicePreviewPlan');
+  if (preview) preview.addEventListener('click', () => sendVoiceTranscript({ autoRun: false }));
   const transcript = byId('voiceTranscript');
   if (transcript) {
     transcript.addEventListener('keydown', (event) => {
@@ -5017,11 +5137,304 @@ function wireShell() {
   });
 }
 
+let continuumRevision = "";
+
+async function refreshContinuum() {
+  const host = byId('continuumEvidence');
+  try {
+    const goal = await GET('/continuum');
+    if (!goal) {
+      replace(host, el('p', { text: 'Save a goal to start monitoring.' }));
+      return;
+    }
+    const revision = `${goal.goal_id}/${goal.revision}`;
+    if (continuumRevision !== revision) {
+      continuumRevision = revision;
+      byId('continuumDescription').value = goal.contract.description;
+      byId('continuumInvariant').value = goal.contract.invariant;
+      byId('continuumResource').value = goal.contract.resource;
+      byId('continuumExpected').value = String(goal.contract.expected);
+      byId('continuumInterval').value = goal.contract.interval;
+      byId('continuumEnabled').checked = goal.contract.enabled;
+    }
+    replace(host, [
+      el('section', { class: 'card' }, [
+        el('h2', { text: goal.contract.description }),
+        el('p', { text: `${goal.state} · ${goal.observation} · ${goal.device_id}` }),
+        el('p', { text: goal.pending || goal.stop_pending ? 'Open Approvals to review a waiting action.' : '' }),
+        el('p', { text: `Last verified: ${goal.last_verified || 'Pending'}` }),
+        el('p', { text: `Repair attempts: ${goal.attempts}/${goal.contract.max_attempts}` }),
+        el('h3', { text: 'ProofRoute decision' }),
+        el('p', { text: goal.strategy || 'Waiting for observation.' }),
+      ]),
+      el('section', { class: 'card' }, [
+        el('h2', { text: 'Evidence timeline' }),
+        el('ol', {}, [...goal.events].reverse().map((entry) => el('li', {
+          text: [entry.at, entry.state, entry.detail, entry.execution_id].filter(Boolean).join(' · '),
+        }))),
+      ]),
+    ]);
+  } catch (error) {
+    replace(host, el('p', { text: error.message }));
+  }
+}
+
+function setLabTab(tab) {
+  const allowed = new Set(['mission', 'chaos', 'proof', 'intent', 'goalguard']);
+  state.labTab = allowed.has(tab) ? tab : 'mission';
+  for (const panel of document.querySelectorAll('[data-lab-panel]')) panel.hidden = panel.dataset.labPanel !== state.labTab;
+  for (const button of document.querySelectorAll('[data-lab-tab]')) button.setAttribute('aria-selected', String(button.dataset.labTab === state.labTab));
+}
+
+function labMetric(label, value) {
+  return el('div', { class: 'metric-card' }, [el('span', { class: 'metric-label', text: label }), el('strong', { class: 'metric-value', text: String(value ?? '—') })]);
+}
+
+async function refreshMissionControl() {
+  const host = byId('missionMetrics');
+  try {
+    const [ready, goal, approvals, executions, devices] = await Promise.all([
+      GET('/ready'), GET('/continuum'), GET('/approvals'), GET('/executions?limit=30'), GET('/devices'),
+    ]);
+    const active = executions.filter((item) => ['executing', 'running', 'pending', 'waiting_permission', 'awaiting_approval'].includes(item.state));
+    const verified = executions.filter((item) => item.state === 'success' && Object.values(item.results || {}).some((result) => result?.verified === true)).length;
+    replace(host, [labMetric('Backend', ready.status || 'unknown'), labMetric('Goal state', goal?.state || 'no goal'), labMetric('Parked approval graphs', approvals.length), labMetric('Active executions', active.length), labMetric('Online devices', devices.filter((item) => item.online).length), labMetric('Verified execution receipts', verified)]);
+    replace(byId('missionGoal'), goal ? [
+      el('p', {}, [stateChip(goal.state), ` ${goal.contract.description}`]),
+      el('p', { class: 'card-note', text: `${goal.observation} · observed ${goal.observed_at ? timeAgo(goal.observed_at) : 'not yet'} · ${goal.strategy || 'No strategy recorded.'}` }),
+      el('ol', { class: 'lab-timeline' }, [...(goal.events || [])].reverse().slice(0, 8).map((event) => el('li', { text: `${timeAgo(event.at)} · ${event.state} · ${event.detail}` }))),
+    ] : el('p', { class: 'empty', text: 'No Goal Contract yet. Create one from IntentCanvas or GoalGuard.' }));
+    const receipts = executions.flatMap((record) => Object.values(record.results || {}).filter((result) => result?.verified === true).map((result) => ({ record, result })));
+    replace(byId('missionExecutions'), receipts.length ? receipts.slice(0, 8).map(({ record, result }) => el('div', { class: 'lab-receipt' }, [el('strong', { text: `${result.action_type || 'Action'} · independently verified` }), el('small', { text: `${record.execution_id} · ${timeAgo(record.updated_at || record.finished_at)}` })])) : el('p', { class: 'empty', text: 'No independently verified execution receipts in recent history.' }));
+  } catch (error) { replace(host, el('p', { class: 'empty', text: `Mission Control data unavailable: ${error.message}` })); }
+}
+
+async function refreshChaosStage() {
+  try {
+    const goal = await GET('/continuum');
+    const chip = byId('chaosAvailability');
+    chip.textContent = goal ? `${goal.state} · ${goal.observation}` : 'Goal not configured';
+    chip.dataset.s = goal?.observation === 'VERIFIED' ? 'success' : goal?.observation === 'VIOLATED' ? 'failed' : 'unknown';
+    byId('chaosGoalSummary').textContent = goal ? `${goal.contract.description} · attempts ${goal.attempts}/${goal.contract.max_attempts} · ${goal.pending ? 'repair execution pending' : 'no repair execution pending'}` : 'Save a server health goal in GoalGuard or create one from IntentCanvas.';
+    replace(byId('chaosTimeline'), goal?.events?.length ? [...goal.events].reverse().map((entry) => el('li', { text: `${timeAgo(entry.at)} · ${entry.state} · ${entry.detail}` })) : el('li', { class: 'empty', text: 'Prepare a goal to start a controlled challenge.' }));
+    for (const node of document.querySelectorAll('#chaosGraph .lab-node')) node.dataset.s = goal?.observation === 'VERIFIED' ? 'success' : goal?.observation === 'VIOLATED' ? 'failed' : 'unknown';
+  } catch (error) { byId('chaosMessage').textContent = error.message; }
+}
+
+async function refreshProofLens() {
+  try {
+    const goal = await GET('/continuum');
+    if (!goal) {
+      replace(byId('proofEvidence'), el('p', { class: 'empty', text: 'Create a server health Goal Contract, then run a fresh observation.' }));
+      replace(byId('proofConclusion'), [stateChip('insufficient_evidence'), el('p', { text: 'No conclusion until supported evidence is available.' })]);
+      return;
+    }
+    const stale = goal.observed_at && Date.now() - Date.parse(goal.observed_at) > goal.contract.interval * 2000;
+    const actual = goal.observation === 'VERIFIED' ? 'HEALTHY' : goal.observation === 'VIOLATED' ? 'UNHEALTHY' : goal.observation;
+    const conclusion = stale ? 'stale_evidence' : actual === 'UNHEALTHY' ? 'contradicted' : actual === 'HEALTHY' ? 'verified' : 'insufficient_evidence';
+    replace(byId('proofEvidence'), [
+      el('div', { class: 'evidence-row' }, [el('strong', { text: 'Controlled dashboard claim' }), stateChip('untrusted'), el('p', { text: 'HEALTHY · fixed demo fixture claim · not an observer' })]),
+      el('div', { class: 'evidence-row' }, [el('strong', { text: 'ActionMesh managed-service observation' }), stateChip(stale ? 'stale' : actual.toLowerCase()), el('p', { text: `${actual} · ${goal.observed_at ? `observed ${timeAgo(goal.observed_at)}` : 'not observed'} · receipt ${goal.events?.[goal.events.length - 1]?.execution_id || 'unavailable'}` })]),
+    ]);
+    replace(byId('proofConclusion'), [stateChip(conclusion), el('p', { text: conclusion === 'contradicted' ? 'The demo dashboard claim conflicts with the managed-service observation.' : conclusion === 'verified' ? 'The supported observer reports the expected condition; the dashboard fixture remains untrusted.' : 'Evidence is stale or insufficient for a conclusion.' })]);
+  } catch (error) { replace(byId('proofEvidence'), el('p', { class: 'empty', text: error.message })); replace(byId('proofConclusion'), stateChip('unavailable')); }
+}
+
+async function refreshIntentCanvas() {
+  try {
+    const goal = await GET('/continuum');
+    const status = goal?.observation === 'VERIFIED' ? 'Healthy' : goal?.observation === 'VIOLATED' ? 'Unhealthy' : goal?.observation || 'Not observed';
+    byId('intentTargetState').textContent = status;
+    byId('intentTargetState').dataset.s = goal?.observation === 'VERIFIED' ? 'success' : goal?.observation === 'VIOLATED' ? 'failed' : 'unknown';
+    byId('intentTargetDot').className = `dot ${goal?.observation === 'VERIFIED' ? 'online' : goal?.observation === 'VIOLATED' ? 'offline' : ''}`;
+    byId('intentCreate').disabled = !state.intentTargetSelected;
+    byId('intentMonitor').disabled = !state.intentTargetSelected;
+    if (state.intentTargetSelected) replace(byId('intentPreview'), [el('strong', { text: 'Typed GoalContract preview' }), kvTable([['Invariant', 'server_health'], ['Resource', 'fixed local Continuum service'], ['Expected', 'HTTP 200'], ['Observer', 'device.server.status']])]);
+  } catch (error) { byId('intentMessage').textContent = error.message; }
+}
+
+async function refreshLab() {
+  await refreshContinuum();
+  await Promise.allSettled([refreshMissionControl(), refreshChaosStage(), refreshProofLens(), refreshIntentCanvas()]);
+}
+
+async function saveIntentGoal(enabled) {
+  if (!state.intentTargetSelected) return;
+  try {
+    const result = await POST('/continuum', { description: byId('intentDescription').value.trim() || 'Keep my demonstration server healthy', invariant: 'server_health', resource: '', expected: true, interval: 5, enabled });
+    byId('intentMessage').textContent = `Goal Contract saved · ${result.goal_id}. Authorization remains per action.`;
+    await refreshLab();
+  } catch (error) { byId('intentMessage').textContent = error.message; }
+}
+
+async function labPost(path, body = {}) {
+  try {
+    const result = await POST(path, body);
+    const message = state.labTab === 'chaos' ? byId('chaosMessage') : state.labTab === 'proof' ? byId('proofConclusion') : byId('missionMessage');
+    if (message) message.textContent = result?.error || result?.state || 'Request completed; refresh for observed state.';
+    await refreshLab();
+    return result;
+  } catch (error) {
+    const message = state.labTab === 'chaos' ? byId('chaosMessage') : byId('missionMessage');
+    if (message) message.textContent = error.message;
+    throw error;
+  }
+}
+
+async function continuumCommand(path, payload) {
+  const message = byId('continuumMessage');
+  try {
+    const result = await POST(path, payload);
+    message.textContent = result?.error || result?.state || 'Save a goal first.';
+    await refreshContinuum();
+  } catch (error) {
+    message.textContent = error.message;
+  }
+}
+
+function parallelActor() { return { actor: { id: 'voiceos-local' } }; }
+
+function showParallelExecution(result) {
+  const id = result?.execution_id || '';
+  if (id) {
+    state.parallelExecutionId = id;
+    const diff = state.parallelDiffs.get(id);
+    if (diff !== undefined) byId('parallelDiff').textContent = diff || '(No file content changed.)';
+  }
+  if (result?.preview_id) state.parallelPreviewId = result.preview_id;
+  const stateLabel = result?.state || 'unknown';
+  byId('parallelMessage').textContent = result?.error || `Preview execution: ${stateLabel}${id ? ` · ${shortId(id)}` : ''}.`;
+  byId('parallelRefresh').disabled = !id;
+  void refreshParallelWorld();
+}
+
+async function submitParallelPreview() {
+  const button = byId('parallelPreview');
+  button.disabled = true;
+  state.parallelPreviewId = '';
+  state.parallelExecutionId = '';
+  byId('parallelApply').disabled = true;
+  byId('parallelMetrics').replaceChildren();
+  byId('parallelVerification').textContent = 'No real changes applied.';
+  byId('parallelMessage').textContent = 'Snapshotting workspace and evaluating the plan in a disposable shadow…';
+  byId('parallelDiff').textContent = 'Waiting for bounded shadow evaluation…';
+  try {
+    const operations = JSON.parse(byId('parallelOperations').value);
+    const result = await POST('/parallelworld/previews', { ...parallelActor(), operations }, { long: true });
+    showParallelExecution(result);
+    if (result.preview_id) {
+      byId('parallelMessage').textContent = `Preview ready · ${shortId(result.preview_id)}. Source remained unchanged.`;
+    } else if (result.state === 'waiting_permission' || result.state === 'requires_user') {
+      byId('parallelMessage').textContent = 'Preview needs file.read authorization. Review Approvals, then select “Check Preview / Approval.”';
+    }
+  } catch (error) {
+    byId('parallelMessage').textContent = error instanceof SyntaxError
+      ? `The operation plan is not valid JSON: ${error.message}` : error.message;
+    byId('parallelConflict').textContent = error.message;
+    byId('parallelConflict').dataset.state = 'conflict';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function refreshParallelWorld() {
+  const workspace = state.appState?.settings?.workspaceRoot || state.appState?.workspaceRoot || '';
+  byId('parallelWorkspace').value = workspace || 'No workspace configured in Settings';
+  if (!state.parallelPreviewId && state.parallelExecutionId) {
+    try {
+      const execution = await GET(`/executions/${encodeURIComponent(state.parallelExecutionId)}`);
+      const nodes = Object.values(execution.results || {});
+      const preview = nodes.find((node) => node.action_type === 'device.files.preview_plan');
+      if (preview?.result?.preview_id) state.parallelPreviewId = preview.result.preview_id;
+      if (execution.state === 'awaiting_approval' || execution.state === 'waiting_permission') {
+        byId('parallelMessage').textContent = 'Waiting for the named ActionMesh approval. No file operation has run.';
+      }
+    } catch (_) { /* the live request may still be settling */ }
+  }
+  if (!state.parallelPreviewId) {
+    await renderParallelHistory();
+    return;
+  }
+  try {
+    const data = await GET(`/parallelworld/previews/${encodeURIComponent(state.parallelPreviewId)}`);
+    replace(byId('parallelMetrics'), [
+      ['Files created', data.files_created], ['Files modified', data.files_modified],
+      ['Files moved', data.files_moved], ['Proposed for trash', data.files_proposed_for_trash],
+    ].map(([label, value]) => el('div', { class: 'metric-card' }, [
+      el('span', { class: 'metric-label', text: label }), el('strong', { class: 'metric-value', text: String(value ?? 0) }),
+    ])));
+    byId('parallelPermissions').textContent = `Required scopes: ${(data.permission_requirements || []).join(', ') || 'none'}`;
+    byId('parallelConflict').textContent = data.source_current
+      ? 'No conflicts detected. Apply rechecks every captured file identity and SHA-256 immediately before dispatch.'
+      : 'Conflict detected: a source file changed after this preview. Preview the plan again before applying.';
+    byId('parallelConflict').dataset.state = data.source_current ? 'ok' : 'conflict';
+    byId('parallelIsolation').textContent = `Preview ${shortId(data.preview_id)} · ${Object.keys(data.source_hashes || {}).length} source files hashed · original files were unchanged during preview.`;
+    byId('parallelApply').disabled = Boolean(data.apply_started) || !data.source_current;
+    byId('parallelApply').dataset.preview = data.preview_id;
+    if (data.execution) {
+      const checks = data.execution.results || {};
+      const values = Object.values(checks);
+      const verified = values.filter((item) => item.verified === true).length;
+      const checked = values.filter((item) => item.action_type).length;
+      byId('parallelVerification').textContent = data.execution.state === 'success'
+        ? `Verified ${verified} of ${checked} action results independently. Execution ${shortId(data.execution.execution_id)}.`
+        : `Execution ${data.execution.state}; ${verified}/${checked} independently verified. ${data.execution.error || 'Review Approvals or History for the next step.'}`;
+      byId('parallelHistory').textContent = `Preview ${shortId(data.preview_id)} · apply execution ${shortId(data.execution.execution_id)} · ${data.execution.state}`;
+    }
+    await renderParallelHistory();
+  } catch (error) {
+    byId('parallelMessage').textContent = error.message;
+  }
+}
+
+async function renderParallelHistory() {
+  try {
+    const rows = await GET('/parallelworld/previews');
+    replace(byId('parallelHistory'), rows.length ? rows.slice(0, 12).map((row) => {
+      const button = el('button', { class: 'btn ghost small', type: 'button', text: `${shortId(row.preview_id)} · ${row.apply_state} · ${row.operations} operations · ${timeAgo(row.created_at)}` });
+      button.addEventListener('click', () => {
+        state.parallelPreviewId = row.preview_id;
+        state.parallelExecutionId = row.apply_execution_id || '';
+        void refreshParallelWorld();
+      });
+      return button;
+    }) : el('p', { class: 'empty', text: 'No ParallelWorld executions yet.' }));
+  } catch (error) {
+    byId('parallelHistory').textContent = `History unavailable: ${error.message}`;
+  }
+}
+
+async function applyParallelPlan() {
+  const id = state.parallelPreviewId;
+  if (!id) return;
+  const button = byId('parallelApply');
+  button.disabled = true;
+  byId('parallelMessage').textContent = 'Rechecking source identities and hashes before submitting the exact previewed operations…';
+  try {
+    const result = await POST(`/parallelworld/previews/${encodeURIComponent(id)}/apply`, parallelActor(), { long: true });
+    if (result.execution_id) state.parallelExecutionId = result.execution_id;
+    byId('parallelVerification').textContent = result.independent_verification
+      ? `Independent verification: ${result.independent_verification.verified}/${result.independent_verification.checks} checks verified · ${result.independent_verification.state}.`
+      : `Execution state: ${result.state}. ActionMesh may be waiting for per-action approval.`;
+    byId('parallelMessage').textContent = result.state === 'success'
+      ? 'Plan applied and independently verified.'
+      : `Apply submitted · ${result.state}. Review the named per-action approvals if requested.`;
+    await refreshParallelWorld();
+  } catch (error) {
+    byId('parallelMessage').textContent = error.message;
+    byId('parallelConflict').textContent = error.message;
+    byId('parallelConflict').dataset.state = 'conflict';
+    button.disabled = false;
+  }
+}
+
 function refreshCurrent() {
   switch (state.view) {
     case 'home': return refreshHome();
     case 'tasks': return refreshTasks();
     case 'automations': return refreshAutomations();
+    case 'continuum': return refreshLab();
+    case 'parallelworld': return refreshParallelWorld();
     case 'history': {
       // The automations history and the executions history share the view.
       // Each owns its own list; the executions list stays silent until its
@@ -5179,6 +5592,88 @@ function wire() {
     refreshCurrent();
   });
   bridge.onStreamStatus((status) => applyStreamStatus(status));
+  byId('continuumForm')?.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void continuumCommand('/continuum', {
+      description: byId('continuumDescription').value,
+      invariant: byId('continuumInvariant').value,
+      resource: byId('continuumResource').value.trim(),
+      expected: byId('continuumExpected').value === 'true',
+      interval: Number(byId('continuumInterval').value),
+      enabled: byId('continuumEnabled').checked,
+    });
+  });
+  byId('continuumCheck')?.addEventListener('click', () => void continuumCommand('/continuum/check'));
+  byId('continuumStop')?.addEventListener('click', () => void continuumCommand('/continuum/stop-demo'));
+  byId('continuumApprovals')?.addEventListener('click', () => showView('approvals'));
+  document.querySelectorAll('[data-lab-tab]').forEach((button) => button.addEventListener('click', () => {
+    setLabTab(button.dataset.labTab);
+    if (state.labTab === 'mission') void refreshMissionControl();
+    else if (state.labTab === 'chaos') void refreshChaosStage();
+    else if (state.labTab === 'proof') void refreshProofLens();
+    else if (state.labTab === 'intent') void refreshIntentCanvas();
+    else void refreshContinuum();
+  }));
+  byId('missionRefresh')?.addEventListener('click', () => void refreshMissionControl());
+  byId('missionApprovals')?.addEventListener('click', () => showView('approvals'));
+  byId('missionCreateGoal')?.addEventListener('click', () => { setLabTab('intent'); state.intentTargetSelected = true; void refreshIntentCanvas(); });
+  byId('missionOpenChaos')?.addEventListener('click', () => setLabTab('chaos'));
+  byId('missionEvidence')?.addEventListener('click', () => showView('history'));
+  byId('missionVerify')?.addEventListener('click', () => { setLabTab('mission'); void labPost('/continuum/check'); });
+  byId('missionStop')?.addEventListener('click', async () => {
+    const message = byId('missionMessage');
+    try {
+      const records = await GET('/executions?limit=100');
+      const active = records.filter((item) => ['executing', 'running', 'pending', 'waiting_permission', 'awaiting_approval'].includes(item.state));
+      const results = await Promise.allSettled(active.map((item) => POST(`/executions/${encodeURIComponent(item.execution_id)}/cancel`)));
+      const requested = results.filter((item) => item.status === 'fulfilled').length;
+      message.textContent = active.length ? `Cancellation requested for ${requested}/${active.length} active executions. Recheck each record; completed side effects cannot be undone.` : 'No active executions to cancel.';
+      await refreshMissionControl();
+    } catch (error) { message.textContent = `Emergency Stop could not request cancellation: ${error.message}`; }
+  });
+  byId('chaosPrepare')?.addEventListener('click', async () => {
+    try {
+      const goal = await GET('/continuum');
+      if (!goal || goal.contract.invariant !== 'server_health') {
+        await POST('/continuum', { description: 'Keep my demonstration server healthy', invariant: 'server_health', resource: '', expected: true, interval: 5, enabled: true });
+      } else if (!goal.contract.enabled) {
+        await POST('/continuum', { ...goal.contract, enabled: true });
+      }
+      await labPost('/continuum/check');
+      byId('chaosMessage').textContent = 'Environment prepared through GoalGuard. Check the approval queue if a managed start is required.';
+    } catch (error) { byId('chaosMessage').textContent = error.message; }
+  });
+  byId('chaosFault')?.addEventListener('click', () => { setLabTab('chaos'); void labPost('/continuum/stop-demo'); });
+  byId('chaosVerify')?.addEventListener('click', () => { setLabTab('chaos'); void labPost('/continuum/check'); });
+  byId('chaosPause')?.addEventListener('click', async () => {
+    try { const goal = await GET('/continuum'); if (!goal) throw new Error('Prepare a Goal Contract first.'); await POST('/continuum', { ...goal.contract, enabled: false }); byId('chaosMessage').textContent = 'Monitoring paused. Existing execution approvals remain governed by ActionMesh.'; await refreshLab(); }
+    catch (error) { byId('chaosMessage').textContent = error.message; }
+  });
+  byId('chaosReset')?.addEventListener('click', async () => {
+    try { const goal = await GET('/continuum'); if (!goal) throw new Error('Prepare a Goal Contract first.'); await POST('/continuum', { ...goal.contract, enabled: true }); await labPost('/continuum/check'); byId('chaosMessage').textContent = 'Challenge reset requested. GoalGuard will observe and any repair will wait for required approval.'; }
+    catch (error) { byId('chaosMessage').textContent = error.message; }
+  });
+  byId('chaosApprovals')?.addEventListener('click', () => showView('approvals'));
+  byId('proofRefresh')?.addEventListener('click', async () => { setLabTab('proof'); try { await POST('/continuum/check'); await refreshProofLens(); } catch (error) { byId('proofConclusion').textContent = error.message; } });
+  byId('proofAudit')?.addEventListener('click', () => showView('history'));
+  byId('intentTarget')?.addEventListener('click', () => {
+    state.intentTargetSelected = true;
+    byId('intentTarget').setAttribute('aria-pressed', 'true');
+    byId('intentTargetNote').textContent = 'Selected target maps to the fixed local Continuum service and its registered server_health observer.';
+    void refreshIntentCanvas();
+  });
+  byId('intentInspect')?.addEventListener('click', async () => {
+    if (!state.intentTargetSelected) { byId('intentMessage').textContent = 'Select the supported demo target first.'; return; }
+    try { await POST('/continuum/check'); await refreshIntentCanvas(); byId('intentMessage').textContent = 'Target inspected through the existing GoalGuard observer.'; }
+    catch (error) { byId('intentMessage').textContent = error.message; }
+  });
+  byId('intentCreate')?.addEventListener('click', () => void saveIntentGoal(false));
+  byId('intentMonitor')?.addEventListener('click', () => void saveIntentGoal(true));
+  byId('intentGoalGuard')?.addEventListener('click', () => setLabTab('goalguard'));
+  byId('parallelPreview')?.addEventListener('click', () => void submitParallelPreview());
+  byId('parallelRefresh')?.addEventListener('click', () => void refreshParallelWorld());
+  byId('parallelApply')?.addEventListener('click', () => void applyParallelPlan());
+  byId('parallelApprovals')?.addEventListener('click', () => showView('approvals'));
   bridge.onStreamEvent((event) => handleStreamEvent(event));
   bridge.onNavigate((payload) => {
     if (payload && payload.view) showView(payload.view);

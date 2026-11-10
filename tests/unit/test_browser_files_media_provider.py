@@ -102,7 +102,7 @@ def _ledger_row(store: SQLiteStore, action: Action) -> dict:
 
 
 # =============================================================================
-# Registration: the 33 C42 operations are in IMPLEMENTED, gated, and advertised
+# Registration: browser, file, and media operations are implemented and gated.
 # =============================================================================
 
 class TestC42Registration(unittest.TestCase):
@@ -111,12 +111,12 @@ class TestC42Registration(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         self.provider = LaptopProvider(Workspace(self.root))
 
-    def test_the_33_operations_are_registered_and_supported(self) -> None:
+    def test_operations_are_registered_and_supported(self) -> None:
         browser = {c for c in CAPABILITIES if c.startswith("browser.")}
         files = {c for c in CAPABILITIES if c.startswith("device.files.")}
         media = {c for c in CAPABILITIES if c.startswith("media.")}
         self.assertEqual(len(browser), 14, browser)
-        self.assertEqual(len(files), 11, files)
+        self.assertEqual(len(files), 13, files)
         self.assertEqual(len(media), 8, media)
         for capability in browser | files | media:
             self.assertIn(capability, IMPLEMENTED, capability)

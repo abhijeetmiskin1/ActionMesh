@@ -16,12 +16,14 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from actionmesh.agent import parallelworld
 from actionmesh.agent.browser_bridge import browser_bridge_config_from_env
 from actionmesh.agent.commands import CommandPolicy
 from actionmesh.agent.config import AgentConfig, AgentConfigError
 from actionmesh.agent.definitions import PROVIDER, register_device_actions
 from actionmesh.agent.paths import Workspace
 from actionmesh.agent.presence import LaptopAgent
+from actionmesh.agent.processes import CONTINUUM_NAME
 from actionmesh.agent.provider import LaptopProvider
 from actionmesh.agent.runner import CommandRunner
 from actionmesh.agent.verification import register_device_strategies
@@ -30,6 +32,7 @@ from actionmesh.core.config import AppConfig
 from actionmesh.core.credentials import Credential, CredentialError, CredentialStore
 from actionmesh.core.devices import DeviceRegistry, SQLiteDeviceRegistry
 from actionmesh.core.executor import ExecutionEngine
+from actionmesh.core.graph.builder import graph_from_actions
 from actionmesh.core.graph.errors import GraphError
 from actionmesh.core.graph.serialization import graph_from_dict
 from actionmesh.core.identity import IdentityError, IdentityStore, SQLiteIdentityStore
@@ -57,6 +60,7 @@ from actionmesh.dashboard import (
     service_worker as service_worker_source,
 )
 from actionmesh.protocol.models import (
+    Action,
     ActionGraph,
     ApprovalRequest,
     DeviceInfo,
@@ -69,6 +73,7 @@ from actionmesh.protocol.models import (
 )
 from actionmesh.protocol.validate import validate_action, validate_identity
 from actionmesh.providers import default_mock_providers
+from actionmesh.providers.base import ProviderError
 from actionmesh.voice import page as voice_page
 from actionmesh.voiceos import (
     Orchestrator,
@@ -81,6 +86,7 @@ from actionmesh.voiceos import (
 from actionmesh.voiceos.automation_run import Runner, schedule_next
 from actionmesh.voiceos.automation_scheduler import Scheduler, summarize_run
 from actionmesh.voiceos.automation_store import AutomationStore
+from actionmesh.voiceos.continuum import Continuum, GoalContract, GoalState
 from actionmesh.voiceos.diagnosis import unobserved
 from actionmesh.voiceos.diagnosis_flow import (
     analysis_step,
@@ -269,10 +275,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # reconciliation was about to account for.
         app.state.startup_automation_missed = scheduler.reconcile()
         scheduler.start()
+    continuum = app.state.continuum
+    continuum_task = asyncio.create_task(continuum.monitor(stop))
     try:
         yield
     finally:
         stop.set()
+        await asyncio.gather(continuum_task, return_exceptions=True)
+        continuum.db.close()
         # Stop the ticker before anything it could be writing to is closed. Its own
         # lock guarantees it is not mid-`execute` when this returns.
         if scheduler is not None:
@@ -2299,6 +2309,219 @@ def create_app(
         # Requested, not confirmed. Whether it stopped is answered by the record on the
         # next read, exactly as the cancel route itself promises.
         return {"status": "requested", "execution_id": execution_id}
+
+    continuum = Continuum(
+        str(Path(app_config.audit_db).with_name("continuum.db")) if app_config.audit_db else ":memory:",
+        app.state.voiceos_orchestrator,
+        lambda: _context({"actor": {"id": "voiceos-local"}}, app.state.consent_store),
+        _voiceos_local_device_id,
+    )
+    app.state.continuum = continuum
+
+    def _continuum_local(request: Request) -> None:
+        if not _is_local(request) or getattr(request.state, "credential", None) is not None:
+            raise HTTPException(status_code=403, detail="Continuum is local operator only")
+
+    @app.get("/continuum")
+    async def continuum_get(request: Request) -> dict[str, Any] | None:
+        _continuum_local(request)
+        goal = continuum.read()
+        if goal and goal["observed_at"] and goal["observation"] == "VERIFIED":
+            from datetime import UTC, datetime
+
+            age = datetime.now(UTC) - datetime.fromisoformat(goal["observed_at"])
+            if age.total_seconds() > 2 * goal["contract"]["interval"]:
+                goal["observation"] = "STALE"
+        return goal
+
+    @app.post("/continuum")
+    async def continuum_save(request: Request, contract: GoalContract) -> dict[str, Any]:
+        _continuum_local(request)
+        async with continuum.lock:
+            existing = continuum.read()
+            if existing is None:
+                device = _voiceos_local_device_id()
+                if not device:
+                    raise HTTPException(status_code=409, detail="Enable the local laptop agent first")
+                goal = GoalState(contract=contract, device_id=device)
+            else:
+                goal = GoalState.model_validate(existing)
+                changed_target = (goal.contract.invariant, goal.contract.resource, goal.contract.expected) != (
+                    contract.invariant, contract.resource, contract.expected,
+                )
+                if changed_target:
+                    if goal.pending or goal.stop_pending:
+                        raise HTTPException(status_code=409, detail="Resolve the pending repair first")
+                    goal = GoalState(contract=contract, device_id=goal.device_id)
+                else:
+                    goal.contract = contract
+                    goal.revision += 1
+            continuum.event(goal, "INITIALIZING" if contract.enabled else "DISABLED",
+                            "Monitoring enabled" if contract.enabled else "Monitoring disabled")
+            return goal.model_dump()
+
+    @app.post("/continuum/check")
+    async def continuum_check(request: Request) -> dict[str, Any] | None:
+        _continuum_local(request)
+        await continuum.tick()
+        return continuum.read()
+
+    @app.post("/continuum/stop-demo")
+    async def continuum_stop_demo(request: Request) -> dict[str, Any]:
+        _continuum_local(request)
+        async with continuum.lock:
+            saved = continuum.read()
+            if (not saved or saved["contract"]["invariant"] != "server_health"
+                or saved["state"] not in {"HEALTHY", "RECOVERED"}
+                or saved["pending"] or saved["stop_pending"]):
+                raise HTTPException(status_code=409, detail="Verify the dedicated service first")
+            goal = GoalState.model_validate(saved)
+            step = await continuum.run_action(goal, "device.server.stop", {"name": CONTINUUM_NAME})
+            return {"state": step.state, "execution_id": step.execution_id, "error": step.error}
+
+    # -- ParallelWorld: preview is a registered read capability; apply is a
+    # server-minted sequence of ordinary file actions through this same engine.
+    def _parallel_workspace() -> Workspace:
+        agent = getattr(app.state, "agent", None)
+        root = getattr(getattr(agent, "config", None), "workspace_root", "")
+        if not root:
+            raise HTTPException(status_code=409, detail="Configure the laptop agent workspace first")
+        try:
+            return Workspace(root)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail="Configured workspace is unavailable") from exc
+
+    def _parallel_local(request: Request) -> None:
+        if not _is_local(request) or getattr(request.state, "credential", None) is not None:
+            raise HTTPException(status_code=403, detail="ParallelWorld is available to the local operator only")
+
+    @app.post("/parallelworld/previews")
+    async def parallelworld_preview(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        _parallel_local(request)
+        if "grants" in payload:
+            raise HTTPException(status_code=400, detail="permission grants are server-side; use /consents")
+        if not engine.registry.has("device.files.preview_plan"):
+            raise HTTPException(status_code=409, detail="ParallelWorld preview capability is unavailable")
+        action = validate_action({
+            "type": "device.files.preview_plan",
+            "provider": PROVIDER,
+            "parameters": {"operations": payload.get("operations")},
+        })
+        graph = graph_from_actions([action], intent="Preview proposed workspace file operations")
+        context = _context(
+            {"actor": payload.get("actor"), "policy": {"rules": [
+                {"action": "device.files.preview_plan", "decision": "allow"},
+            ]}}, app.state.consent_store,
+            credential=getattr(request.state, "credential", None),
+            credentials=app.state.credentials,
+        )
+        result = await engine.execute(graph, context)
+        body = result.to_dict()
+        preview_id = next((str(node.get("result", {}).get("preview_id") or "")
+                           for node in body.get("nodes", {}).values()
+                           if node.get("action_type") == "device.files.preview_plan"), "")
+        body["preview_id"] = preview_id
+        saved = parallelworld.get_preview(preview_id) if preview_id else None
+        body["source_unchanged"] = bool(saved and parallelworld.check_fresh(_parallel_workspace(), saved))
+        if preview_id and saved is not None:
+            saved.actor_id = context.actor.id if context.actor is not None else "voiceos-local"
+        return body
+
+    @app.get("/parallelworld/previews")
+    def parallelworld_history(request: Request) -> list[dict[str, Any]]:
+        _parallel_local(request)
+        history: list[dict[str, Any]] = []
+        for record in parallelworld.list_previews():
+            execution = engine.record(record.apply_execution_id) if record.apply_execution_id else None
+            history.append({
+                "preview_id": record.preview_id,
+                "created_at": record.created_at.isoformat(),
+                "operations": len(record.operations),
+                **parallelworld.summary_counts(record),
+                "apply_started": record.apply_started,
+                "apply_execution_id": record.apply_execution_id,
+                "apply_state": execution.state.value if execution is not None else "not_applied",
+            })
+        return history
+
+    @app.get("/parallelworld/previews/{preview_id}")
+    def parallelworld_get(request: Request, preview_id: str) -> dict[str, Any]:
+        _parallel_local(request)
+        scope = _record_scope(request)
+        record = parallelworld.get_preview(preview_id)
+        if record is None or (scope is not None and record.actor_id != scope):
+            raise HTTPException(status_code=404, detail="preview not found or expired")
+        result: dict[str, Any] = {
+            "preview_id": record.preview_id,
+            **parallelworld.summary_counts(record),
+            "permission_requirements": sorted({"file.read", *({"file.delete"} if any(x["op"] == "trash" for x in record.operations) else set()), *({"file.write"} if any(x["op"] != "trash" for x in record.operations) else set())}),
+            "source_hashes": {path: item["sha256"] for path, item in parallelworld.unchanged_proof(record).items()},
+            "source_unchanged_during_preview": True,
+            "apply_started": record.apply_started,
+        }
+        execution_record = None
+        if record.apply_execution_id:
+            execution_record = engine.record(record.apply_execution_id)
+            if execution_record is not None and (scope is None or execution_record.actor_id == scope):
+                result["execution"] = execution_record.model_dump()
+        workspace = _parallel_workspace()
+        if execution_record is not None and execution_record.state.value == "success":
+            result["source_current"] = parallelworld.check_expected(
+                workspace, record.after, require_identity=False
+            )
+        else:
+            result["source_current"] = parallelworld.check_fresh(workspace, record)
+        return result
+
+    @app.post("/parallelworld/previews/{preview_id}/apply")
+    async def parallelworld_apply(request: Request, preview_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        _parallel_local(request)
+        if "grants" in payload:
+            raise HTTPException(status_code=400, detail="permission grants are server-side; use /consents")
+        workspace = _parallel_workspace()
+        record = parallelworld.get_preview(preview_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="preview not found or expired")
+        scope = _record_scope(request)
+        if scope is not None and record.actor_id != scope:
+            raise HTTPException(status_code=404, detail="preview not found or expired")
+        try:
+            record = parallelworld.reserve_apply(workspace, preview_id)
+        except ProviderError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        actions: list[Action] = []
+        action_types = {
+            "create": "device.files.create", "edit": "device.files.edit",
+            "copy": "device.files.copy", "rename": "device.files.rename",
+            "move": "device.files.move", "trash": "device.files.trash",
+        }
+        for operation in record.operations:
+            params = {key: value for key, value in operation.items() if key != "op"}
+            actions.append(validate_action({
+                "type": action_types[operation["op"]],
+                "provider": PROVIDER,
+                "parameters": params,
+            }))
+        graph = graph_from_actions(actions, intent=f"Apply approved ParallelWorld preview {preview_id}")
+        context = _context(
+            {"actor": payload.get("actor"), "policy": {"rules": [
+                {"action": action_types[item["op"]], "decision": "allow"}
+                for item in record.operations
+            ]}}, app.state.consent_store,
+            credential=getattr(request.state, "credential", None),
+            credentials=app.state.credentials,
+        )
+        result = await engine.execute(graph, context)
+        record.apply_execution_id = result.execution_id
+        body = result.to_dict()
+        body["preview_id"] = preview_id
+        body["independent_verification"] = {
+            "checks": sum(1 for node in result.nodes.values() if node.verification is not None),
+            "verified": sum(1 for node in result.nodes.values() if node.verified is True),
+            "all_verified": result.state.value == "success" and bool(result.nodes) and result.all_verified,
+            "state": result.state.value,
+        }
+        return body
 
     # -- automations (C39) -------------------------------------------------
     #

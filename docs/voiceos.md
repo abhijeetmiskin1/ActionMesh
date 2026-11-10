@@ -128,6 +128,6 @@ python -m unittest tests.unit.test_voiceos    # sessions, steps, references, the
 python -m unittest tests.unit.test_docs_freshness
 ```
 
-The in-browser pass for slice 1 is recorded on `TASK_BOARD.md` under C32: what was driven
+The in-browser pass for slice 1 recorded what was driven
 with a real recognizer stubbed (no microphone hardware was available in that environment),
 which requests the page actually made, and what therefore remains unverified.

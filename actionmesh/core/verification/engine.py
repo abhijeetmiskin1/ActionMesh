@@ -133,7 +133,15 @@ class VerificationEngine:
             )
 
         # 2. What the world looks like now. Weight 3 — the real check.
-        verdict, detail = self._assess(action, _observed(provider, action))
+        observation = _observed(provider, action)
+        verdict, detail = self._assess(action, observation)
+        if verdict == "match" and observation is not None:
+            observed_fields = observation.get("result_fields", {})
+            if any(
+                type(result.data.get(key)) is not type(value) or result.data.get(key) != value
+                for key, value in observed_fields.items()
+            ):
+                verdict, detail = "mismatch", "result changed during independent verification"
         if verdict == "match":
             evidence.append(Evidence("observed_state", detail))
         elif verdict == "mismatch":

@@ -23,6 +23,14 @@ from typing import Any
 SAFE_RESULT_KEYS = frozenset(
     {
         "path",
+        "preview_id",
+        "files_created",
+        "files_modified",
+        "files_moved",
+        "files_proposed_for_trash",
+        "files_changed",
+        "diff_bytes",
+        "permission_requirements",
         "relative",
         "bytes",
         "size",

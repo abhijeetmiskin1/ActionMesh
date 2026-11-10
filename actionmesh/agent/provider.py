@@ -34,7 +34,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from actionmesh.agent import apps, connectors
+from actionmesh.agent import apps, connectors, parallelworld
 from actionmesh.agent.browser import BridgeDriver, BrowserEngine
 from actionmesh.agent.browser_bridge import BrowserBridgeConfig
 from actionmesh.agent.browser_bridge import make_request as _make_browser_request
@@ -50,12 +50,16 @@ from actionmesh.agent.ides import KNOWN_IDES, EditorDiscovery, EditorNotFound
 from actionmesh.agent.media import MediaEngine, MprisMediaDriver
 from actionmesh.agent.paths import ResolvedPath, Workspace
 from actionmesh.agent.processes import (
+    CONTINUUM_ARGUMENTS,
+    CONTINUUM_NAME,
+    CONTINUUM_PORT,
     EXITED,
     RUNNING,
     STOPPED,
     MissingServerName,
     ProcessRecord,
     ProcessRegistry,
+    continuum_http_ready,
     is_listening,
     stop_group,
 )
@@ -152,6 +156,7 @@ class LaptopProvider(ActionProvider):
             "device.files.list",
             "device.files.search",
             "device.files.read",
+            "device.files.compare",
             "device.files.open",
             "device.files.info",
             "device.files.create",
@@ -160,6 +165,7 @@ class LaptopProvider(ActionProvider):
             "device.files.copy",
             "device.files.edit",
             "device.files.trash",
+            "device.files.preview_plan",
             # C42: local playback through the MPRIS adapter (read-back verified).
             "media.status",
             "media.play",
@@ -229,6 +235,7 @@ class LaptopProvider(ActionProvider):
             "device.files.list",
             "device.files.search",
             "device.files.read",
+            "device.files.compare",
             "device.files.open",
             "device.files.info",
             "device.files.create",
@@ -237,6 +244,7 @@ class LaptopProvider(ActionProvider):
             "device.files.copy",
             "device.files.edit",
             "device.files.trash",
+            "device.files.preview_plan",
             # C42: media operations round-trip to the player over D-Bus.
             "media.status",
             "media.play",
@@ -435,6 +443,7 @@ class LaptopProvider(ActionProvider):
             "device.files.list": lambda: self._files_list(action),
             "device.files.search": lambda: self._files_search(action),
             "device.files.read": lambda: self._files_read(action),
+            "device.files.compare": lambda: self._files_compare(action),
             "device.files.open": lambda: self._files_open(action),
             "device.files.info": lambda: self._files_info(action),
             "device.files.create": lambda: self._files_create(action),
@@ -443,6 +452,7 @@ class LaptopProvider(ActionProvider):
             "device.files.copy": lambda: self._files_copy(action),
             "device.files.edit": lambda: self._files_edit(action),
             "device.files.trash": lambda: self._files_trash(action),
+            "device.files.preview_plan": lambda: self._files_preview_plan(action),
             # C42 — local playback through MPRIS. Each is a read-back
             # verified command on the media engine.
             "media.status": lambda: self._media_status(action),
@@ -673,6 +683,12 @@ class LaptopProvider(ActionProvider):
         }
         return result
 
+    async def _files_compare(self, action: Action) -> dict[str, Any]:
+        changed = await asyncio.to_thread(
+            self._files_engine().compare, action.parameters["left"], action.parameters["right"],
+        )
+        return {"changed": changed}
+
     async def _files_open(self, action: Action) -> dict[str, Any]:
         engine = self._files_engine()
         path = action.parameters.get("path", "")
@@ -764,6 +780,20 @@ class LaptopProvider(ActionProvider):
             "trashed": result.get("trashed", False),
         }
         return result
+
+    async def _files_preview_plan(self, action: Action) -> dict[str, Any]:
+        if self.workspace is None:
+            raise ProviderError("no workspace configured", FailureKind.AUTHORIZATION)
+        record, summary = await asyncio.to_thread(
+            parallelworld.preview, self.workspace, action.parameters.get("operations")
+        )
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "preview_id": record.preview_id,
+            "operations": action.parameters.get("operations"),
+        }
+        return {**summary, "diff": record.diff}
 
     # -- C42: media -------------------------------------------------------
     async def _media_status(self, action: Action) -> dict[str, Any]:
@@ -932,6 +962,11 @@ class LaptopProvider(ActionProvider):
             emit = output_callback()
             if emit is not None:
                 emit("files.preview", str(data.get("preview") or ""))
+            return
+        if action.type == "device.files.preview_plan":
+            emit = output_callback()
+            if emit is not None:
+                emit("parallelworld.diff", str(data.get("diff") or ""))
             return
         # C42 — the browser. ``BrowserEngine`` already emits ``browser.url``,
         # ``browser.title`` and ``browser.elements`` itself via the same
@@ -1287,6 +1322,11 @@ class LaptopProvider(ActionProvider):
         name = str(params.get("name") or "").strip() if server else ""
         port = self._port(params) if server else None
         label = name or str(params.get("label") or "").strip()
+        if name == CONTINUUM_NAME and (
+            params.get("command") != "python3" or decision.arguments != CONTINUUM_ARGUMENTS
+            or port != CONTINUUM_PORT or params.get("working_directory")
+        ):
+            raise ProviderError("The Continuum server name is reserved.", FailureKind.INVALID_INPUT)
         # Everything that could make this request impossible is settled *before* the
         # process exists. `reserve` covers the name and the child cap; a refusal
         # afterwards would leave an owned-by-nobody process holding a port.
@@ -1395,12 +1435,17 @@ class LaptopProvider(ActionProvider):
             entry["listening"] = (
                 await is_listening(record.port) if record.port else None
             )
+            if (name == CONTINUUM_NAME and record.port == CONTINUUM_PORT
+                and record.arguments == CONTINUUM_ARGUMENTS and record.state == "running"):
+                entry["ready"] = await continuum_http_ready()
             entries.append(entry)
         result = {
             "servers": entries,
             "count": len(entries),
             "running": self.processes.running(),
         }
+        if name == CONTINUUM_NAME:
+            result["listening"] = await is_listening(CONTINUUM_PORT)
         self._effects[action.action_id] = {
             "action_type": action.type,
             "idempotency_key": action.idempotency_key,
@@ -2071,6 +2116,11 @@ class LaptopProvider(ActionProvider):
         description it would have read before one. Otherwise the same successful action
         would be evidenced two different ways depending on who was watching.
         """
+        if action.type == "device.files.preview_plan":
+            # Preview operations may contain proposed replacement text. The preview
+            # itself is verified live, but those parameters must never be serialized
+            # into the process/effect ledger.
+            return
         if self._effects.get(action.action_id) is None:
             return
         seen = self.observe(action)
@@ -2303,6 +2353,19 @@ class LaptopProvider(ActionProvider):
                 "parameters": {"app": app},
                 "state": {"running": running},
             }
+        if action.type == "device.files.preview_plan":
+            effect = self._effects.get(action.action_id)
+            if self.workspace is None or effect is None:
+                return None
+            record = parallelworld.get_preview(str(effect.get("preview_id") or ""))
+            if record is None or not parallelworld.check_fresh(self.workspace, record):
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"operations": action.parameters.get("operations")},
+                "state": {"preview_id": record.preview_id},
+            }
         # -- C42 readonly file probes (live re-read, no effect, no ledger) ----
         # list/search/info/open are reads: the handlers deliberately record no
         # effect, and test_browser_files_media_provider pins that ("Reads do not
@@ -2343,6 +2406,19 @@ class LaptopProvider(ActionProvider):
                 "idempotency_key": action.idempotency_key,
                 "parameters": {"path": fresh.get("path"), "pattern": action.parameters.get("pattern", "")},
                 "state": {"count": fresh.get("count")},
+            }
+        if action.type == "device.files.compare":
+            if self.files is None:
+                return None
+            try:
+                changed = self.files.compare(action.parameters["left"], action.parameters["right"])
+            except (AgentError, ProviderError, OSError):
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": dict(action.parameters),
+                "result_fields": {"changed": changed},
             }
         if action.type == "device.files.info":
             if self.files is None:

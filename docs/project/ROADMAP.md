@@ -1,6 +1,6 @@
 # Roadmap
 
-*Derived from `TASK_BOARD.md`, `docs/c42-*`, and the source. The
+*Derived from `docs/c42-*`, and the source. The
 2026-11-08 acceptance run is recorded in
 [Testing and Acceptance](TESTING_AND_ACCEPTANCE.md).*
 
@@ -11,7 +11,7 @@
 | P0-1 | Live-verify MPRIS media against a real player | **DONE (2026-11-08)** — mpv on an isolated Debian D-Bus session | `actionmesh/agent/media.py`, `tests/e2e/test_phase4_live_acceptance.py` | Linux with a dedicated MPRIS player | Status, play, pause and volume confirmed by player readback | Opt-in mpv test passed. A separate run also confirmed local file opening | Linux session bus and test player |
 | P0-2 | Live browser acceptance | **DONE (2026-11-08)** — real Electron bridge on macOS | `desktop/app/browser_window.js`, `tests/e2e/` | Electron app + backend | Public-site navigation and search, plus click and sign-in handoff on a controlled page | Real readback from Example Domain, DuckDuckGo, IRCTC and Zomato. Loopback click reached the gate and a second click was refused | Electron bridge and network access for public sites |
 | P0-3 | Verify CSP + header posture in the Electron shell | **DONE (2026-11-04)** — CSP verified at `desktop/ui/index.html:5`: `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'` | `desktop/ui/index.html` | — | CSP documented in [SECURITY_MODEL.md](SECURITY_MODEL.md) with a test | Source read, 2026-11-04 | — |
-| P0-4 | Refresh stale root docs (`README.md` status table/counts) | **DONE (2026-11-04)** — README/PROJECT/HANDOFF/CURRENT_STATUS/ROADMAP/AI_HANDOFF rewritten with source-verified numbers (60 ops, 49 routes, CSP, 150 MB deb, fail-closed submit, MPRIS not live-verified); "What is NOT done / BLOCKED" added; historical counts labeled | `README.md`, `PROJECT.md`, `HANDOFF.md`, `docs/project/CURRENT_STATUS.md` | This documentation package | Counts match source; historical labeled | Grep cross-check of every number; `test_voiceos.py` 40 passed | — |
+| P0-4 | Refresh stale root docs (`README.md` status table/counts) | **DONE (2026-11-04)** — README/PROJECT/CURRENT_STATUS/ROADMAP rewritten with source-verified numbers (60 ops, 49 routes, CSP, 150 MB deb, fail-closed submit, MPRIS not live-verified); "What is NOT done / BLOCKED" added; historical counts labeled | `README.md`, `PROJECT.md`, `docs/project/CURRENT_STATUS.md` | This documentation package | Counts match source; historical labeled | Grep cross-check of every number; `test_voiceos.py` 40 passed | — |
 
 ## P1 — Actual user-facing capabilities
 

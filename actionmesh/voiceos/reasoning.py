@@ -14,12 +14,13 @@ work by guessing at a process, and it never becomes an approval.
 from __future__ import annotations
 
 import re
+import shlex
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS
+from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS, MAC_APPS
 from actionmesh.agent.connectors import DRIVE_SEARCH, GITHUB_ISSUES, GITHUB_REPOS
 from actionmesh.core.planner import Planner
 from actionmesh.voiceos.models import Conversation, TaskSession, TaskStep
@@ -549,6 +550,47 @@ class Reasoner:
                              device_id=session.device_id)
 
     def _task(self, request: str, conversation: Conversation) -> Understanding:
+        compare = re.match(r"compare workspace files\s+(.+)", request, re.I)
+        if compare is not None:
+            try:
+                parts = shlex.split(compare[1])
+            except ValueError:
+                parts = []
+            if len(parts) != 3 or parts[1].lower() != "and" or not parts[0] or not parts[2]:
+                return Understanding(
+                    kind="answer", reply='Say Compare workspace files "first path" and "second path".',
+                )
+            action = "device.files.compare"
+            if not self.known_action(action):
+                return Understanding(kind="answer", reply="Workspace file comparison is unavailable.")
+            session = self._session(request, [
+                TaskStep(index=0, label="Compare workspace files", action_type=action,
+                         parameters={"left": parts[0], "right": parts[2]}),
+            ], conversation)
+            return Understanding(
+                kind="task", reply="I can compare both files and report whether their bytes match.",
+                session=session, device_id=session.device_id,
+            )
+        ensure = re.fullmatch(r"(?:ensure|make sure) (.+?) is running[.?!]?", request, re.I)
+        if ensure is not None:
+            name = ensure[1]
+            app = name.lower()
+            if app not in MAC_APPS:
+                return Understanding(kind="answer", reply="Choose a supported Mac app.")
+            if not all(self.known_action(action) for action in (MAC_APP_STATUS, MAC_APP_ACTION)):
+                return Understanding(kind="answer", reply="Native app controls are unavailable here.")
+            session = self._session(request, [
+                TaskStep(index=0, label=f"Check {name}", action_type=MAC_APP_STATUS,
+                         parameters={"app": app}),
+                TaskStep(index=1, label=f"Open {name} only if closed", action_type=MAC_APP_ACTION,
+                         parameters={"app": app}, when={"step": 0, "running": False}),
+            ], conversation)
+            return Understanding(
+                kind="task",
+                reply=f"I will check {name} and open it only if it is verified closed.",
+                session=session,
+                device_id=session.device_id,
+            )
         if re.fullmatch(r"(?:open|launch|start) claude code[.?!]?", request, re.I):
             return Understanding(
                 kind="answer",

@@ -16,6 +16,6 @@ Say **“Open Calculator, then is Calculator running?”** VoiceOS transcribes t
 
 ## Why it matters
 
-The same execution path handles voice and text. An AI proposal carries no authority, and a failed verification never becomes a success message. This gives users a practical way to delegate supported work while retaining control over consequential actions.
+The same execution path handles voice and text. A proposed action carries no authority, and a failed verification never becomes a success message. This gives users a practical way to delegate supported work while retaining control over consequential actions.
 
 **Build:** ActionMesh 0.2.0 for Apple Silicon, with Electron, Python, FastAPI, and SQLite. [Project overview](../README.md) · [Verification notes](project/TESTING_AND_ACCEPTANCE.md)
