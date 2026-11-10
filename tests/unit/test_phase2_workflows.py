@@ -143,7 +143,7 @@ class TestSelectedRefBindsIntoSubmit(unittest.TestCase):
 
 class TestEveryTemplateActionIsImplemented(unittest.TestCase):
     def test_all_template_steps_are_in_IMPLEMENTED(self) -> None:
-        self.assertEqual(len(IMPLEMENTED), 66)
+        self.assertEqual(len(IMPLEMENTED), 67)
         for name, template in TEMPLATES.items():
             for step in template.steps:
                 self.assertIn(

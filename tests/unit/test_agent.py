@@ -528,7 +528,7 @@ class TestAgentInTheService(unittest.TestCase):
         offered = client.get("/capabilities", params={"provider": "laptop"}).json()
         names = [item["action"] for item in offered]
         # This app has a workspace root and no browser, media or shell flags.
-        self.assertEqual(len(offered), 19)
+        self.assertEqual(len(offered), 20)
         self.assertIn("device.files.compare", names)
         self.assertIn("device.project.list", names)
         self.assertNotIn("device.terminal.execute", names)
