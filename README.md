@@ -13,7 +13,7 @@ VoiceOS is a voice-first desktop assistant. ActionMesh checks each requested act
 ![macOS](https://img.shields.io/badge/macOS-desktop-111827?logo=apple&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-Apache--2.0-2ea44f)
-![Status](https://img.shields.io/badge/project-in%20development-0ea5a4)
+[![CI](https://github.com/abhijeetmiskin1/ActionMesh/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/abhijeetmiskin1/ActionMesh/actions/workflows/ci.yml)
 
 <br>
 
