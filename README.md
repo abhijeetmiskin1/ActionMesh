@@ -1,184 +1,83 @@
-# ActionMesh + VoiceOS
+<div align="center">
+  <img src="desktop/assets/icon.png" width="92" alt="ActionMesh app icon">
+  <h1>ActionMesh + VoiceOS</h1>
+  <p><strong>A voice assistant that performs supported tasks and shows what actually happened.</strong></p>
+  <p>macOS desktop · Python execution engine · Apache 2.0</p>
+</div>
 
-> **One intent. Every action.**
-> The trusted execution layer for AI.
+[One-page solution pitch](docs/SOLUTION_PITCH.md) · [How it works](#how-it-works) · [Run locally](#run-locally) · [Project documentation](docs/project/AI_HANDOFF.md)
 
-ActionMesh is a **permission-aware, verifiable, cross-application execution
-platform**. VoiceOS is a **voice interaction layer on top of it** — a client,
-not a second engine. Nothing the AI says authorizes anything; the pipeline
-decides.
+## Try the demo
 
-```text
-AI proposes.  Policy decides.  User controls.
-Executor acts.  Verifier confirms.  Audit remembers.
+In **Voice Commands**, press the microphone and say a command. **Heard** shows the transcript. **Task Results** explains the outcome, with the detailed execution trace available on demand. You can also type the command and press **Send & run**.
+
+| Say | What ActionMesh does |
+|---|---|
+| “Open Calculator, then is Calculator running?” | Opens the native app and separately checks whether macOS reports it running. |
+| “Open browser” | Opens ActionMesh’s controlled browser and verifies navigation. |
+| “Check the best deal” → “USB-C charger” | Asks which product, then searches the web and reports the search links it found. |
+| “Show open issues in abhijeetmiskin1/ActionMesh” | Reads the public GitHub API and presents the verified count and source. |
+
+Turn on **Keep listening after replies** to try **“Jarvis, repeat that”** and **“Jarvis, stop listening.”** Use **Voice readiness → Check setup** to check microphone access and task permissions before a demo.
+
+## Desktop preview
+
+The images below are real screenshots from earlier desktop builds. The current layout and controls may differ.
+
+| Voice Commands | Desktop workspace |
+|---|---|
+| ![Voice Commands with microphone and transcript controls](previews/c40/02-voice-commands.png) | ![Packaged ActionMesh desktop home](previews/c40/07-packaged-home.png) |
+
+## How it works
+
+```mermaid
+flowchart LR
+    U[Voice or typed request] --> P[VoiceOS proposes a task]
+    P --> R[Registry validates typed actions]
+    R --> A{Policy and permission}
+    A -->|Approval needed| H[User reviews action]
+    H -->|Approved| E[Execution engine]
+    A -->|Allowed| E
+    A -->|Denied| S[Show what blocked the task]
+    H -->|Rejected| S
+    E --> V[Independent verification]
+    V --> T[Task Results and audit]
 ```
 
-One execution pipeline, always:
+VoiceOS is the interface. ActionMesh owns the execution pipeline. The policy engine checks permissions before a provider runs, consequential actions require per-action approval, and unverified work stays visible as such. See the [execution contract](docs/c42-execution-contract.md).
 
-```text
-intent → plan (untrusted) → validate → registry → graph →
-PolicyEngine (ALLOW/DENY/ASK) → approval → ExecutionEngine →
-LaptopProvider → verification → audit
-```
+## Capability status
 
-Real OS access exists only in `actionmesh/agent/`. The policy engine is the
-only producer of authorization decisions. No second engine, second browser,
-or second approval system is permitted.
+| Capability | Evidence and boundaries |
+|---|---|
+| Mac app control, controlled browser, spoken task flow | Packaged Mac rehearsals verified native app launch and status, browser navigation, and transcription with supplied recordings. Physical microphone access was checked separately. |
+| GitHub repository and issue lookup | Public reads verified against the live API. Private issues require a repository-scoped token. |
+| Google Drive metadata search | Adapter and fixture tests are in place. Live use requires a Drive API OAuth token with metadata read access. |
+| Product discovery | Returns search links. Verified seller and delivered-price comparisons and checkout are pending. |
+| Image generation | Provider integration pending. |
 
----
+See [integrations and setup](docs/project/INTEGRATIONS.md) and [testing and acceptance](docs/project/TESTING_AND_ACCEPTANCE.md).
 
-## Verified state (2026-11-04, Phase 4 P0-4 documentation refresh)
+## Run locally
 
-Every number below was checked against source on this date. "Verified"
-means read from the file / runtime, not copied from an older doc.
-
-| Claim | Verified value | How checked |
-|---|---|---|
-| Implemented laptop ops | **60** (`IMPLEMENTED` in `actionmesh/agent/definitions.py`) | `.venv/bin/python -c "from actionmesh.agent.definitions import IMPLEMENTED; print(len(IMPLEMENTED))"` → `60` |
-| `SUPPORTED == IMPLEMENTED` | **True** (invariant, test-asserted) | `.venv/bin/python` importing `LaptopProvider.SUPPORTED` vs `IMPLEMENTED` |
-| HTTP routes | **49** `@app.get/post/put/delete/websocket` in `actionmesh/api.py` (excl. `@app.middleware`) | `grep -c` + manual count of the 49 decorator lines |
-| Renderer CSP | **Present** — `desktop/ui/index.html:5` | `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'` |
-| Python AI providers | **2**: `anthropic`, `desktop` | `actionmesh/voiceos/llm.py:115` — `AVAILABLE_PROVIDERS = frozenset({"anthropic", "desktop"})` |
-| Desktop JS providers | **5 listed, 4 `implemented: true`** (`anthropic`, `openai`, `gemini`, `openai_compatible`; `ollama` is `implemented: false`) | `desktop/app/providers.js:49-91`. Mismatch is intentional: JS implements 4 transports, Python only exposes `anthropic` + the `desktop` bridge back to JS |
-| Linux package | **150 MB** `desktop/release/ActionMesh-0.1.0-amd64.deb` (built 2026-11-04) | `ls -lh desktop/release/` |
-| `booking.submit` / `order.place` | **Fail-closed** — raise `PERMANENT` "this build has no payment backend…" (`provider.py:_submit`, ~1941) | Read handler; no fabricated reference, no retry (`max_attempts=1`) |
-| MPRIS live verification | **NOT live-verified** | `actionmesh/agent/media.py:326-328` — "NOT exercised against a live player" |
-| Live acceptance gate | **Opt-in only** — `ACTIONMESH_LIVE_ACCEPTANCE=1` | `tests/e2e/test_phase2_live_acceptance.py:4,32`; `test_phase3_live_acceptance.py:42`. Without it, tests skip as BLOCKED |
-| Focused test check | `tests/unit/test_voiceos.py` — **40 passed** (1.41 s) | `.venv/bin/python -m pytest tests/unit/test_voiceos.py -q` |
-
-Historical counts (C42: 1,758 passed / 3 skipped / 888 subtests; desktop
-106) are **historical**, recorded in
-[`docs/project/TESTING_AND_ACCEPTANCE.md`](docs/project/TESTING_AND_ACCEPTANCE.md).
-They are not a claim about the current tree. The full suite was not rerun
-for this documentation pass.
-
----
-
-## What is NOT done / BLOCKED
-
-Do not mistake the table above for live verification.
-
-- **MPRIS media is not live-verified.** `MprisMediaDriver` (`media.py:326`)
-  was written against the MPRIS 2.0 spec and tested only with
-  `FakeMediaDriver`. Driving it against a real player (VLC/Elisa/mpv) on a
-  Linux desktop with a session bus is P0-1.
-- **Browser is fixture-tested only.** Real-site navigation/search/click
-  acceptance is P0-2; the e2e live slice is opt-in
-  (`ACTIONMESH_LIVE_ACCEPTANCE=1`) and reports BLOCKED without a bridge.
-- **Real booking / ordering does not exist.** `booking.submit` and
-  `order.place` are CRITICAL-gated definitions whose handler deliberately
-  refuses: no payment backend, no fabricated confirmation. A real vendor
-  integration (C13) is intentionally external — boundary only.
-- **OpenAI / Gemini / generic Python providers are NOT IMPLEMENTED.**
-  Python exposes only `anthropic` and `desktop`. The desktop JS layer
-  implements `openai`/`gemini`/`openai_compatible` transports, but they are
-  reachable from Python only via the desktop bridge, and no second real
-  provider is selectable end-to-end (P1-3).
-- **No live device pairing, live provider calls, or fresh multi-format
-  packaging run** (AppImage/NSIS/dmg/APK install) is recorded in this
-  pass. The 150 MB `.deb` above is the one artifact verified present.
-- **Dark theme** is explicitly out of scope (light theme only).
-
-Labels used across these docs: **LIVE** (exercised against a real
-device/player/site/provider in a recorded run), **INTEGRATED**
-(wired end-to-end, tested with fakes/fixtures), **BLOCKED**
-(requires an external prerequisite — credentials, player, network, device),
-**NOT IMPLEMENTED** (no source). Live-verified, fixture-tested, integrated,
-and not-implemented are never merged.
-
----
-
-## How to run
+Use Python 3.11 or newer and Node.js. The desktop development build uses the Python environment in the project root.
 
 ```bash
-# Python suite (full — don't rerun casually)
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+cd desktop
+npm ci
+npm start
+```
+
+For voice recognition, configure **Providers → Audio** with an OpenAI-compatible transcription endpoint, model, and credential. Use **Approvals** to grant the scopes required by your commands. The desktop stores provider credentials using the operating system’s encryption service.
+
+```bash
+# From the project root
 .venv/bin/python -m pytest tests -q
-
-# Security invariants only
-.venv/bin/python -m pytest tests/security -q
-
-# One file
-.venv/bin/python -m pytest tests/unit/test_voiceos.py -q
-
-# Lint / types
-.venv/bin/python -m ruff check actionmesh tests scripts
-.venv/bin/python -m mypy actionmesh
-
-# Desktop
-cd desktop && npm test          # node --test
-cd desktop && npm run dist:linux   # electron-builder --linux deb --x64
+.venv/bin/ruff check actionmesh tests scripts
+.venv/bin/mypy actionmesh
+(cd desktop && npm test)
 ```
 
-Serve the control room:
-
-```bash
-.venv/bin/python -m actionmesh.cli serve    # http://127.0.0.1:8000
-```
-
-Live acceptance (browser/e2e only; everything else skips honestly):
-
-```bash
-ACTIONMESH_LIVE_ACCEPTANCE=1 .venv/bin/python -m pytest tests/e2e/test_phase2_live_acceptance.py tests/e2e/test_phase3_live_acceptance.py -q
-```
-
-Without that env var these tests report BLOCKED (skipped with a reason),
-which is the honest result when no real bridge/player/network is present.
-Do not claim live verification from a skipped run.
-
----
-
-## Architecture in one screen
-
-| Layer | Location | Job |
-|---|---|---|
-| Protocol | `actionmesh/protocol/` | `Action`, `GraphNode`, envelopes, risk enums |
-| Registry | `actionmesh/core/registry/` | Describes capabilities; never executes, never authorizes |
-| Permissions | `actionmesh/core/permissions/` | Closed catalog; `PolicyEngine` alone decides ALLOW/DENY/ASK |
-| Graph | `actionmesh/core/graph/` | Compose, cycle-detect, order, pre-flight authorize |
-| Planner | `actionmesh/core/planner.py` | Proposes `{type, parameters}` only; output is untrusted |
-| Executor | `actionmesh/core/executor/engine.py` | Runs approved graphs; does not certify its own work |
-| Verification | `actionmesh/core/verification/` | Independent re-read of the world; `verify()` stays `verified=False` until observed |
-| Audit | `actionmesh/core/audit/` | Hash-chained, tamper-evident record |
-| Laptop agent | `actionmesh/agent/` | **Only** place with real OS access (60 ops) |
-| VoiceOS | `actionmesh/voiceos/` | Voice client through `/plan` → `/execute` → approval; cannot reach the consent surface |
-| Desktop | `desktop/` | Electron shell; single `contextBridge` in `preload.js`; `sandbox`/`contextIsolation` on, `nodeIntegration` off; renderer CSP above |
-
-Security invariants (never weakened): a client cannot define its own
-authority (no `grants` in bodies); risk = `max(action, definition)`; CRITICAL
-needs explicit per-`action_id` approval; unverified is never success; content
-never crosses the result boundary; workspace paths are confined; fail closed;
-no model-generated freeform code execution. Full list in
-[`AGENTS.md`](AGENTS.md) and [`docs/project/SECURITY_MODEL.md`](docs/project/SECURITY_MODEL.md).
-
----
-
-## Documentation
-
-Start at [`docs/project/AI_HANDOFF.md`](docs/project/AI_HANDOFF.md) for
-agents, or [`PROJECT.md`](PROJECT.md) for the whole picture.
-
-- [`docs/project/CURRENT_STATUS.md`](docs/project/CURRENT_STATUS.md) — evidence-based inventory (LIVE / INTEGRATED / BLOCKED / NOT IMPLEMENTED)
-- [`docs/project/ROADMAP.md`](docs/project/ROADMAP.md) — P0–P3 remaining work
-- [`docs/project/TESTING_AND_ACCEPTANCE.md`](docs/project/TESTING_AND_ACCEPTANCE.md) — suite map; historical counts labeled as such
-- [`docs/project/SYSTEM_ARCHITECTURE.md`](docs/project/SYSTEM_ARCHITECTURE.md) — components and diagrams
-- [`docs/project/SECURITY_MODEL.md`](docs/project/SECURITY_MODEL.md) — controls and invariants
-- [`docs/project/API_REFERENCE.md`](docs/project/API_REFERENCE.md) — the 49 routes
-- [`docs/c42-execution-contract.md`](docs/c42-execution-contract.md) — binding capability contract (code wins on disagreement)
-- [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/permissions.md`](docs/permissions.md), [`docs/registry.md`](docs/registry.md), [`docs/action-graph.md`](docs/action-graph.md), [`docs/providers.md`](docs/providers.md), [`docs/provider-contract.md`](docs/provider-contract.md), [`docs/voiceos.md`](docs/voiceos.md), [`docs/audit.md`](docs/audit.md), [`docs/rest-api.md`](docs/rest-api.md), [`docs/deployment.md`](docs/deployment.md)
-- [`HANDOFF.md`](HANDOFF.md) — short continuation state
-- [`android/README.md`](android/README.md) — Android APK shell
-
-> ### ⚠️ This repository is a reconstruction
->
-> The original working tree was deleted during development. `.git/` was lost
-> with it. Everything here was **rewritten from the architecture and design**,
-> then verified by executing it. It is a reconstruction, not a restoration:
-> treat the code as a fresh implementation and re-verify before relying on it.
->
-> **The first commit was made after the reconstruction, not during it.** This
-> history therefore starts from a verified state — real diffs, real rollback
-> and real blame from that commit onward, and no history before it.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+[Architecture](docs/project/SYSTEM_ARCHITECTURE.md) · [Security model](docs/project/SECURITY_MODEL.md) · [Roadmap](docs/project/ROADMAP.md) · [Changelog](CHANGELOG.md) · [License](LICENSE)

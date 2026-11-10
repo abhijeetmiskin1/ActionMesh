@@ -195,12 +195,13 @@ function clearClaim(dirs, pid) {
 }
 
 class Backend {
-  constructor({ dataDir, appRoot, isPackaged, resourcesPath, settings, key, bridge, browserBridge }) {
+  constructor({ dataDir, appRoot, isPackaged, resourcesPath, settings, key, bridge, browserBridge, connectorCredentials }) {
     this.dataDir = dataDir;
     this.appRoot = appRoot;
     this.isPackaged = isPackaged;
     this.resourcesPath = resourcesPath;
     this.settings = settings;
+    this.connectorCredentials = connectorCredentials;
     this.key = key; // loopback API key — memory only, never written to disk
     // C41: where the planner's model calls go. The *credential* is deliberately absent
     // here — `bridge` carries a socket path and a per-launch token that authorises
@@ -309,6 +310,15 @@ class Backend {
       // Browser and media are distinct boundaries too: a user may allow shell
       // and not the controlled browser. Default off, so a legacy settings file
       // without these keys reads as "no".
+      const connectors = this.connectorCredentials?.() || {};
+      if (s.allowGithubRead) {
+        env.ACTIONMESH_ALLOW_GITHUB_READ = '1';
+        if (connectors.github) env.ACTIONMESH_GITHUB_TOKEN = connectors.github;
+      }
+      if (s.allowDriveRead) {
+        env.ACTIONMESH_ALLOW_DRIVE_READ = '1';
+        if (connectors.drive) env.ACTIONMESH_GOOGLE_DRIVE_TOKEN = connectors.drive;
+      }
       env.ACTIONMESH_ALLOW_BROWSER = s.allowBrowser ? '1' : '0';
       env.ACTIONMESH_ALLOW_MEDIA = s.allowMedia ? '1' : '0';
       env.ACTIONMESH_ALLOWED_COMMANDS = (s.allowedCommands || []).join(',');

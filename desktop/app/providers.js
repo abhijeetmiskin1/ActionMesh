@@ -398,7 +398,7 @@ function compatibleEndpoint(baseUrl, route = 'chat/completions') {
   return { url: `${parsed.origin}${path}/${route}` };
 }
 
-async function transcribe({ baseUrl, model, apiKey, timeoutSeconds }, bytes, mime, options = {}) {
+async function transcribe({ baseUrl, model, apiKey, timeoutSeconds, language = 'en' }, bytes, mime, options = {}) {
   const endpoint = compatibleEndpoint(baseUrl, 'audio/transcriptions');
   if (endpoint.error || !model || !apiKey || !keyIsHeaderSafe(apiKey)) {
     return result('not_configured', 'Configure an Audio endpoint, model and key in Providers.');
@@ -409,8 +409,12 @@ async function transcribe({ baseUrl, model, apiKey, timeoutSeconds }, bytes, mim
   }
   const boundary = randomUUID();
   const extension = mime === 'audio/wav' ? 'wav' : 'webm';
+  const languagePart = ['en', 'hi'].includes(language)
+    ? `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\n${language}\r\n`
+    : '';
   const body = Buffer.concat([
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n`
+      + languagePart
       + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="utterance.${extension}"\r\n`
       + `Content-Type: ${mime}\r\n\r\n`),
     bytes,

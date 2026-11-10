@@ -246,7 +246,7 @@ class TestPhoneControlsLaptop(unittest.TestCase):
         self.consent("file.write")
         first = self.execute(token, "device.file.write", {"path": "no.txt", "content": "x"})
         waiting = self.laptop.get("/approvals").json()
-        self.phone.post(
+        rejected = self.laptop.post(
             "/approvals",
             json={
                 "action_id": first["nodes"]["one"]["action_id"],
@@ -254,6 +254,9 @@ class TestPhoneControlsLaptop(unittest.TestCase):
                 "execution_id": waiting[0]["execution_id"],
             },
         )
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertEqual(rejected.json()["execution"]["state"], "cancelled")
+        self.assertEqual(self.laptop.get("/approvals").json(), [])
         still = self.execute(token, "device.file.write", {"path": "no.txt", "content": "x"})
         self.assertEqual(still["state"], "waiting_permission")
         self.assertFalse(os.path.exists(os.path.join(self.root, "no.txt")))

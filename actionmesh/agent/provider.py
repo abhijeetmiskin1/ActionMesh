@@ -34,7 +34,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from actionmesh.agent import apps
+from actionmesh.agent import apps, connectors
 from actionmesh.agent.browser import BridgeDriver, BrowserEngine
 from actionmesh.agent.browser_bridge import BrowserBridgeConfig
 from actionmesh.agent.browser_bridge import make_request as _make_browser_request
@@ -113,6 +113,7 @@ class LaptopProvider(ActionProvider):
             "device.ide.list",
             "device.ide.open",
             "device.ide.command",
+            *connectors.CONNECTOR_ACTIONS,
             apps.MAC_APP_ACTION,
             apps.MAC_APP_STATUS,
             "device.app.open",
@@ -184,6 +185,7 @@ class LaptopProvider(ActionProvider):
             "device.ide.list",
             "device.ide.open",
             "device.ide.command",
+            *connectors.CONNECTOR_ACTIONS,
             apps.MAC_APP_ACTION,
             apps.MAC_APP_STATUS,
             "device.app.open",
@@ -399,6 +401,7 @@ class LaptopProvider(ActionProvider):
             "device.ide.command": lambda: self._ide_command(action),
             "device.project.status": lambda: self._project_status(action),
             "device.project.open": lambda: self._ide_open(action, project=True),
+            **{name: lambda: self._connector_read(action) for name in connectors.CONNECTOR_ACTIONS},
             apps.MAC_APP_ACTION: lambda: self._launch_native_app(action),
             apps.MAC_APP_STATUS: lambda: self._native_app_status(action),
             "device.app.open": lambda: self._app_open(action),
@@ -1697,6 +1700,23 @@ class LaptopProvider(ActionProvider):
             )
         ]
 
+    async def _connector_read(self, action: Action) -> dict[str, Any]:
+        first = await connectors.read(action)
+        observed = await connectors.read(action)
+        if first != observed:
+            raise ProviderError(
+                "The result changed between reads. Narrow the search and retry.",
+                FailureKind.PROVIDER,
+            )
+        observed.pop("_membership")
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "parameters": dict(action.parameters),
+            "state": {"count": observed["count"], "truncated": observed["truncated"]},
+        }
+        return observed
+
     async def _launch_native_app(self, action: Action) -> dict[str, Any]:
         app = action.parameters.get("app")
         await asyncio.to_thread(apps.launch, app)
@@ -2390,6 +2410,8 @@ class LaptopProvider(ActionProvider):
             # time would build a description of a description -- and report an exit code
             # of None for a command that exited 0.
             return recovered
+        if action.type in connectors.CONNECTOR_ACTIONS:
+            return recorded
         # -- screen capabilities, deliberately above the workspace guard ---------
         # `observe()` below starts by refusing to answer without a workspace root,
         # because most branch below rebuilds a path. Screen work has no path: it reads

@@ -376,8 +376,11 @@ class Orchestrator:
 
         # The same bounded rule the control room and the voice page send: the workspace
         # declares what it is willing to *consider*, for exactly this action type. It
-        # authorises nothing — consent, risk and approval still decide.
-        policy = Policy(rules=[PolicyRule(action=step.action_type, decision=PolicyDecision.ALLOW)])
+        # authorises nothing — consent, risk and approval still decide. Preserve
+        # explicit policy rules so a caller can ask for stricter handling.
+        policy = context.policy if context.policy.rules else Policy(
+            rules=[PolicyRule(action=step.action_type, decision=PolicyDecision.ALLOW)]
+        )
         return replace(context, policy=policy, approvals=list(context.approvals))
 
     def _condition_met(self, session: TaskSession, step: TaskStep) -> bool:

@@ -27,6 +27,10 @@ SAFE_RESULT_KEYS = frozenset(
         "bytes",
         "size",
         "count",
+        "source_url",
+        "connector_results",
+        "selected_repository",
+        "unique",
         "total",
         "truncated",
         "exit_code",
@@ -157,6 +161,7 @@ PROJECTED_LIST_KEYS = frozenset(
         # confined to the workspace, consent-gated, and audited; the *body* of any file
         # they name still cannot come through here.
         "entries",
+        "connector_results",
     }
 )
 

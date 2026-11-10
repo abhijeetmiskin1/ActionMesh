@@ -157,6 +157,12 @@ def check_params(
                 f"got {type(value).__name__}",
                 f"{path}.parameters.{name}",
             )
+        choices = spec.get("enum")
+        if isinstance(choices, list) and value not in choices:
+            raise ValidationError(
+                f"parameter {name!r} for {defn.name} is outside the allowed values",
+                f"{path}.parameters.{name}",
+            )
     return warnings
 
 

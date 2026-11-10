@@ -1,8 +1,7 @@
 """The only outbound network call in ActionMesh, reviewable on one page.
 
 The package-wide rule in ``tests/security/test_dangerous_primitives.py`` is that
-nothing dials out. A reasoning layer needs one approved exception: a single HTTPS
-POST to a named official endpoint. That exception lives here and nowhere else, and
+nothing dials out. A reasoning layer needs one approved exception: bounded HTTPS requests to named official endpoints. That exception lives here and nowhere else, and
 this module is deliberately small enough to read in full:
 
 * **One function dials.** :func:`post_json` opens one TLS connection, writes one
@@ -25,10 +24,9 @@ this module is deliberately small enough to read in full:
   not the response. Errors carry a status code and a short message the remote
   service chose to make public; a request's contents never appear in them.
 
-The execution engine does **not** import this module, directly or transitively.
-Its provider adapters run on the agent's own machine and reach the world only
-through the command policy. This transport exists for exactly one caller:
-:mod:`actionmesh.voiceos.llm`'s provider adapter.
+The same TLS exchange supports fixed read-only GitHub and Drive endpoints.
+The connector query is encoded separately from the approved endpoint. No
+redirects are followed and connector error bodies are not surfaced.
 """
 
 from __future__ import annotations
@@ -38,7 +36,7 @@ import json
 from collections.abc import Mapping
 from contextlib import suppress
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 #: The only port this transport will dial. An API endpoint on another port is not
 #: the official interface it claims to be.
@@ -53,6 +51,20 @@ OFFICIAL_ENDPOINTS: frozenset[str] = frozenset(
         "https://api.anthropic.com/v1/messages",
     }
 )
+
+READ_ENDPOINTS = frozenset({
+    "https://api.github.com/search/repositories",
+    "https://api.github.com/search/issues",
+    "https://www.googleapis.com/drive/v3/files",
+})
+
+
+class ReadTransportError(RuntimeError):
+    def __init__(self, status: int, *, rate_limited: bool = False) -> None:
+        self.status = status
+        self.rate_limited = rate_limited
+        super().__init__(f"read service returned HTTP {status}")
+
 
 #: A request above this size is a mistake or an attack; both are refused.
 MAX_REQUEST_BYTES = 64 * 1024
@@ -78,7 +90,7 @@ class TransportError(RuntimeError):
     """
 
 
-def checked_endpoint(endpoint: str) -> tuple[str, int, str]:
+def checked_endpoint(endpoint: str, *, read: bool = False) -> tuple[str, int, str]:
     """Validate an endpoint and return ``(host, port, path)``; raise otherwise.
 
     Pure and synchronous so the rule can be tested without a network: an endpoint
@@ -106,7 +118,7 @@ def checked_endpoint(endpoint: str) -> tuple[str, int, str]:
     path = parsed.path or "/"
     if not path.startswith("/"):
         raise TransportError("the model endpoint has an invalid path")
-    if f"https://{host}{path}" not in OFFICIAL_ENDPOINTS:
+    if f"https://{host}{path}" not in (READ_ENDPOINTS if read else OFFICIAL_ENDPOINTS):
         # The destination is a closed list in this file. A caller cannot widen it by
         # configuring a URL, which is the whole point of a transport that is allowed
         # to touch the network while the rest of the package is not.
@@ -129,9 +141,11 @@ def _checked_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
-def _request_bytes(host: str, path: str, headers: Mapping[str, str], body: bytes) -> bytes:
+def _request_bytes(
+    host: str, path: str, headers: Mapping[str, str], body: bytes, *, method: str = "POST",
+) -> bytes:
     lines = [
-        f"POST {path} HTTP/1.1",
+        f"{method} {path} HTTP/1.1",
         f"Host: {host}",
         "User-Agent: ActionMesh/1.0",
         "Accept: application/json",
@@ -253,6 +267,25 @@ async def post_json(
         raise TransportError("the request exceeded the size limit")
     budget = max(1, min(int(max_response_bytes), MAX_RESPONSE_BYTES))
     request = _request_bytes(host, path, safe_headers, body)
+    return await _exchange_json(host, port, request, timeout_s, budget)
+
+
+async def get_json(
+    *, endpoint: str, headers: Mapping[str, str], query: Mapping[str, str],
+    timeout_s: float = 5.0,
+) -> dict[str, Any]:
+    """Read from a fixed connector endpoint with bounded, encoded query values."""
+    host, port, path = checked_endpoint(endpoint, read=True)
+    encoded = urlencode(query)
+    if len(encoded) > 2048:
+        raise TransportError("the connector query exceeded the size limit")
+    request = _request_bytes(host, f"{path}?{encoded}", _checked_headers(headers), b"", method="GET")
+    return await _exchange_json(host, port, request, timeout_s, 512 * 1024, read=True)
+
+
+async def _exchange_json(
+    host: str, port: int, request: bytes, timeout_s: float, budget: int, *, read: bool = False,
+) -> dict[str, Any]:
 
     try:
         reader, writer = await asyncio.wait_for(
@@ -291,6 +324,10 @@ async def post_json(
             await writer.wait_closed()
 
     if status < 200 or status >= 300:
+        if read:
+            raise ReadTransportError(
+                status, rate_limited=response_headers.get("x-ratelimit-remaining") == "0",
+            )
         raise TransportError(_error_message(status, raw))
     try:
         data = json.loads(raw.decode("utf-8"))

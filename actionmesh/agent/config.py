@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from actionmesh import __version__
 from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS
 from actionmesh.agent.commands import DEFAULT_ALLOWED
+from actionmesh.agent.connectors import DRIVE_SEARCH, GITHUB_ISSUES, GITHUB_REPOS
 from actionmesh.agent.definitions import (
     CAPABILITIES,
     IMPLEMENTED,
@@ -129,6 +130,8 @@ class AgentConfig:
     #: submit verb and the two CRITICAL submits sit behind ``allow_payment``.
     allow_browser: bool = False
     allow_native_apps: bool = False
+    allow_github_read: bool = False
+    allow_drive_read: bool = False
     #: Local media player control (C42). Off by default: a headless agent must not
     #: advertise a player it cannot reach, and media control is a distinct boundary
     #: from shell/desktop/browser.
@@ -254,6 +257,8 @@ class AgentConfig:
             allow_desktop=_truthy(get(ENV_ALLOW_DESKTOP)),
             allow_browser=_truthy(get(ENV_ALLOW_BROWSER)),
             allow_native_apps=_truthy(get("ACTIONMESH_ALLOW_NATIVE_APPS")),
+            allow_github_read=_truthy(get("ACTIONMESH_ALLOW_GITHUB_READ")),
+            allow_drive_read=_truthy(get("ACTIONMESH_ALLOW_DRIVE_READ")),
             allow_media=_truthy(get(ENV_ALLOW_MEDIA)),
             allow_payment=_truthy(get(ENV_ALLOW_PAYMENT)),
             heartbeat_s=heartbeat,
@@ -297,6 +302,10 @@ class AgentConfig:
         out: list[str] = []
         for capability in CAPABILITIES:
             if capability not in IMPLEMENTED:
+                continue
+            if capability in {GITHUB_REPOS, GITHUB_ISSUES} and not self.allow_github_read:
+                continue
+            if capability == DRIVE_SEARCH and not self.allow_drive_read:
                 continue
             if capability in {MAC_APP_ACTION, MAC_APP_STATUS} and (
                 not self.allow_native_apps or sys.platform != "darwin"

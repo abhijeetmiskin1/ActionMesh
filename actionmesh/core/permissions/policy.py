@@ -86,7 +86,8 @@ def default_policy() -> Policy:
     """
     allow = ("calendar.create", "calendar.update", "reminder.create", "device.notify",
              "search.web", "payment.verify", "device.app.launch_native", "device.app.status_native",
-             "browser.open", "browser.search")
+             "browser.open", "browser.search", "github.repositories.search",
+             "github.issues.list", "google.drive.search")
     ask = ("message.read", "message.send", "file.read", "file.move", "calendar.delete",
            "file.share", "device.send_file", "system.launch_app", "payment.prepare",
            "payment.confirm")

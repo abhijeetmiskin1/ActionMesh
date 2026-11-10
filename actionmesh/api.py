@@ -856,7 +856,7 @@ def create_app(
     #: says so, so a request is never silently answered by a machine that stayed
     #: quiet. A deployment with no provider gets the rules alone, unchanged.
     voiceos_planner = build_planner(
-        voiceos_provider, app.state.planner, engine.registry.has
+        voiceos_provider, app.state.planner, engine.registry.has, definition_for=engine.registry.get
     )
     app.state.voiceos_planner = voiceos_planner
     #: C36 — the analyst, the object that explains a log the system actually read.
@@ -1553,12 +1553,17 @@ def create_app(
             # Resuming is only offered for an execution that is actually waiting, and
             # the approval is still matched on `action_id` at dispatch: approving some
             # other action in the graph changes nothing here.
-            waiting = {item["execution_id"] for item in engine.awaiting_approval()}
+            waiting = {item["execution_id"]: item for item in engine.awaiting_approval()}
             if execution_id not in waiting:
                 raise HTTPException(
                     status_code=409,
                     detail="execution is not awaiting approval",
                 )
+            if status == "rejected" and any(
+                candidate.get("action_id") == action_id
+                for candidate in waiting[execution_id]["actions"]
+            ):
+                engine.request_cancel(execution_id)
             resumed = await engine.resume(execution_id)
             if resumed is not None:
                 out["execution"] = resumed.to_dict()
@@ -2153,6 +2158,8 @@ def create_app(
         session = _voiceos_load(session_id, _record_scope(request))
         if session_id in active_voice_runs:
             raise HTTPException(status_code=409, detail="this task is already running")
+        if session.run_policy is not None:
+            payload = {**payload, "policy": session.run_policy}
         context = _context(
             payload,
             app.state.consent_store,
@@ -2165,6 +2172,8 @@ def create_app(
             # Write the name of each execution to the step *before* awaiting it. If this
             # request dies mid-step, the session on disk still points at the run, and the
             # next reader can ask the durable record what became of it instead of guessing.
+            if session.run_policy is None and isinstance(payload.get("policy"), dict):
+                session.run_policy = context.policy.model_dump()
             session.automatic = payload.get("stop_on_unverified") is True
             outcome = await app.state.voiceos_orchestrator.advance(
                 session, context, checkpoint=store.save_session,

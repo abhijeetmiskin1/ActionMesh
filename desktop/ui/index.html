@@ -231,12 +231,20 @@
           <label class="check"><input type="checkbox" id="voiceHandsFree" checked> Run spoken commands after transcription</label>
           <label class="check"><input type="checkbox" id="voiceConversation"> Keep listening after replies</label>
           <p class="fine">Turn this on and press the microphone to start a conversation. Say “Jarvis, stop listening” or leave Voice Commands to end it.</p>
+          <p class="fine" id="voiceHeard" aria-live="polite" hidden></p>
+          <label class="field">Recognition language
+            <select id="voiceRecognitionLanguage">
+              <option value="en">English</option>
+              <option value="hi">Hindi</option>
+              <option value="auto">Auto-detect</option>
+            </select>
+          </label>
           <p class="mic-transcript-label">Transcript</p>
           <textarea class="textarea" id="voiceTranscript" rows="3"
                     placeholder="What would you like VoiceOS to do?"></textarea>
           <div class="btn-row">
             <button class="btn primary" id="voiceSend" type="button">Send &amp; run</button>
-            <button class="btn ghost" id="voiceStopListening" type="button" disabled>Stop Listening</button>
+            <button class="btn ghost" id="voiceStopListening" type="button" disabled>Finish recording</button>
             <button class="btn ghost" id="voiceStopSpeaking" type="button" disabled>Stop Speaking</button>
             <button class="btn subtle" id="voiceClear" type="button">Clear</button>
             <button class="btn danger ghost" id="voiceCancel" type="button">Cancel</button>
@@ -246,6 +254,12 @@
                the answer is the deterministic planner rather than a model. -->
           <p class="fine" id="voiceModel" data-mode="deterministic">Checking which planner will answer…</p>
           <p class="fine" id="voiceSupport"></p>
+          <div class="btn-row">
+            <label class="field">Reply voice
+              <select id="voiceReplyVoice" aria-label="Reply voice"><option value="">Automatic</option></select>
+            </label>
+            <button class="btn ghost small" id="voicePreviewSpeech" type="button">Preview voice</button>
+          </div>
         </article>
 
         <article class="card" aria-labelledby="voiceResultHeading">
@@ -271,6 +285,15 @@
           <button class="btn ghost small" data-goto="approvals" type="button">Approvals</button>
           <button class="btn ghost small" data-goto="providers" type="button">Voice provider setup</button>
         </div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h2 class="card-title">Voice readiness</h2>
+          <button class="btn ghost small" id="voiceReadinessCheck" type="button">Check setup</button>
+        </div>
+        <p class="card-note">Checks setup and permissions. Use a real command to verify speech and execution.</p>
+        <dl class="kv" id="voiceReadinessResult" aria-live="polite"></dl>
       </article>
 
       <details class="card secondary-panel" id="voiceGuide">
@@ -745,6 +768,19 @@
             <label class="check"><input type="checkbox" id="setAllowShell"> Allow shell execution</label>
             <label class="check"><input type="checkbox" id="setAllowDesktop"> Allow screen capture and accessibility (this desktop)</label>
             <label class="check"><input type="checkbox" id="setAllowBrowser"> Allow the browser drive (this desktop)</label>
+            <fieldset>
+              <legend>Read-only connectors</legend>
+              <label class="check"><input type="checkbox" id="setAllowGithubRead"> Allow GitHub repository and issue reads</label>
+              <label class="field">GitHub read token (optional for public repositories)
+                <input id="setGithubReadToken" type="password" autocomplete="off">
+              </label>
+              <label class="check"><input type="checkbox" id="setAllowDriveRead"> Allow Google Drive metadata search</label>
+              <label class="field">Google Drive OAuth access token
+                <input id="setDriveReadToken" type="password" autocomplete="off">
+              </label>
+              <p class="fine">Tokens are stored in the OS keyring. Leave blank to keep a saved token.</p>
+              <label class="check"><input type="checkbox" id="forgetConnectorTokens"> Remove saved connector tokens when saving</label>
+            </fieldset>
             <label class="check"><input type="checkbox" id="setAllowMedia"> Allow media control (this desktop)</label>
             <label class="field">Allowed programs (comma separated)
               <input id="setAllowedCommands" autocomplete="off" spellcheck="false">

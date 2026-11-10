@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS
+from actionmesh.agent.connectors import DRIVE_SEARCH, GITHUB_ISSUES, GITHUB_REPOS
 from actionmesh.core.planner import Planner
 from actionmesh.voiceos.models import Conversation, TaskSession, TaskStep
 from actionmesh.voiceos.targeting import TargetChoice, describe_choice
@@ -217,6 +218,8 @@ class Reasoner:
         if not request:
             return Understanding(kind="answer", reply="Say something first — or type it.")
         awaiting_product = conversation.awaiting_deal_product
+        awaiting_repo = conversation.awaiting_github_repository
+        conversation.awaiting_github_repository = False
         conversation.awaiting_deal_product = False
         if _CLEAR.match(request):
             return Understanding(
@@ -233,6 +236,8 @@ class Reasoner:
         switched = self._switch(request, conversation)
         if switched is not None:
             return switched
+        if awaiting_repo and re.fullmatch(r"[\w-]+/[\w.-]+", request.rstrip(".?!")):
+            return self._task(f"Show open issues in {request}", conversation)
         if awaiting_product:
             product = request.rstrip(".?!")
             command = re.match(
@@ -243,6 +248,7 @@ class Reasoner:
             if not command and re.fullmatch(r"[\w][\w +.,&/()'-]{0,119}", product):
                 return self._task(f"Find deals for {product}", conversation)
         answer = self._task(request, conversation)
+        conversation.awaiting_github_repository = answer.unresolved == ("github.repository",)
         conversation.awaiting_deal_product = (
             match_website_intent(request) == "deal.search" and answer.unresolved == ("web.query",)
         )
@@ -504,7 +510,56 @@ class Reasoner:
             device_id=session.device_id,
         )
 
+    def _connector_task(self, request: str, conversation: Conversation) -> Understanding | None:
+        text = request.rstrip(".?!")
+        repo = re.fullmatch(
+            r"(?:find|search for|show) (?:a |the )?github repositor(?:y|ies) (?:named |for )?(.+?)"
+            r"(?P<follow>,? (?:and )?then (?:show|list) (?:its )?open issues)?", text, re.I,
+        )
+        issues = re.fullmatch(r"(?:show|list|find) (?:the )?open issues (?:in|for|on) (.+)", text, re.I)
+        drive = re.fullmatch(r"(?:find|search for|look for) (?:my )?(.+) in google drive", text, re.I)
+        if repo:
+            steps = [TaskStep(0, "Find GitHub repositories", GITHUB_REPOS, {"query": repo[1]})]
+            if repo["follow"]:
+                steps.append(TaskStep(
+                    1, "Look up open issues in the verified repository", GITHUB_ISSUES, {},
+                    when={"step": 0, "verified": True, "unique": True},
+                    bind={"repository": {"from_step": 0, "key": "selected_repository"}},
+                ))
+        elif issues:
+            target = issues[1].removesuffix(" on GitHub").strip()
+            if not re.fullmatch(r"[\w-]+/[\w.-]+", target):
+                return Understanding(
+                    kind="answer", reply="Which GitHub repository? Give me its owner/name.",
+                    unresolved=("github.repository",),
+                )
+            steps = [TaskStep(0, "Look up open GitHub issues", GITHUB_ISSUES, {"repository": target})]
+        elif drive:
+            steps = [TaskStep(0, "Search Google Drive by file name", DRIVE_SEARCH, {"query": drive[1]})]
+        else:
+            return None
+        if any(not self.known_action(step.action_type) for step in steps):
+            detail = (
+                "Enable Google Drive read access and configure a read-only OAuth token."
+                if drive else "Enable GitHub reads in Settings and restart the backend."
+            )
+            return Understanding(kind="answer", reply=detail)
+        session = self._session(request, steps, conversation)
+        return Understanding(kind="task", reply="I can check that source.", session=session,
+                             device_id=session.device_id)
+
     def _task(self, request: str, conversation: Conversation) -> Understanding:
+        if re.fullmatch(r"(?:open|launch|start) claude code[.?!]?", request, re.I):
+            return Understanding(
+                kind="answer",
+                reply=(
+                    "Claude Code terminal launch is unavailable here. Say Open Claude "
+                    "to open the installed Claude desktop app."
+                ),
+            )
+        connector = self._connector_task(request, conversation)
+        if connector is not None:
+            return connector
         mixed = self._mixed_workflow(request, conversation)
         if mixed is not None:
             return mixed
@@ -569,9 +624,9 @@ class Reasoner:
                 TaskStep(
                     index=index,
                     label=(
-                        f"Open {action.parameters['app'].title()}"
+                        f"Open {str(action.parameters.get('app', '')).title()}"
                         if action.type == MAC_APP_ACTION
-                        else f"Check {action.parameters['app'].title()}"
+                        else f"Check {str(action.parameters.get('app', '')).title()}"
                         if action.type == MAC_APP_STATUS else f"Run {action.type}"
                     ),
                     action_type=action.type,

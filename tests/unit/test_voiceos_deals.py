@@ -49,6 +49,9 @@ def test_voice_deal_discovery_runs_read_only(monkeypatch) -> None:
         assert followup_session["steps"][1]["parameters"]["query"] == query
         assert propose("Find the best deal")["kind"] == "answer"
 
+        offer = propose("Check offers on Macbook")
+        steps = client.get(f"/voiceos/sessions/{offer['session_id']}").json()["steps"]
+        assert [step["action_type"] for step in steps] == ["browser.open", "browser.search"]
         denied = run(propose("open brawser"))
         assert denied["steps"][0]["action_type"] == "browser.open"
         assert denied["steps"][0]["state"] == "denied"
@@ -82,3 +85,10 @@ def test_voice_deal_discovery_runs_read_only(monkeypatch) -> None:
         assert [step["index"] for step in combined["steps"]] == [0, 1, 2, 3]
         assert all(step["verified"] for step in combined["steps"])
         assert combined["steps"][-1]["observed"]["running"] is True
+
+        gate_url = f"{home}?q={quote_plus('Macbook deals prices reputable retailers')}"
+        driver.add_page(gate_url, "Sign in", [{"tag": "input", "password": True}])
+        gated = run(propose("Check offers on Macbook"))
+        assert gated["status"] == "needs_review", gated
+        assert gated["steps"][1]["observed"]["status"] == "needs_user"
+        assert gated["steps"][1]["verified"] is False

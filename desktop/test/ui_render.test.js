@@ -430,6 +430,8 @@ test('hands-free dictation runs a final transcript and speaks the result', async
   assert.equal(calls.some(([, path]) => path === '/voiceos/messages'), false);
   transcript('List workspace', { final: true });
   await new Promise(setImmediate);
+  assert.equal(document.getElementById('voiceHeard').textContent, 'Heard: List workspace');
+  assert.equal(document.getElementById('voiceHeard').hidden, false);
   const result = document.getElementById('voiceTaskResult');
   const runs = calls.filter(([, path]) => path === '/voiceos/sessions/task-1/run');
   assert.deepEqual(runs, [['POST', '/voiceos/sessions/task-1/run', {
@@ -705,4 +707,75 @@ test('a completed task can be reused as an editable voice command', async () => 
   assert.equal(document.querySelector('section[data-view="voice"]').hidden, false);
   assert.equal(document.getElementById('voiceTranscript').value, 'Open Calculator');
   assert.equal(document.getElementById('voiceReply').hidden, true);
+});
+
+test('granting a missing voice permission returns to the unsent command', async () => {
+  let runs = 0;
+  let grants = 0;
+  const denied = {
+    session_id: 'denied', request: 'Open Calculator', status: 'failed',
+    steps: [{
+      action_type: 'device.app.launch_native', state: 'denied',
+      error: "missing permission(s): ['system.app.launch']",
+    }],
+  };
+  const { document } = await bootPage({ beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => {
+      const value = await readState();
+      return { ...value, backend: { ...value.backend, status: 'ready' } };
+    };
+    bridge.request = async ({ method, path, body }) => {
+      if (path === '/voiceos/messages') return { ok: true, body: { kind: 'task', session_id: 'denied' } };
+      if (path === '/voiceos/sessions/denied/run') runs++;
+      if (path.startsWith('/voiceos/sessions/denied')) return { ok: true, body: denied };
+      if (path === '/consents' && method === 'POST') {
+        assert.equal(body.scope, 'system.app.launch');
+        grants++;
+      }
+      if (path.startsWith('/consents') || path === '/approvals') return { ok: true, body: [] };
+      return { ok: false, status: 503, error: 'fixture route unavailable' };
+    };
+  } });
+  document.querySelector('.nav-item[data-view="voice"]').click();
+  document.getElementById('voiceTranscript').value = denied.request;
+  document.getElementById('voiceSend').click();
+  await new Promise(setImmediate);
+  Array.from(document.getElementById('voiceTaskResult').querySelectorAll('button'))
+    .find((button) => button.textContent === 'Set up app launch permission').click();
+  assert.equal(grants, 0);
+  document.getElementById('consentGrant').click();
+  await new Promise(setImmediate);
+  assert.equal(grants, 1);
+  assert.equal(runs, 1);
+  assert.equal(document.querySelector('section[data-view="voice"]').hidden, false);
+  assert.equal(document.getElementById('voiceTranscript').value, denied.request);
+});
+
+test('voice readiness distinguishes configured speech from verified action access', async () => {
+  const { document } = await bootPage({ beforeLoad(bridge) {
+    const readState = bridge.state;
+    bridge.state = async () => ({
+      ...await readState(), backend: { status: 'ready' }, microphonePermission: 'granted',
+      purposes: { audio: { provider: 'openai_compatible_stt', model: 'test-whisper',
+        endpoint: 'http://localhost:20128/v1', hasKey: true, state: 'not_configured' } },
+    });
+    bridge.request = async ({ path }) => {
+      if (path === '/capabilities') return { ok: true, body: [
+        { action: 'device.app.launch_native' }, { action: 'device.app.status_native' },
+      ] };
+      if (path.startsWith('/consents')) return { ok: true, body: [
+        { scope: 'system.app.launch', max_risk: 'medium' },
+      ] };
+      return { ok: false, status: 503, error: 'fixture route unavailable' };
+    };
+  } });
+  document.getElementById('voiceReadinessCheck').click();
+  await new Promise(setImmediate);
+  const result = document.getElementById('voiceReadinessResult').textContent;
+  assert.match(result, /macOS access granted/);
+  assert.match(result, /record a command to verify/);
+  assert.match(result, /Capability and permission found/);
+  assert.match(result, /Grant system.app.status/);
+  assert.match(result, /Enable browser drive/);
 });

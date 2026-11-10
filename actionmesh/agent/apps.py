@@ -16,6 +16,7 @@ MAC_APPS = {
     "activity monitor": "com.apple.ActivityMonitor",
     "calculator": "com.apple.calculator",
     "calendar": "com.apple.iCal",
+    "claude": "com.anthropic.claudefordesktop",
     "clock": "com.apple.clock",
     "dictionary": "com.apple.Dictionary",
     "finder": "com.apple.finder",

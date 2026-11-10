@@ -158,6 +158,7 @@ const state = {
   ready: null,
   selectedTask: null,
   voiceTask: null,
+  voicePermissionSetup: null,
   automaticApprovals: new Map(),
   voiceSubmitting: false,
   runningTasks: new Set(),
@@ -660,6 +661,9 @@ function refreshTasksBadgeOnly() {
 const VOICE_SETUP_PERMISSIONS = {
   'device.app.launch_native': { scope: 'system.app.launch', risk: 'medium', label: 'app launch' },
   'device.app.status_native': { scope: 'system.app.status', risk: 'low', label: 'app status' },
+  'github.repositories.search': { scope: 'github.read', risk: 'low', label: 'GitHub read' },
+  'github.issues.list': { scope: 'github.read', risk: 'low', label: 'GitHub read' },
+  'google.drive.search': { scope: 'google.drive.read', risk: 'low', label: 'Google Drive read' },
   'browser.open': { scope: 'browser.control', risk: 'low', label: 'browser' },
   'browser.search': { scope: 'search.web', risk: 'low', label: 'web search' },
 };
@@ -707,6 +711,8 @@ function renderTaskDetail(host, session) {
       class: 'btn ghost', type: 'button', text: `Set up ${label} permission`,
     });
     permission.addEventListener('click', () => {
+      const untouched = session.steps.every((step) => ['pending', 'denied', 'skipped'].includes(step.state));
+      state.voicePermissionSetup = untouched ? { scope, request: session.request } : null;
       showView('approvals');
       byId('consentScope').value = scope;
       byId('consentRisk').value = risk;
@@ -742,7 +748,9 @@ function renderTaskDetail(host, session) {
   }
 
   const parts = [head];
-  if (session.description) {
+  if (inVoice) {
+    parts.push(el('p', { class: 'card-note', text: voiceRunReport(session) }));
+  } else if (session.description) {
     parts.push(el('pre', { class: 'mono', text: session.description }));
   }
   parts.push(actions);
@@ -765,14 +773,20 @@ function renderTaskDetail(host, session) {
     actions.append(explain);
   }
 
-  parts.push(steps);
+  if (inVoice) {
+    parts.push(el('details', { class: 'secondary-panel' }, [
+      el('summary', { text: 'Execution details' }), steps,
+    ]));
+  } else {
+    parts.push(steps);
+  }
 
   const diagnosis = state.diagnoses.get(session.session_id);
   if (diagnosis) {
     parts.push(renderDiagnosis(diagnosis));
   }
 
-  if (session.summary) {
+  if (!inVoice && session.summary) {
     parts.push(el('p', { class: 'fine', text: session.summary }));
   }
   replace(host, parts);
@@ -800,6 +814,19 @@ function renderStep(step) {
   if (step.verified !== null && step.verified !== undefined) rows.push(['verified', step.verified ? 'yes' : 'no']);
   if (step.error) rows.push(['error', step.error]);
   if (rows.length) body.append(kvTable(rows));
+  if (step.verified === true && typeof step.observed?.source_url === 'string'
+    && /^https:\/\/(github\.com|drive\.google\.com)\//.test(step.observed.source_url)) {
+    const source = el('button', { class: 'btn ghost small', type: 'button', text: 'Open source' });
+    source.addEventListener('click', () => void bridge.openExternal(step.observed.source_url));
+    body.append(source);
+    const links = step.observed.connector_results;
+    for (const row of (Array.isArray(links) ? links.slice(0, 10) : [])) {
+      if (typeof row?.name !== 'string' || !/^https:\/\/github\.com\//.test(row.source_url)) continue;
+      const link = el('button', { class: 'btn ghost small', type: 'button', text: row.name });
+      link.addEventListener('click', () => void bridge.openExternal(row.source_url));
+      body.append(link);
+    }
+  }
   if (step.observed) {
     body.append(el('div', { class: 'fine', text: 'Observed (from what the provider returned):' }));
     body.append(el('pre', { class: 'mono', text: JSON.stringify(step.observed, null, 2) }));
@@ -823,13 +850,47 @@ function renderStep(step) {
 
 function voiceRunReport(session) {
   if (session.status === 'awaiting_approval') return 'Waiting for your approval.';
-  if (session.status === 'needs_review') return 'Task paused for review.';
+  if (session.status === 'needs_review') {
+    if (session.steps?.some((step) => step.observed?.status === 'needs_user')) {
+      return 'Complete the prompt in the browser, then edit and resend your command.';
+    }
+    return 'Task paused for review.';
+  }
+  const denied = session.steps?.find((step) => step.state === 'denied'
+    && step.error?.includes('missing permission(s)')
+    && Object.hasOwn(VOICE_SETUP_PERMISSIONS, step.action_type));
+  if (denied) return `I need ${VOICE_SETUP_PERMISSIONS[denied.action_type].label} permission. Open Task Results to set it up.`;
   if (session.status !== 'completed') return `Task status: ${session.status.replaceAll('_', ' ')}.`;
   const steps = session.steps || [];
   const step = steps[0];
+  if (session.status === 'proposed') return 'Ready to run.';
+  if (steps.length === 1 && step.action_type === 'browser.open' && step.verified === true) {
+    return 'I opened the browser.';
+  }
   if (steps.length === 1 && step.action_type === 'device.app.status_native' && step.verified === true
     && typeof step.observed?.running === 'boolean' && typeof step.observed.app === 'string') {
     return `${step.label?.replace(/^Check /, '') || step.observed.app} is ${step.observed.running ? 'running' : 'closed'}.`;
+  }
+  if (steps.length && steps.every((item) => item.verified === true
+    && Object.hasOwn(VOICE_SETUP_PERMISSIONS, item.action_type)
+    && (item.action_type === 'device.app.launch_native'
+      || (item.action_type === 'device.app.status_native' && typeof item.observed?.running === 'boolean')))) {
+    return steps.map((item) => {
+      const name = item.label.replace(/^(Open|Check) /, '');
+      return item.action_type === 'device.app.launch_native'
+        ? `I opened ${name}.`
+        : `${name} is ${item.observed?.running ? 'running' : 'closed'}.`;
+    }).join(' ');
+  }
+  const lookup = steps.findLast((item) => item.verified === true && Number.isInteger(item.observed?.count)
+    && typeof item.observed?.source_url === 'string');
+  if (lookup) {
+    const count = lookup.observed.total ?? lookup.observed.count;
+    const followup = steps.some((item) => item.action_type === 'github.issues.list' && item.state === 'skipped')
+      ? ' Give me the exact owner and repository name to check its issues.' : '';
+    const boundary = lookup.observed.truncated && lookup.observed.total === undefined
+      ? ' More results may be available.' : '';
+    return `I found ${count} matching ${count === 1 ? 'result' : 'results'}.${boundary} Open the source in Task Results.${followup}`;
   }
   const search = steps.find((item) => item.action_type === 'browser.search' && item.verified === true);
   if (Number.isInteger(search?.observed?.count)) {
@@ -1553,7 +1614,16 @@ async function grantConsent(button) {
     });
     field.value = '';
     toast(`Granted ${scope}.`, 'good');
-    await refreshConsents();
+    const setup = state.voicePermissionSetup;
+    state.voicePermissionSetup = null;
+    if (setup?.scope === scope && setup.request && state.view === 'approvals') {
+      showView('voice');
+      const input = byId('voiceTranscript');
+      input.value = setup.request;
+      input.focus();
+    } else {
+      await refreshConsents();
+    }
   } catch (error) {
     toast(`That permission was not granted: ${error.message}`, 'bad');
   } finally {
@@ -2329,6 +2399,8 @@ async function refreshSettings() {
   byId('setAllowShell').checked = Boolean(settings.allowShell);
   byId('setAllowDesktop').checked = Boolean(settings.allowDesktop);
   byId('setAllowBrowser').checked = Boolean(settings.allowBrowser);
+  byId('setAllowGithubRead').checked = Boolean(settings.allowGithubRead);
+  byId('setAllowDriveRead').checked = Boolean(settings.allowDriveRead);
   byId('setAllowMedia').checked = Boolean(settings.allowMedia);
   byId('setAllowedCommands').value = (settings.allowedCommands || []).join(', ');
 
@@ -2368,10 +2440,20 @@ async function saveSettings() {
       allowShell: byId('setAllowShell').checked,
       allowDesktop: byId('setAllowDesktop').checked,
       allowBrowser: byId('setAllowBrowser').checked,
+      allowGithubRead: byId('setAllowGithubRead').checked,
+      allowDriveRead: byId('setAllowDriveRead').checked,
       allowMedia: byId('setAllowMedia').checked,
       allowedCommands: byId('setAllowedCommands').value.split(',').map((s) => s.trim()).filter(Boolean),
     };
+    const forgetTokens = byId('forgetConnectorTokens');
+    for (const [id, key] of [['setGithubReadToken', 'githubReadToken'], ['setDriveReadToken', 'driveReadToken']]) {
+      const input = byId(id);
+      if (forgetTokens.checked || input.value.trim()) patch[key] = forgetTokens.checked ? '' : input.value.trim();
+    }
     const answer = await bridge.updateSettings(patch);
+    byId('setGithubReadToken').value = '';
+    byId('setDriveReadToken').value = '';
+    forgetTokens.checked = false;
     const shortcut = answer && answer.shortcut;
     byId('settingsSaved').textContent = shortcut && shortcut.registered
       ? 'Saved. The shortcut is registered.'
@@ -3766,6 +3848,11 @@ function renderVoiceSupport() {
     return;
   }
 
+  const language = byId('voiceRecognitionLanguage');
+  const configuredLanguage = state.appState?.settings?.voiceTranscriptionLanguage;
+  if (language && !language.disabled) {
+    language.value = ['hi', 'auto'].includes(configuredLanguage) ? configuredLanguage : 'en';
+  }
   const audio = state.appState?.purposes?.audio;
   const gateway = Boolean(audio?.provider === 'openai_compatible_stt' && audio.hasKey && audio.endpoint && audio.model);
   voice.setGatewayEnabled?.(gateway);
@@ -4008,6 +4095,11 @@ function wireVoice() {
       }
     });
     voice.onTranscript((text, info) => {
+      if (info?.final) {
+        const heard = byId('voiceHeard');
+        heard.textContent = `Heard: ${text}`;
+        heard.hidden = false;
+      }
       if (info?.final && voiceConversationActive) {
         const command = text.trim().replace(/^(?:hey\s+)?jarvis[,!:\s]+/i, '').replace(/[.!?]+$/, '').trim();
         if (/^(stop listening|end conversation)$/i.test(command)) {
@@ -4029,6 +4121,39 @@ function wireVoice() {
     voice.onError((message) => toast(message, 'bad'));
   }
 
+  const language = byId('voiceRecognitionLanguage');
+  language.addEventListener('change', async () => {
+    language.disabled = true;
+    try {
+      const result = await bridge.updateSettings({ voiceTranscriptionLanguage: language.value });
+      if (state.appState) state.appState.settings = result.settings;
+    } catch {
+      toast('Could not save the recognition language.', 'bad');
+    } finally {
+      language.disabled = false;
+      renderVoiceSupport();
+    }
+  });
+  const replyVoice = byId('voiceReplyVoice');
+  const previewSpeech = byId('voicePreviewSpeech');
+  byId('voiceReadinessCheck').addEventListener('click', () => void checkVoiceReadiness());
+  function refreshReplyVoices() {
+    const selected = replyVoice.value;
+    const voices = voice?.replyVoices?.() || [];
+    replace(replyVoice, [
+      el('option', { value: '', text: 'Automatic' }),
+      ...voices.map((item) => el('option', { value: item.voiceURI, text: `${item.name} (${item.lang})` })),
+    ]);
+    if (voices.some((item) => item.voiceURI === selected)) replyVoice.value = selected;
+  }
+  refreshReplyVoices();
+  window.speechSynthesis?.addEventListener?.('voiceschanged', refreshReplyVoices);
+  replyVoice.addEventListener('change', () => voice?.setReplyVoice?.(replyVoice.value));
+  previewSpeech.disabled = !voice?.textToSpeechSupported;
+  previewSpeech.addEventListener('click', () => {
+    endVoiceConversation();
+    speakVoiceReply(voice, 'Hello. I’m ready for your command.');
+  });
   byId('voiceConversation')?.addEventListener('change', (event) => {
     if (!event.target.checked) endVoiceConversation();
   });
@@ -4054,10 +4179,7 @@ function wireVoice() {
   }
 
   const stopListening = byId('voiceStopListening');
-  if (stopListening) stopListening.addEventListener('click', () => {
-    if (voiceConversationActive) endVoiceConversation();
-    else voice?.stopListening();
-  });
+  if (stopListening) stopListening.addEventListener('click', () => voice?.stopListening());
   const stopSpeaking = byId('voiceStopSpeaking');
   if (stopSpeaking) stopSpeaking.addEventListener('click', () => (voice ? voice.stopSpeaking() : null));
   const cancel = byId('voiceCancel');
@@ -4070,6 +4192,7 @@ function wireVoice() {
   const clear = byId('voiceClear');
   if (clear) clear.addEventListener('click', () => {
     byId('voiceTranscript').value = '';
+    byId('voiceHeard').hidden = true;
     byId('voiceReply').hidden = true;
     state.voiceTask = null;
     void refreshVoiceResult();
@@ -4115,6 +4238,57 @@ function wireVoice() {
       renderVoiceSupport();
       if (voice?.supported) byId('voiceMic')?.click();
     });
+  }
+}
+
+async function checkVoiceReadiness() {
+  const button = byId('voiceReadinessCheck');
+  const result = byId('voiceReadinessResult');
+  button.disabled = true;
+  try {
+    await refreshAppState();
+    const snapshot = state.appState;
+    const microphone = snapshot?.microphonePermission || 'unknown';
+    const audio = snapshot?.purposes?.audio;
+    const audioConfigured = audio?.provider && audio.hasKey && audio.endpoint && audio.model;
+    const rows = [
+      ['Backend', state.backendReady ? 'Ready' : 'Offline. Restart the backend in Settings.'],
+      ['Microphone', microphone === 'granted' ? 'macOS access granted'
+        : microphone === 'denied' || microphone === 'restricted'
+          ? 'Access blocked. Check macOS Privacy & Security → Microphone.'
+          : 'Access unconfirmed. Press the microphone to check.'],
+      ['Recognition', audioConfigured
+        ? `${audio.model} · ${audio.state === 'connected' ? 'Last transcription succeeded' : 'Configured; record a command to verify'}`
+        : 'Set an Audio provider, model and key in Providers.'],
+    ];
+    if (state.backendReady) {
+      const [capabilities, grants] = await Promise.allSettled([
+        GET('/capabilities'), GET(`/consents?actor_id=${encodeURIComponent(IDENTITY.id)}`),
+      ]);
+      for (const [label, action, scope, risk] of [
+        ['Open Calculator', 'device.app.launch_native', 'system.app.launch', 'medium'],
+        ['Check Calculator status', 'device.app.status_native', 'system.app.status', 'low'],
+        ['Open browser', 'browser.open', 'browser.control', 'low'],
+      ]) {
+        let detail = 'Could not read capabilities or permissions.';
+        if (capabilities.status === 'fulfilled' && grants.status === 'fulfilled') {
+          const available = capabilities.value.some((entry) => entry.action === action);
+          const allowedRisks = risk === 'medium' ? ['medium', 'high', 'critical'] : ['low', 'medium', 'high', 'critical'];
+          const granted = grants.value.some((entry) => entry.scope === scope && allowedRisks.includes(entry.max_risk));
+          detail = available
+            ? (granted ? 'Capability and permission found' : `Grant ${scope} in Approvals.`)
+            : (action === 'browser.open' ? 'Enable browser drive in Settings.' : 'Mac app capability unavailable.');
+        }
+        rows.push([label, detail]);
+      }
+    }
+    replace(result, rows.flatMap(([label, detail]) => [
+      el('dt', { text: label }), el('dd', { text: detail }),
+    ]));
+  } catch {
+    replace(result, el('dd', { text: 'Could not check setup.' }));
+  } finally {
+    button.disabled = false;
   }
 }
 

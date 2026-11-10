@@ -1519,6 +1519,12 @@ class ExecutionEngine:
             return outcome
 
         outcome.result = dict(provider_result.data)
+        if resolved.action.type.startswith("browser.") and outcome.result.get("status") == "needs_user":
+            self.ledger.fail(key)
+            outcome.state = ActionState.REQUIRES_USER
+            outcome.verified = False
+            outcome.error = "The browser needs your attention. Complete the prompt and retry the command."
+            return outcome
         outcome.state = ActionState.VERIFYING
         try:
             # C6's verification is a synchronous, in-process inspection of

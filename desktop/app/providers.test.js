@@ -28,7 +28,7 @@ function fakeRequest(reply, calls = []) {
         handlers[event] = handler;
         return req;
       },
-      write() {},
+      write(body) { options.body = body; },
       end() {
         // Answer asynchronously, the way a real socket would.
         setImmediate(() => {
@@ -275,9 +275,12 @@ test('transcription uses the fixed audio route and refuses invalid audio before 
   assert.equal(calls[0].hostname, '127.0.0.1');
   assert.equal(calls[0].path, '/v1/audio/transcriptions');
   assert.match(calls[0].headers['content-type'], /^multipart\/form-data; boundary=/);
+  assert.match(String(calls[0].body), /name="language"\r\n\r\nen\r\n/);
   assert.equal((await providers.transcribe(config, new Uint8Array(1024 * 1024 + 1), 'audio/webm', options)).transcript, undefined);
   assert.equal((await providers.transcribe(config, new Uint8Array([1]), 'video/webm', options)).transcript, undefined);
   assert.equal(calls.length, 1);
+  await providers.transcribe({ ...config, language: 'auto' }, new Uint8Array([1]), 'audio/webm', options);
+  assert.doesNotMatch(String(calls[1].body), /name="language"/);
 });
 
 test('the timeout is clamped to 1..60 seconds', async () => {

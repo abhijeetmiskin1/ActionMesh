@@ -268,7 +268,7 @@ _RULES: tuple[
 )
 
 
-_CLAUSE_SPLIT = re.compile(r"\s*;\s*|\s+(?:and\s+)?then\s+", re.I)
+_CLAUSE_SPLIT = re.compile(r"\s*;\s*|(?:,\s*|\s+)(?:and\s+)?then\s+", re.I)
 
 
 def _clauses(text: str) -> list[str]:

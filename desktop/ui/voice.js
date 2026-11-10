@@ -368,6 +368,13 @@
     if (api.state !== 'idle') emitState('idle');
   }
 
+  let selectedVoiceURI = '';
+  function replyVoices() {
+    return (synthesis?.getVoices?.() || []).filter(
+      (voice) => voice.localService && /^en(?:-|_)/i.test(voice.lang),
+    );
+  }
+
   function speak(text) {
     if (!textToSpeechSupported) return false;
     const phrase = String(text === undefined || text === null ? '' : text).trim();
@@ -378,8 +385,13 @@
     silence();
 
     const speech = new Synthesis(phrase);
-    speech.lang = 'en-US';
-    speech.rate = 1.0;
+    const voices = replyVoices();
+    const voice = voices.find((item) => item.voiceURI === selectedVoiceURI)
+      || voices.find((item) => item.name === 'Rishi')
+      || voices.find((item) => item.name === 'Daniel');
+    if (voice) speech.voice = voice;
+    speech.lang = voice?.lang || 'en-US';
+    speech.rate = 0.92;
     utterance = speech;
 
     speech.onend = () => {
@@ -419,6 +431,8 @@
     if (STATES.has(name)) emitState(name, detail);
   }
 
+  api.replyVoices = replyVoices;
+  api.setReplyVoice = (uri) => { selectedVoiceURI = uri; };
   api.startListening = startListening;
   api.stopListening = stopListening;
   api.cancel = cancel;

@@ -290,7 +290,7 @@ def _food_discover() -> list[dict[str, Any]]:
             when={"step": 1, "state": "success"},
         ),
         _step(
-            "Present names, ratings, prices, delivery and menu to compare",
+            "Inspect the resulting page",
             "browser.inspect",
             when={"step": 2, "state": "success"},
         ),
@@ -657,7 +657,7 @@ _BOOK_TRIGGERS = ("book", "booking", "reserve", "ticket")
 # tests/unit/test_phase4_templates.py::TestWebIntentDoesNotShadow.
 _DEAL_SEARCH_RX = re.compile(
     r"^(?:find|check|compare|look for|show me) (?:me )?(?:the )?"
-    r"(?:best )?(?:(?:verified|vrified) )?deals?(?: for (.*))?[.?!]*$",
+    r"(?:best )?(?:(?:verified|vrified) )?(?:deals?|offers?)(?: (?:for|on) (.*))?[.?!]*$",
     re.I,
 )
 _DEAL_FOLLOW_UP_RX = re.compile(r"\s+(?:and|then)\s+(?:then\s+)?(?:order|buy)\b", re.I)
@@ -708,7 +708,10 @@ def match_website_intent(text: str) -> str | None:
         return "train.search"
     if _WEB_SEARCH_RX.search(cleaned):
         return "web.search"
-    if _FOOD_DISCOVER_RX.search(cleaned):
+    if _FOOD_DISCOVER_RX.search(cleaned) and re.search(
+        r"\b(?:zomato|swiggy|uber eats|doordash|deliveroo|food|pizza|restaurants?|"
+        r"menus?|near me|nearby)\b", cleaned,
+    ):
         return "food.discover"
     return None
 

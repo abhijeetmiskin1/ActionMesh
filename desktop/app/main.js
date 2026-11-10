@@ -468,6 +468,8 @@ function appState() {
     chrome: process.versions.chrome,
     node: process.versions.node,
     platform: process.platform,
+    microphonePermission: process.platform === 'darwin'
+      ? systemPreferences?.getMediaAccessStatus?.('microphone') || 'unknown' : 'unknown',
     arch: process.arch,
     backend: backend ? backend.snapshot() : { status: 'stopped' },
     settings: settings ? settings.public() : null,
@@ -815,7 +817,8 @@ function registerIpc() {
     const apiKey = settings.secret('audioApiKey');
     transcriptionInFlight = true;
     try {
-      const answer = await providers.transcribe({ model, baseUrl, apiKey, timeoutSeconds: timeout },
+      const language = settings.get('voiceTranscriptionLanguage');
+      const answer = await providers.transcribe({ model, baseUrl, apiKey, timeoutSeconds: timeout, language },
         recording?.bytes, recording?.mime);
       const current = purposeFields('audio');
       if (current.provider === provider && current.model === model && current.endpoint === baseUrl
@@ -1271,6 +1274,10 @@ app.whenReady().then(async () => {
     isPackaged: app.isPackaged,
     resourcesPath: process.resourcesPath,
     settings: settings.values,
+    connectorCredentials: () => ({
+      github: settings.secret('githubReadToken'),
+      drive: settings.secret('driveReadToken'),
+    }),
     key: newLoopbackKey(),
     bridge: bridgeToken ? { socketPath: bridgeSocket, token: bridgeToken } : null,
     // Env only: socket path + per-launch token, never a credential. The backend

@@ -72,3 +72,18 @@ cd desktop && npm test                             # node --test
 
 Do not rerun the full suites just to write documentation. New behavior
 needs a focused test; run the affected file(s).
+
+## November 9 Mac demo baseline
+
+The existing Apple Silicon 0.2.0 build opened the physical microphone in the
+desktop Voice Commands window. Typed “Open browser” verified one action and
+“Open Calculator, then is Calculator running?” verified both actions. The
+short product follow-up reached execution, then stopped on missing
+`search.web` permission. This was an authorization failure, separate from
+the earlier wrong-language transcription and malformed-planner-output bugs.
+
+For repeatable speech acceptance, feed a supplied recording into the
+packaged renderer's MediaRecorder path, keep the configured transcription
+provider and real executor in use, then inspect Heard and Task Results.
+Check physical microphone access separately. These checks do not measure
+recognition of a live speaker in the demo room.
