@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="previews/actionmesh-readme-hero.jpg" alt="VoiceOS routes a spoken request to desktop actions and a verified result" width="100%">
+<img src="previews/actionmesh-readme-hero.jpg" width="100%" alt="VoiceOS desktop assistant connected to a browser, app controls, and a verified result">
 
 # ActionMesh + VoiceOS
 
-### Say what you need. See what happened.
+### A voice-first assistant for real desktop work.
 
-VoiceOS is a voice-first desktop assistant. ActionMesh checks each requested action, runs it through one controlled pipeline, and shows the result with evidence.
+Speak or type a request. Follow the task as it runs. See what was verified, what needs approval, and what could not be done.
 
 <br>
 
@@ -17,107 +17,99 @@ VoiceOS is a voice-first desktop assistant. ActionMesh checks each requested act
 
 <br>
 
-[Try the demo](#try-it) · [How it works](#one-request-one-pipeline) · [Roadmap](#where-its-going) · [Set up locally](#run-it-locally)
+[⚡ Quick demo](#quick-demo) · [🧭 How it works](#from-request-to-result) · [✅ Capabilities](#capabilities) · [🗺️ Roadmap](#roadmap) · [🛠️ Setup](#run-locally)
 
 </div>
 
 ---
 
-## A desktop assistant with a visible result
+## Built around a simple promise
 
-Give a short voice or typed command. VoiceOS turns it into a supported task, asks for a missing detail when needed, and hands it to ActionMesh. You can see whether the task is running, finished, blocked, or waiting for your approval.
+ActionMesh is the control layer. VoiceOS is the desktop interface. Together, they turn supported requests into observable tasks with clear permission checks and results.
 
-## Try it
+<div align="center">
+<img src="previews/actionmesh-task-flow.jpg" width="88%" alt="Illustration of a spoken request moving through a task plan and permission check to a verified result">
+<br><sub>Concept illustration · the desktop interface and available actions depend on your setup</sub>
+</div>
 
-Open **Voice Commands**, press the microphone, and say one of these. You can also type the same request and use **Send & run**.
+## ⚡ Quick demo
 
-| Say this | What you should see |
+Open **Voice Commands**, press the microphone, and try these. For a quiet room, type the same words and click **Send & run**.
+
+| Try saying | Expected behavior |
 |---|---|
-| **“Open Calculator, then is Calculator running?”** | Calculator opens, then its running state is checked independently. |
-| **“Open WhatsApp”** | Requests the native app launch through the existing permission flow. WhatsApp must be installed on the Mac. |
+| **“Open Calculator, then is Calculator running?”** | Opens Calculator, then checks its running state independently. |
+| **“Open WhatsApp”** | Requests the native launch using the app permission. WhatsApp must be installed on the Mac. |
 | **“Open browser”** | Opens a page in the controlled browser and reports the observed navigation. |
-| **“Check the best deal”**, then **“USB-C charger”** | Asks for the product, then opens web search links. Search links are not verified offers. |
+| **“Check the best deal”** → **“USB-C charger”** | Asks for the product, then opens search links. These are discovery links, not verified offers. |
 | **“Show open issues in abhijeetmiskin1/ActionMesh”** | Looks up public repository issues and returns a source-linked result. |
 
-For continuous conversation, enable **Keep listening after replies**. Then try **“Jarvis, repeat that”** or **“Jarvis, stop listening.”** Check **Voice readiness → Check setup** before a live demo.
+In **Task Results**, check whether each step succeeded, failed, needs approval, or could not be verified. Enable **Keep listening after replies** to try **“Jarvis, repeat that”** and **“Jarvis, stop listening.”**
 
-## One request, one pipeline
+## 🧭 From request to result
 
 ```mermaid
 flowchart LR
-    U([Voice or text]) --> V[VoiceOS understands and proposes]
-    V --> R[Action registry checks the request]
+    U([Voice or text]) --> V[Understand and propose]
+    V --> R[Check registered actions]
     R --> P{Policy and permissions}
-    P -->|Needs approval| H[You review the specific action]
-    H -->|Approve| X[ActionMesh executes]
+    P -->|Approval required| H[You review the action]
+    H -->|Approve| X[Run through ActionMesh]
     P -->|Allowed| X
-    H -->|Reject| N[Task stops and reports why]
-    P -->|Denied| N
-    X --> O[Independent observation]
-    O --> T[Task Results and audit history]
+    H -->|Reject| S[Stop and explain]
+    P -->|Denied| S
+    X --> O[Observe the result independently]
+    O --> T[Show Task Results and audit]
 ```
 
-The proposal does not grant itself permission. ActionMesh applies policy, pauses for required approval, and checks the result separately from the action that ran. If it cannot verify the outcome, it says so.
-
-## What works today
-
-<table>
-<tr>
-<td width="50%">
-
-### Desktop control
-Native Mac app launch and status checks, plus a controlled browser path. Actions use the shared permission and verification pipeline.
-
-</td>
-<td width="50%">
-
-### Voice and typed commands
-Microphone capture, transcription, follow-up questions, and a typed fallback through the same task flow.
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### Task Results
-See each step, its state, what blocked it, and the observation used to verify it.
-
-</td>
-<td width="50%">
-
-### Connected data
-Public GitHub repository and issue lookup are available. Private repository reads need a scoped token.
-
-</td>
-</tr>
-</table>
-
-### In progress
-
-| Area | Current state |
+| Step | What happens |
 |---|---|
-| Google Drive | Search adapter and fixture coverage exist; live search needs a configured read-only OAuth connection. |
-| Shopping research | Finds search links. Offer matching, seller checks, and delivered-price comparison are not yet verified. |
-| Image creation | No working image provider is connected in this build. |
+| **Understand** | Convert a voice or typed request into a bounded task proposal. |
+| **Check** | Match the proposal to a registered action and its required permissions. |
+| **Control** | Pause for your approval when an action requires it. |
+| **Verify** | Check the resulting computer or provider state separately from execution. |
+| **Report** | Show the outcome and evidence in Task Results. |
 
-## Where it’s going
+The proposal cannot grant itself authority. If the result is uncertain, the task stays unverified instead of being described as a success.
 
-The goal is a useful everyday assistant that can handle a request from first instruction to a clear, verifiable result. Each stage builds on the same permission and execution path.
+## ✅ Capabilities
 
-<table>
-<tr><th>Stage</th><th>Planned direction</th><th>Progress</th></tr>
-<tr><td><strong>1 · Reliable desktop tasks</strong></td><td>More dependable speech, app and browser control, natural follow-ups, and clear recovery when something is unavailable.</td><td>In development</td></tr>
-<tr><td><strong>2 · Personal work search</strong></td><td>Read-only search across connected GitHub and Google Workspace data, with source links and concise summaries.</td><td>Adapters underway</td></tr>
-<tr><td><strong>3 · Multi-step assistance</strong></td><td>Use verified results to choose a bounded next step, while asking when a target is unclear.</td><td>Planned</td></tr>
-<tr><td><strong>4 · Research and creation</strong></td><td>Compare real offers and add image creation only when a supported provider can be verified.</td><td>Planned</td></tr>
-<tr><td><strong>5 · User-approved actions</strong></td><td>Extend into higher-impact tasks with clear details, per-action approval, and a verifiable receipt.</td><td>Future</td></tr>
-</table>
+| Area | Available now | Boundary |
+|---|---|---|
+| **Desktop apps** | Allowlisted Mac app launch and status checks | Requires the app to be installed and the relevant permission. |
+| **Browser** | Controlled open, search, and page observation | Login, CAPTCHA, and MFA remain for you to handle. |
+| **Voice** | Microphone capture, transcription, spoken replies, and follow-up turns | Requires microphone access and a configured transcription service. |
+| **Typed fallback** | Submit the same request path from the Voice Commands screen | Useful for rehearsal or noisy rooms. |
+| **GitHub** | Public repository and issue lookup | Private repository reads need a scoped connection. |
+| **Google Drive** | File search adapter and fixture coverage | Live search needs a read-only OAuth connection. |
+| **Shopping research** | Product search links | Seller checks, offer matching, and delivered totals are not yet verified. |
 
-These are project directions, not promises that unfinished integrations already work. See the [roadmap](docs/project/ROADMAP.md) for current detail.
+### Available today, still being built
 
-## Run it locally
+```text
+READY TO TRY       Mac app control · controlled browser · voice and typed tasks
+CONNECT WHEN READY GitHub reads · Google Drive read-only search
+IN DEVELOPMENT    Natural multi-step follow-through · richer deal comparison
+NOT CONNECTED     Image creation
+```
 
-Requirements: Python 3.11 or newer and Node.js.
+The status above separates available behavior from integrations that need credentials or further implementation. See [integrations and setup](docs/project/INTEGRATIONS.md) and [testing and acceptance](docs/project/TESTING_AND_ACCEPTANCE.md).
+
+## 🗺️ Roadmap
+
+| Stage | Direction | Status |
+|:--|:--|:--:|
+| **01 · Desktop basics** | Make voice, app control, browser tasks, and recovery dependable. | In development |
+| **02 · Personal search** | Search connected work sources with bounded access and useful source links. | Adapters underway |
+| **03 · Follow-through** | Choose a bounded next step from verified results and ask when details are missing. | Planned |
+| **04 · Product research** | Compare matching products, sellers, shipping, and current availability. | Planned |
+| **05 · More capabilities** | Add other providers only after their real end-to-end behavior can be checked. | Future |
+
+These are project goals, not claims that unfinished features already work. Follow the [project roadmap](docs/project/ROADMAP.md) for updates.
+
+## 🛠️ Run locally
+
+**Requirements:** Python 3.11+ and Node.js.
 
 ```bash
 python3 -m venv .venv
@@ -127,9 +119,9 @@ npm ci
 npm start
 ```
 
-To use speech recognition, configure **Providers → Audio** with a compatible transcription endpoint, model, and credential. Grant only the permissions needed for the commands you want to try. Provider credentials are stored through the operating system’s credential service.
+For speech recognition, configure **Providers → Audio** with a transcription endpoint, model, and credential. Then grant only the permissions needed for the commands you plan to use. Credentials are stored through the operating system’s credential service.
 
-### Run the checks
+### Run the project checks
 
 From the project root:
 
@@ -140,19 +132,20 @@ From the project root:
 (cd desktop && npm test)
 ```
 
-## Explore the project
+## 📚 Project map
 
-| | |
+| Start here | Learn more |
 |---|---|
-| **Project overview** | [Solution pitch](docs/SOLUTION_PITCH.md) · [Project overview](docs/project/PROJECT_OVERVIEW.md) |
-| **Design and safeguards** | [System architecture](docs/project/SYSTEM_ARCHITECTURE.md) · [Security model](docs/project/SECURITY_MODEL.md) · [Execution contract](docs/c42-execution-contract.md) |
-| **Build and test** | [Development guide](docs/project/DEVELOPMENT_GUIDE.md) · [Integrations](docs/project/INTEGRATIONS.md) · [Testing and acceptance](docs/project/TESTING_AND_ACCEPTANCE.md) |
-| **Project details** | [Roadmap](docs/project/ROADMAP.md) · [Changelog](CHANGELOG.md) · [Apache 2.0 license](LICENSE) |
+| [Project overview](docs/project/PROJECT_OVERVIEW.md) | [One-page solution pitch](docs/SOLUTION_PITCH.md) |
+| [System architecture](docs/project/SYSTEM_ARCHITECTURE.md) | [Security model](docs/project/SECURITY_MODEL.md) |
+| [Development guide](docs/project/DEVELOPMENT_GUIDE.md) | [Execution contract](docs/c42-execution-contract.md) |
+| [Integrations](docs/project/INTEGRATIONS.md) | [Testing and acceptance](docs/project/TESTING_AND_ACCEPTANCE.md) |
+| [Roadmap](docs/project/ROADMAP.md) | [Changelog](CHANGELOG.md) · [Apache 2.0 license](LICENSE) |
 
 <div align="center">
 
 ---
 
-**ActionMesh + VoiceOS** · Built to make desktop assistance observable, permission-aware, and useful.
+**ActionMesh + VoiceOS** · Clear actions. Clear permissions. Clear results.
 
 </div>
