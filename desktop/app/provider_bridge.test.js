@@ -212,17 +212,30 @@ test('status records the last verified state over the inferred one', async (t) =
 });
 
 test('status narrates the injected verified state to main when it is supplied', async (t) => {
-  const settings = fakeSettings();
+  const settings = fakeSettings({
+    values: {
+      purpose_reasoning_provider: 'openai_compatible',
+      purpose_reasoning_model: 'local-model',
+      purpose_reasoning_endpoint: 'http://localhost:20128/v1',
+    },
+    secrets: { reasoningApiKey: API_KEY },
+  });
   const providers = fakeProviders();
   const seen = [];
   const { socketPath } = await withBridge(t, {
     settings,
     providers,
-    noteTestResult: (state) => seen.push(state),
+    getStatus: () => ({ state: seen.at(-1)?.state || 'not_configured' }),
+    noteTestResult: (state, lane) => seen.push({ state, ...lane }),
   });
 
   await roundTrip(socketPath, frameFor({}));
-  assert.deepEqual(seen, ['connected']);
+  assert.deepEqual(seen, [{
+    state: 'connected', purpose: 'reasoning', provider: 'openai_compatible',
+    model: 'local-model', baseUrl: 'http://localhost:20128/v1',
+  }]);
+  const { frame } = await roundTrip(socketPath, frameFor({ op: 'status' }));
+  assert.equal(frame.state, 'connected');
 });
 
 // -- live settings --------------------------------------------------------------

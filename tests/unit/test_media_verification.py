@@ -10,11 +10,15 @@ the distinct honest answers when the read-back itself fails:
   rather than staying absent forever
 - a command on a ghost name answers ``unavailable``/``ambiguous``, never a guess
 
-MPRIS stays explicitly NOT live-verified (media.py:300): these are fixture
-tests against FakeMediaDriver, not live-player claims.
+These tests use fixtures. The opt-in mpv test lives in
+`tests/e2e/test_phase4_live_acceptance.py`.
 """
 
 from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from actionmesh.agent.media import (
     FakeMediaDriver,
@@ -90,3 +94,45 @@ def test_ghost_player_is_never_guessed() -> None:
     driver.add_player("vlc", state="paused")
     engine2 = MediaEngine(driver)
     assert engine2.play("ghost")["status"] == "ambiguous"
+
+
+def test_mpris_uses_the_reply_type_for_each_dbus_method(monkeypatch) -> None:
+    glib = SimpleNamespace(
+        Variant=lambda signature, arguments: (signature, arguments),
+        VariantType=lambda signature: signature,
+    )
+    monkeypatch.setitem(sys.modules, "gi", SimpleNamespace(require_version=Mock()))
+    monkeypatch.setitem(sys.modules, "gi.repository", SimpleNamespace(GLib=glib))
+    bus = Mock()
+    bus.call_sync.return_value.unpack.return_value = ({"PlaybackStatus": "Paused"},)
+    driver = MprisMediaDriver()
+    monkeypatch.setattr(driver, "_session_bus", lambda: bus)
+
+    assert driver.get("mpv").state == "paused"
+    get_all = bus.call_sync.call_args.args
+    assert get_all[3:6] == ("GetAll", ("(s)", (driver._PLAYER_IFACE,)), "(a{sv})")
+
+    assert driver.command("mpv", "play")
+    play = bus.call_sync.call_args.args
+    assert play[3:6] == ("Play", ("()", ()), "()")
+
+
+def test_mpris_open_confirms_the_current_file_after_dispatch(monkeypatch) -> None:
+    driver = MprisMediaDriver()
+    monkeypatch.setattr(driver, "_player_names", lambda: ["mpv", "vlc"])
+    dispatch = Mock()
+    monkeypatch.setattr(driver, "_call", dispatch)
+    monkeypatch.setattr("actionmesh.agent.media.time.sleep", lambda _: None)
+
+    stale = {"Metadata": {"xesam:url": "file:///tmp/old.wav"}}
+    get_all = Mock(return_value=stale)
+    monkeypatch.setattr(driver, "_get_all", get_all)
+    assert driver.open_file("/tmp/new track.wav") == "rejected"
+    dispatch.assert_called_once()
+
+    dispatch.reset_mock()
+    get_all.side_effect = [
+        stale, {"Metadata": {"xesam:url": "file:///tmp/new%20track.wav"}},
+    ]
+    assert driver.open_file("/tmp/new track.wav") == "opened"
+    assert dispatch.call_args.args[3:] == ("OpenUri", "(s)", ("file:///tmp/new%20track.wav",))

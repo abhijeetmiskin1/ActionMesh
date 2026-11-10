@@ -2,6 +2,10 @@
 
 *The entry point for every future AI coding agent. Read this first.*
 
+The 2026-11-08 run closed P0 browser and MPRIS acceptance. See
+[Testing and Acceptance](TESTING_AND_ACCEPTANCE.md) for the scope and
+commands. The 2026-11-04 checkpoint below records the earlier state.
+
 ## Project identity
 
 **ActionMesh** — a permission-aware, verifiable, cross-application
@@ -127,8 +131,7 @@ for the Mermaid diagrams.
 
 1. `git status` — see the dirty C42 tree; do not disturb it.
 2. Read [CURRENT_STATUS.md](CURRENT_STATUS.md) + `docs/c42-execution-contract.md`.
-3. Pick the next task from [ROADMAP.md](ROADMAP.md) (P0-1 MPRIS live
-   verification is the smallest honest first step).
+3. Pick the next open task from [ROADMAP.md](ROADMAP.md).
 4. Add a focused test, implement, run only the affected test file(s).
 5. Update this file's "Completed work" and the session handoff template.
 

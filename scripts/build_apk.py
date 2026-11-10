@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -103,8 +104,12 @@ def tool_env() -> dict[str, str]:
 
 
 def _chmod_x(path: Path) -> None:
-    if path.exists():
-        path.chmod(path.stat().st_mode | 0o111)
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return
+    if mode & 0o111 != 0o111:
+        path.chmod(mode | 0o111)
 
 
 def make_executables() -> None:
@@ -138,9 +143,10 @@ def _download(url: str, dest: Path) -> None:
 
 
 def resolve_jdk_url() -> str:
+    architecture = "aarch64" if platform.machine().lower() in {"arm64", "aarch64"} else "x64"
     api = (
         "https://api.adoptium.net/v3/assets/feature_releases/17/ga"
-        f"?architecture=x64&image_type=jdk&os={DOWNLOAD_OS}&vendor=eclipse&page_size=1"
+        f"?architecture={architecture}&image_type=jdk&os={DOWNLOAD_OS}&vendor=eclipse&page_size=1"
     )
     request = urllib.request.Request(api, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=60) as resp:
@@ -161,6 +167,9 @@ def ensure_jdk() -> None:
     with tarfile.open(tarball) as archive:
         archive.extractall(raw)
     inner = next(path for path in raw.iterdir() if path.is_dir())
+    mac_home = inner / "Contents" / "Home"
+    if mac_home.is_dir():
+        inner = mac_home
     if JDK.exists():
         shutil.rmtree(JDK)
     inner.rename(JDK)
@@ -249,7 +258,8 @@ def build(args: argparse.Namespace) -> Path:
     run([tools / "aapt2", "link", "-o", base, "-I", android_jar(),
          "--manifest", manifest, "--java", gen,
          "--min-sdk-version", MIN_SDK, "--target-sdk-version", TARGET_SDK,
-         "--version-code", str(args.version_code), "--version-name", args.version_name,
+         "--replace-version", "--version-code", str(args.version_code),
+         "--version-name", args.version_name,
          flata], env=env)
 
     log("compiling java (javac)")

@@ -581,6 +581,7 @@ def create_app(
             app.state.voiceos_store_instance = opened
         return opened
     app.state.voiceos_orchestrator = Orchestrator(engine=engine)
+    active_voice_runs: set[str] = set()
     #: C39 — automations. A sixth store family, beside the VoiceOS one and opened the
     #: same lazy way: a process that never touches an automation should not be holding
     #: a database handle. What it stores is *intent* (a name, a plan, a trigger) plus
@@ -855,7 +856,7 @@ def create_app(
     #: says so, so a request is never silently answered by a machine that stayed
     #: quiet. A deployment with no provider gets the rules alone, unchanged.
     voiceos_planner = build_planner(
-        voiceos_provider, app.state.planner, engine.registry.has
+        voiceos_provider, app.state.planner, engine.registry.has, definition_for=engine.registry.get
     )
     app.state.voiceos_planner = voiceos_planner
     #: C36 — the analyst, the object that explains a log the system actually read.
@@ -1552,12 +1553,17 @@ def create_app(
             # Resuming is only offered for an execution that is actually waiting, and
             # the approval is still matched on `action_id` at dispatch: approving some
             # other action in the graph changes nothing here.
-            waiting = {item["execution_id"] for item in engine.awaiting_approval()}
+            waiting = {item["execution_id"]: item for item in engine.awaiting_approval()}
             if execution_id not in waiting:
                 raise HTTPException(
                     status_code=409,
                     detail="execution is not awaiting approval",
                 )
+            if status == "rejected" and any(
+                candidate.get("action_id") == action_id
+                for candidate in waiting[execution_id]["actions"]
+            ):
+                engine.request_cancel(execution_id)
             resumed = await engine.resume(execution_id)
             if resumed is not None:
                 out["execution"] = resumed.to_dict()
@@ -2119,6 +2125,10 @@ def create_app(
                 "request": row.request,
                 "status": row.status,
                 "steps": len(row.steps),
+                "automatic_approval_execution_id": next(
+                    (step.execution_id for step in row.steps if step.state == "awaiting_approval"),
+                    "",
+                ) if row.automatic else "",
                 "settled": sum(1 for step in row.steps if step.settled),
                 "updated_at": row.updated_at,
             }
@@ -2126,13 +2136,14 @@ def create_app(
         ]
 
     @app.get("/voiceos/sessions/{session_id}")
-    def voiceos_session(request: Request, session_id: str) -> dict[str, Any]:
+    async def voiceos_session(request: Request, session_id: str) -> dict[str, Any]:
         session = _voiceos_load(session_id, _record_scope(request))
         # Fold any live step from its execution record first. This reads only -- it
         # cannot start anything -- but it is what stops a cancelled run from being
         # shown as still awaiting approval.
-        session = app.state.voiceos_orchestrator.fold_records(session)
-        _voiceos_store().save_session(session)
+        if session_id not in active_voice_runs:
+            session = app.state.voiceos_orchestrator.fold_records(session)
+            _voiceos_store().save_session(session)
         out = session.to_dict()
         out["description"] = describe_session(session)
         return out
@@ -2145,6 +2156,10 @@ def create_app(
         credential = getattr(request.state, "credential", None)
         _throttle("voiceos", _credential_key(request))
         session = _voiceos_load(session_id, _record_scope(request))
+        if session_id in active_voice_runs:
+            raise HTTPException(status_code=409, detail="this task is already running")
+        if session.run_policy is not None:
+            payload = {**payload, "policy": session.run_policy}
         context = _context(
             payload,
             app.state.consent_store,
@@ -2152,22 +2167,30 @@ def create_app(
             credentials=app.state.credentials,
         )
         store: VoiceOsStore = _voiceos_store()
-        # Write the name of each execution to the step *before* awaiting it. If this
-        # request dies mid-step, the session on disk still points at the run, and the
-        # next reader can ask the durable record what became of it instead of guessing.
-        outcome = await app.state.voiceos_orchestrator.advance(
-            session, context, checkpoint=store.save_session
-        )
-        updated: TaskSession = outcome["session"]
-        store.save_session(updated)
-        conversation = store.get_conversation(updated.actor_id)
-        conversation.active_session_id = updated.session_id
-        if outcome.get("references"):
-            # Remember what was *observed*, so the next turn can say "the second one".
-            conversation.references = list(outcome["references"])
-        conversation.remember("voiceos", updated.summary or describe_session(updated))
-        store.save_conversation(conversation)
-        return updated.to_dict()
+        active_voice_runs.add(session_id)
+        try:
+            # Write the name of each execution to the step *before* awaiting it. If this
+            # request dies mid-step, the session on disk still points at the run, and the
+            # next reader can ask the durable record what became of it instead of guessing.
+            if session.run_policy is None and isinstance(payload.get("policy"), dict):
+                session.run_policy = context.policy.model_dump()
+            session.automatic = payload.get("stop_on_unverified") is True
+            outcome = await app.state.voiceos_orchestrator.advance(
+                session, context, checkpoint=store.save_session,
+                stop_on_unverified=session.automatic,
+            )
+            updated: TaskSession = outcome["session"]
+            store.save_session(updated)
+            conversation = store.get_conversation(updated.actor_id)
+            conversation.active_session_id = updated.session_id
+            if outcome.get("references"):
+                # Remember what was *observed*, so the next turn can say "the second one".
+                conversation.references = list(outcome["references"])
+            conversation.remember("voiceos", updated.summary or describe_session(updated))
+            store.save_conversation(conversation)
+            return updated.to_dict()
+        finally:
+            active_voice_runs.discard(session_id)
 
     @app.post("/voiceos/sessions/{session_id}/diagnose")
     async def voiceos_session_diagnose(

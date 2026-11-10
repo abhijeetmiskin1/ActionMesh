@@ -18,6 +18,7 @@ reference resolves only to something the user was actually shown.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import tempfile
@@ -27,6 +28,7 @@ from typing import Any
 from unittest import mock
 
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from actionmesh.api import create_app
 from actionmesh.core.devices import DeviceRegistry
@@ -365,6 +367,38 @@ class TestReasoningLayer(unittest.TestCase):
             known_action=lambda name: name.startswith("device.") or name == "message.send",
             templates=lambda: tuple(templates),
         )
+
+    def test_jarvis_opens_the_registered_browser_and_never_falls_back_to_simulation(self) -> None:
+        command = "Hey Jarvis, open the browser."
+        unavailable = self._reasoner().understand(command, self.conversation)
+        self.assertEqual(unavailable.kind, "answer")
+        self.assertIn("browser drive", unavailable.reply)
+        reasoner = Reasoner(
+            planner=_StubPlanner(), known_action=lambda name: name == "browser.open",
+            templates=lambda: (),
+        )
+        planned = reasoner.understand(command, self.conversation)
+        assert planned.session is not None
+        self.assertEqual(planned.session.steps[0].action_type, "browser.open")
+        self.assertEqual(planned.session.steps[0].parameters, {"url": "https://duckduckgo.com/"})
+
+    def test_named_services_use_the_browser_action(self) -> None:
+        reasoner = Reasoner(
+            planner=_StubPlanner(), known_action=lambda name: name == "browser.open",
+            templates=lambda: (),
+        )
+        for service, url in (
+            ("GitHub", "https://github.com/"),
+            ("Google Drive", "https://drive.google.com/"),
+            ("Google Calendar", "https://calendar.google.com/"),
+        ):
+            command = f"Hey Jarvis, open {service}."
+            with self.subTest(service=service):
+                answer = reasoner.understand(command, self.conversation)
+                assert answer.session is not None
+                self.assertEqual(answer.session.steps[0].action_type, "browser.open")
+                self.assertEqual(answer.session.steps[0].parameters, {"url": url})
+                self.assertIsNone(self._reasoner().understand(command, self.conversation).session)
 
     def test_a_reference_resolves_only_to_what_was_observed(self) -> None:
         self.conversation.references = observed_references(
@@ -789,6 +823,52 @@ class TestStepIsNamedBeforeItRuns(unittest.TestCase):
             ),
         )
 
+    def test_automatic_execution_does_not_continue_after_unverified_result(self) -> None:
+        from actionmesh.agent.definitions import register_device_actions
+        from actionmesh.core.executor.engine import ExecutionResult
+        from actionmesh.protocol.models import ActionState
+
+        register_device_actions(self.engine.registry)
+        self.session.steps = [
+            TaskStep(index=index, label="List files", action_type="device.file.list")
+            for index in range(2)
+        ]
+        with mock.patch.object(
+            self.orchestrator, "_run_step", return_value=ExecutionResult(
+                execution_id="check", state=ActionState.REQUIRES_USER, simulated=False,
+            ),
+        ) as execute:
+            run(self.orchestrator.advance(self.session, self.context, stop_on_unverified=True))
+        self.assertEqual(execute.await_count, 1)
+        self.assertEqual(self.session.steps[1].state, "pending")
+        self.assertEqual(self.orchestrator.fold_records(self.session).status, "needs_review")
+
+    def test_resolved_failed_approval_never_dispatches_the_next_step(self) -> None:
+        from actionmesh.protocol.models import ActionState
+
+        first = self.session.steps[0]
+        first.state = "awaiting_approval"
+        first.execution_id = "waiting"
+        self.session.status = "awaiting_approval"
+        self.session.steps.append(TaskStep(index=1, label="Later", action_type="message.send"))
+        record = mock.Mock(state=ActionState.DENIED, results={})
+        with (
+            mock.patch.object(self.engine, "record", return_value=record),
+            mock.patch.object(self.orchestrator, "_run_step") as execute,
+        ):
+            run(self.orchestrator.advance(self.session, self.context))
+            run(self.orchestrator.advance(self.session, self.context))
+        execute.assert_not_awaited()
+        self.assertEqual(self.session.status, "failed")
+        self.assertEqual(self.session.steps[1].state, "pending")
+
+    def test_automatic_execution_pauses_before_simulated_actions(self) -> None:
+        with mock.patch.object(self.orchestrator, "_run_step") as execute:
+            run(self.orchestrator.advance(self.session, self.context, stop_on_unverified=True))
+        execute.assert_not_awaited()
+        self.assertEqual(self.session.status, "needs_review")
+        self.assertIn("simulation", self.session.summary)
+
     def test_the_execution_id_is_recorded_while_the_step_is_still_running(self) -> None:
         seen: list[tuple[str, str]] = []
         original = self.orchestrator.engine.run_execution
@@ -846,6 +926,41 @@ class TestSessionReconciliation(unittest.TestCase):
         if store is not None:
             store.close()
 
+    def test_overlapping_runs_cannot_dispatch_the_same_session_twice(self) -> None:
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            orchestrator = self.app.state.voiceos_orchestrator
+            original = orchestrator.advance
+
+            async def paused(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                entered.set()
+                await release.wait()
+                return await original(*args, **kwargs)
+
+            transport = ASGITransport(app=self.app, client=LOCAL)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                actor = {"id": "voice-user"}
+                response = await client.post(
+                    "/voiceos/messages", json={"actor": actor, "text": "tell mom hi"},
+                )
+                session_id = response.json()["session_id"]
+                route = f"/voiceos/sessions/{session_id}"
+                with mock.patch.object(orchestrator, "advance", side_effect=paused) as advance:
+                    first = asyncio.create_task(client.post(f"{route}/run", json={"actor": actor}))
+                    try:
+                        await asyncio.wait_for(entered.wait(), timeout=2)
+                        duplicate = await client.post(f"{route}/run", json={"actor": actor})
+                        self.assertEqual(duplicate.status_code, 409)
+                        self.assertEqual((await client.get(route)).status_code, 200)
+                    finally:
+                        release.set()
+                        completed = await first
+                    self.assertEqual(completed.status_code, 200)
+                    advance.assert_awaited_once()
+
+        asyncio.run(scenario())
+
     def test_a_step_that_ended_while_nobody_was_looking_is_folded_on_read(self) -> None:
         self.client.post(
             "/consents",
@@ -864,7 +979,11 @@ class TestSessionReconciliation(unittest.TestCase):
         session = store.get_session(session_id)
         session.steps[0].state = "awaiting_approval"
         session.status = "awaiting_approval"
+        session.automatic = True
         store.save_session(session)
+        listed = self.client.get("/voiceos/sessions").json()
+        row = next(item for item in listed if item["session_id"] == session_id)
+        self.assertEqual(row["automatic_approval_execution_id"], execution_id)
 
         read = self.client.get(f"/voiceos/sessions/{session_id}").json()
         self.assertEqual(read["steps"][0]["state"], "succeeded")

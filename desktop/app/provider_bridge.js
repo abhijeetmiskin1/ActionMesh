@@ -183,10 +183,18 @@ async function startBridge(options) {
     try { source.log(message); } catch { /* logging must never break serving */ }
   }
 
-  function recordVerified(state) {
+  function recordVerified(state, lane) {
     verified = { state };
-    if (!noteTestResult) return;
-    try { noteTestResult(state); } catch { /* main owns its cache; a failure is theirs */ }
+    if (!noteTestResult || !lane.configured) return;
+    const current = laneFor(planningLanes());
+    if (current.lane !== lane.lane || current.provider !== lane.provider
+        || current.model !== lane.model || current.endpoint !== lane.endpoint
+        || current.apiKey !== lane.apiKey) return;
+    try {
+      noteTestResult(state, {
+        purpose: lane.lane, provider: lane.provider, model: lane.model, baseUrl: lane.endpoint,
+      });
+    } catch { /* main owns its cache; a failure is theirs */ }
   }
 
   /**
@@ -387,7 +395,7 @@ async function startBridge(options) {
     // what the UI reports and what the planner does cannot drift apart.
     const lane = laneFor(planningLanes());
     if (!lane.configured) {
-      recordVerified('not_configured');
+      recordVerified('not_configured', lane);
       return { ok: false, state: 'not_configured', detail: STATE_DETAIL.not_configured };
     }
     const providerId = lane.provider;
@@ -400,11 +408,11 @@ async function startBridge(options) {
     const spec = specFor(providerId);
     const requiresKey = !spec || spec.requiresKey !== false;
     if (requiresKey && !apiKey) {
-      recordVerified('missing_key');
+      recordVerified('missing_key', lane);
       return { ok: false, state: 'missing_key', detail: STATE_DETAIL.missing_key };
     }
     if (!generateIsAvailable()) {
-      recordVerified('provider_unavailable');
+      recordVerified('provider_unavailable', lane);
       return { ok: false, state: 'provider_unavailable', detail: NO_GENERATE_DETAIL };
     }
 
@@ -430,7 +438,7 @@ async function startBridge(options) {
     } catch {
       // A thrown error can carry anything the transport put in it. Say only what this
       // file says.
-      recordVerified('provider_unavailable');
+      recordVerified('provider_unavailable', lane);
       return { ok: false, state: 'provider_unavailable', detail: STATE_DETAIL.provider_unavailable };
     }
 
@@ -438,14 +446,14 @@ async function startBridge(options) {
     if (state === 'ok') {
       const content = outcome.content;
       if (!content || typeof content !== 'object' || Array.isArray(content)) {
-        recordVerified('malformed');
+        recordVerified('malformed', lane);
         return { ok: false, state: 'malformed', detail: STATE_DETAIL.malformed };
       }
-      recordVerified('connected');
+      recordVerified('connected', lane);
       return { ok: true, content };
     }
     if (KNOWN_STATES.has(state)) {
-      recordVerified(state);
+      recordVerified(state, lane);
       return {
         ok: false,
         state,
@@ -453,7 +461,7 @@ async function startBridge(options) {
       };
     }
     // Anything outside the contract, including a missing state, is not trusted.
-    recordVerified('provider_unavailable');
+    recordVerified('provider_unavailable', lane);
     return { ok: false, state: 'provider_unavailable', detail: STATE_DETAIL.provider_unavailable };
   }
 

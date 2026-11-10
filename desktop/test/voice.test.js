@@ -14,9 +14,10 @@ const path = require('node:path');
 const { install } = require('./dom_harness.js');
 
 /** Load voice.js into a fresh harness window and return { page, api }. */
-function loadVoice() {
+function loadVoice(setup) {
   const page = install({});
   const win = page.window;
+  if (setup) setup(win);
   const source = fs.readFileSync(path.join(__dirname, '..', 'ui', 'voice.js'), 'utf8');
   // voice.js reads window.SpeechRecognition / window.speechSynthesis at load;
   // the harness window has neither, so `supported`/`textToSpeechSupported`
@@ -66,6 +67,44 @@ test('voice module honours its no-fake-mic contract', () => {
   assert.equal(api.supported, false);
   assert.equal(api.startListening(), false);
   assert.equal(api.state, 'error');
+});
+
+test('recorded audio is transcribed only after stop and fills a reviewable transcript', async () => {
+  const calls = [];
+  let stopped = 0;
+  class Recorder {
+    static isTypeSupported() { return true; }
+    start() { this.state = 'recording'; }
+    stop() {
+      this.state = 'inactive';
+      this.ondataavailable({ data: new Blob(['test recording']) });
+      this.onstop();
+    }
+  }
+  const { api } = loadVoice((win) => {
+    win.MediaRecorder = Recorder;
+    win.navigator = { mediaDevices: {
+      getUserMedia: async () => ({ getTracks: () => [{ stop: () => { stopped += 1; } }] }),
+    } };
+    win.actionmesh = {
+      requestVoiceMic: async () => true,
+      transcribeVoice: async (audio) => {
+        calls.push(audio);
+        return { state: 'connected', transcript: 'List workspace files.' };
+      },
+    };
+  });
+  api.setGatewayEnabled(true);
+  const transcript = new Promise((resolve) => api.onTranscript(resolve));
+  assert.equal(api.startListening(), true);
+  await new Promise(setImmediate);
+  assert.equal(api.state, 'listening');
+  assert.equal(calls.length, 0);
+  api.stopListening();
+  assert.equal(await transcript, 'List workspace files.');
+  assert.equal(calls[0].mime, 'audio/webm');
+  assert.equal(stopped, 1);
+  assert.equal(api.state, 'idle');
 });
 
 // ---------------------------------------------------------------------------

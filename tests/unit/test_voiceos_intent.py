@@ -62,6 +62,14 @@ class TestNlToTemplateIntent(unittest.TestCase):
         self.assertNotIn(ORDER_PLACE_ACTION, [step.action_type for step in session.steps])
         self.assertEqual(session.steps[1].parameters.get("query"), "pizza")
 
+    def test_generic_search_does_not_trigger_food_discovery(self) -> None:
+        self.assertIsNone(match_website_intent("ok search the work body"))
+
+    def test_claude_code_does_not_fall_back_to_a_browser(self) -> None:
+        answer = _reasoner().understand("Open Claude Code", Conversation(actor_id="a"))
+        self.assertIsNone(answer.session)
+        self.assertIn("Open Claude", answer.reply)
+
     def test_search_speed_render_asks_for_the_query(self) -> None:
         text = "search for speed render near me"
         self.assertEqual(match_website_intent(text), "food.discover")

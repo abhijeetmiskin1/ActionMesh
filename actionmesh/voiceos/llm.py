@@ -59,7 +59,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from actionmesh.agent.apps import MAC_APP_ACTION, MAC_APP_STATUS
 from actionmesh.core.planner import Plan, Planner, ProposedAction
+from actionmesh.core.registry import check_params
+from actionmesh.protocol.models import ActionDefinition
+from actionmesh.protocol.validate import ValidationError
 from actionmesh.voiceos import model_bridge
 from actionmesh.voiceos.model_bridge import BridgeConfig, BridgeError, BridgeUnavailable
 from actionmesh.voiceos.transport import TransportError, post_json
@@ -674,8 +678,14 @@ class LlmPlanner:
     provider: LlmProvider
     fallback: Planner
     known_action: Callable[[str], bool]
+    definition_for: Callable[[str], ActionDefinition] | None = None
 
     def plan(self, intent: str) -> Plan:
+        local = self.fallback.plan(intent)
+        if local.actions and not local.notes and all(
+            action.type in {MAC_APP_ACTION, MAC_APP_STATUS} for action in local.actions
+        ):
+            return local
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -710,6 +720,12 @@ class LlmPlanner:
                 f"the model proposed nothing usable ({detail})",
                 proposal.notes,
             )
+        if self.definition_for is not None:
+            try:
+                for action_type, parameters in proposal.actions:
+                    check_params(self.definition_for(action_type), parameters)
+            except ValidationError:
+                return self._fallback(intent, "the model supplied invalid action parameters")
         return Plan(
             intent=intent,
             actions=tuple(
@@ -811,11 +827,13 @@ def build_planner(
     provider: LlmProvider | None,
     fallback: Planner,
     known_action: Callable[[str], bool],
+    *,
+    definition_for: Callable[[str], ActionDefinition] | None = None,
 ) -> Planner:
     """Wrap a live provider in a planner, or hand back the deterministic one."""
     if provider is None:
         return fallback
-    return LlmPlanner(provider=provider, fallback=fallback, known_action=known_action)
+    return LlmPlanner(provider, fallback, known_action, definition_for)
 
 
 def build_analyst(

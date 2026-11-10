@@ -82,6 +82,9 @@ _SCOPES: dict[str, Permission] = {
     "payment.verify": Permission("payment.verify", "Verify a transaction", RiskLevel.LOW),
     # system
     "system.app.launch": Permission("system.app.launch", "Launch an application", RiskLevel.MEDIUM),
+    "system.app.status": Permission("system.app.status", "Check whether a Mac app is running", RiskLevel.LOW),
+    "github.read": Permission("github.read", "Read GitHub repositories and issues", RiskLevel.LOW),
+    "google.drive.read": Permission("google.drive.read", "Search Google Drive file metadata", RiskLevel.LOW),
     "system.shell": Permission("system.shell", "Run shell commands", RiskLevel.CRITICAL),
     # misc
     "search.web": Permission("search.web", "Perform a web search", RiskLevel.LOW),

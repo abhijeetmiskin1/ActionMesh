@@ -28,7 +28,7 @@ function fakeRequest(reply, calls = []) {
         handlers[event] = handler;
         return req;
       },
-      write() {},
+      write(body) { options.body = body; },
       end() {
         // Answer asynchronously, the way a real socket would.
         setImmediate(() => {
@@ -221,7 +221,7 @@ test('each provider posts its documented endpoint and header', async () => {
   assert.equal(seen[2].port, 443);
 });
 
-test('an OpenAI-compatible base URL must be https and is used verbatim', async () => {
+test('a remote OpenAI-compatible base URL must be HTTPS', async () => {
   const calls = [];
   const refused = await providers._withRequest(
     { provider: 'openai_compatible', model: 'm', apiKey: KEY, baseUrl: 'http://gateway.example.com/v1' },
@@ -239,6 +239,22 @@ test('an OpenAI-compatible base URL must be https and is used verbatim', async (
   assert.equal(calls[0].path, '/v1/chat/completions');
 });
 
+test('OpenAI-compatible HTTP connects only to the pinned loopback address', async () => {
+  const calls = [];
+  const config = { provider: 'openai_compatible', model: 'm', apiKey: KEY };
+  const request = fakeRequest(ok(), calls);
+  const connected = await providers._withRequest({ ...config, baseUrl: 'http://localhost:20128/v1' }, request);
+  assert.equal(connected.state, 'connected');
+  assert.equal(calls[0].protocol, 'http:');
+  assert.equal(calls[0].hostname, '127.0.0.1');
+  assert.equal(calls[0].port, 20128);
+  assert.equal(calls[0].path, '/v1/chat/completions');
+  for (const baseUrl of ['http://localhost.example/v1', 'http://192.168.1.1/v1', 'http://user@localhost/v1']) {
+    assert.equal((await providers._withRequest({ ...config, baseUrl }, request)).state, 'provider_unavailable');
+  }
+  assert.equal(calls.length, 1);
+});
+
 test('a base URL on another port is refused', async () => {
   const calls = [];
   const out = await providers._withRequest(
@@ -247,6 +263,24 @@ test('a base URL on another port is refused', async () => {
   );
   assert.equal(out.state, 'provider_unavailable');
   assert.deepEqual(calls, []);
+});
+
+test('transcription uses the fixed audio route and refuses invalid audio before sending', async () => {
+  const calls = [];
+  const config = { baseUrl: 'http://localhost:20128/v1', model: 'test-stt', apiKey: KEY };
+  const options = { request: fakeRequest(ok('{"text":" test transcript "}'), calls) };
+  const answer = await providers.transcribe(config, new Uint8Array([1, 2]), 'audio/webm', options);
+  assert.equal(answer.state, 'connected');
+  assert.equal(answer.transcript, 'test transcript');
+  assert.equal(calls[0].hostname, '127.0.0.1');
+  assert.equal(calls[0].path, '/v1/audio/transcriptions');
+  assert.match(calls[0].headers['content-type'], /^multipart\/form-data; boundary=/);
+  assert.match(String(calls[0].body), /name="language"\r\n\r\nen\r\n/);
+  assert.equal((await providers.transcribe(config, new Uint8Array(1024 * 1024 + 1), 'audio/webm', options)).transcript, undefined);
+  assert.equal((await providers.transcribe(config, new Uint8Array([1]), 'video/webm', options)).transcript, undefined);
+  assert.equal(calls.length, 1);
+  await providers.transcribe({ ...config, language: 'auto' }, new Uint8Array([1]), 'audio/webm', options);
+  assert.doesNotMatch(String(calls[1].body), /name="language"/);
 });
 
 test('the timeout is clamped to 1..60 seconds', async () => {
@@ -390,6 +424,8 @@ test('each provider asks its own dialect for the same answer', async () => {
   );
   const c = JSON.parse(compat.bodies[0]);
   assert.equal(c.response_format.type, 'json_object');
+  assert.equal(c.stream, false);
+  assert.match(c.messages[0].content, /"required":\["actions"\]/);
 });
 
 test('anthropic: a fenced JSON text block is still read', async () => {

@@ -38,6 +38,7 @@ SESSION_STATES = (
     "proposed",
     "running",
     "awaiting_approval",
+    "needs_review",
     "interrupted",
     "completed",
     "stopped",
@@ -170,6 +171,8 @@ class TaskSession:
     steps: list[TaskStep] = field(default_factory=list)
     device_id: str = ""
     status: str = "proposed"
+    automatic: bool = False
+    run_policy: dict[str, Any] | None = field(default=None, repr=False)
     summary: str = ""
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -220,6 +223,8 @@ class TaskSession:
         it just comes back without its binds, which is why only the store calls this.
         """
         out = self.to_dict()
+        out["automatic"] = self.automatic
+        out["run_policy"] = self.run_policy
         out["steps"] = [step.to_storage() for step in self.steps]
         return out
 
@@ -231,6 +236,8 @@ class TaskSession:
             request=str(raw.get("request", "")),
             device_id=str(raw.get("device_id") or ""),
             status=str(raw.get("status") or "proposed"),
+            automatic=raw.get("automatic") is True,
+            run_policy=raw.get("run_policy") if isinstance(raw.get("run_policy"), dict) else None,
             summary=str(raw.get("summary") or ""),
             created_at=str(raw.get("created_at") or _now()),
             updated_at=str(raw.get("updated_at") or _now()),
@@ -252,6 +259,8 @@ class Conversation:
     history: list[dict[str, str]] = field(default_factory=list)
     active_session_id: str = ""
     device_id: str = ""
+    awaiting_deal_product: bool = False
+    awaiting_github_repository: bool = False
     references: list[dict[str, str]] = field(default_factory=list)
     updated_at: str = field(default_factory=_now)
     #: The session ``active_session_id`` names, resolved by whoever loaded it. Derived,
@@ -275,6 +284,8 @@ class Conversation:
             "history": list(self.history),
             "active_session_id": self.active_session_id,
             "device_id": self.device_id,
+            "awaiting_deal_product": self.awaiting_deal_product,
+            "awaiting_github_repository": self.awaiting_github_repository,
             "references": list(self.references),
             "updated_at": self.updated_at,
         }
@@ -286,6 +297,8 @@ class Conversation:
             history=[dict(item) for item in raw.get("history") or []],
             active_session_id=str(raw.get("active_session_id") or ""),
             device_id=str(raw.get("device_id") or ""),
+            awaiting_deal_product=raw.get("awaiting_deal_product") is True,
+            awaiting_github_repository=raw.get("awaiting_github_repository") is True,
             references=[dict(item) for item in raw.get("references") or []],
             updated_at=str(raw.get("updated_at") or _now()),
         )

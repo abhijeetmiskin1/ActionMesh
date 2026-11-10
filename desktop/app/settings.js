@@ -24,7 +24,9 @@ const SECRET_KEYS = [
   'chatApiKey',           // NEW - chat/reasoning text providers
   'reasoningApiKey',      // NEW - reasoning-only providers (can alias chat)
   'imageApiKey',          // NEW - image generation providers
-  'audioApiKey'           // NEW - audio/TTS providers
+  'audioApiKey',          // Audio transcription
+  'githubReadToken',
+  'driveReadToken',
 ];
 
 const DEFAULTS = {
@@ -43,6 +45,8 @@ const DEFAULTS = {
   // machine is "can open pages", and media control is "can drive my player" —
   // neither is what "can run tests" means — so none of them turns on another.
   allowBrowser: false,
+  allowGithubRead: false,
+  allowDriveRead: false,
   allowMedia: false,
   deviceId: 'laptop-1',
   deviceName: 'This laptop',
@@ -70,6 +74,7 @@ const DEFAULTS = {
   purpose_image_model: '',
   purpose_image_endpoint: '',
   purpose_image_timeout: 12,
+  voiceTranscriptionLanguage: 'en',
   purpose_audio_provider: '',
   purpose_audio_model: '',
   purpose_audio_endpoint: '',

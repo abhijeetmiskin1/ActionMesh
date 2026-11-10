@@ -18,9 +18,9 @@ combined. Numbers re-verified against source 2026-11-04 (Phase 4 P0-4).*
 | AI providers: Anthropic (Python) | ✓ | ✓ | ✓ | ✓ | ✓ | — | **INTEGRATED** (needs API key) |
 | AI providers: desktop bridge (cwd `desktop`) | ✓ | ✓ | ✓ | ✓ | ✓ | — | **INTEGRATED** |
 | AI providers: OpenAI / Gemini / generic (Python) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **NOT IMPLEMENTED** in Python (`llm.py:115`); JS transports exist (`providers.js`) but are not Python providers |
-| Browser agent | ✓ | ✓ | ✓ (via Electron IPC) | ✓ | ✓ (fixtures) | ✗ | **TESTED WITH FIXTURES** |
+| Browser agent | ✓ | ✓ | ✓ (via Electron IPC) | ✓ | ✓ | ✓ | **LIVE-TESTED** — public-site navigation and search, plus click and sign-in handoff on a controlled page |
 | Files agent | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | **TESTED WITH FIXTURES** |
-| Media (MPRIS) | ✓ | ✓ | ✓ (D-Bus code) | ✓ | ✓ (fake driver) | ✗ | **TESTED WITH FIXTURES** — real player explicitly not exercised (`media.py:326-328`) |
+| Media (MPRIS) | ✓ | ✓ | ✓ (D-Bus) | ✓ | ✓ | ✓ | **LIVE-TESTED** — status, play, pause, volume and local file opening with mpv on Debian |
 | Workflows / automations | ✓ | ✓ | ✓ | ✓ | ✓ | — | **INTEGRATED** |
 | Website discovery (restaurant/train flows) | ✓ | ✓ | ✓ | ✓ | ✓ (fixtures) | ✗ | **TESTED WITH FIXTURES** |
 | Booking / ordering (real) | Partial (definitions + gates) | ✓ | Refuses (no backend) | — | ✓ (refusal tested) | ✗ | **PARTIAL / EXTERNALLY BLOCKED** — `booking.submit`/`order.place` fail closed (`provider.py:_submit`, `PERMANENT`); no real vendor |
@@ -52,8 +52,6 @@ via the C41 bridge. The extra JS transports are not Python providers.
 
 ## What is NOT done / BLOCKED
 
-- **MPRIS live verification (P0-1)** — needs Linux desktop + real player + session bus. Label: BLOCKED in this pass, TESTED WITH FIXTURES in source.
-- **Live browser acceptance (P0-2)** — fixture/fake-driver only; e2e live slice is opt-in (`ACTIONMESH_LIVE_ACCEPTANCE=1`, `tests/e2e/test_phase2_live_acceptance.py:4,32`) and BLOCKED without a real bridge.
 - **Real booking / ordering (P1-2)** — handler refuses (`PERMANENT`, no payment backend). Needs a real vendor + credentials.
 - **Real vendor integrations (P1-1, C13)** — NOT IMPLEMENTED by design; `RealProviderBase` boundary only.
 - **Second Python AI provider (P1-3)** — OpenAI/Gemini Python transports NOT IMPLEMENTED; JS transports exist but are only reachable via the desktop bridge.

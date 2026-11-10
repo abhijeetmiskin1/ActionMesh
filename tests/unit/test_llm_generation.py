@@ -152,6 +152,37 @@ class TestThePlannerStillPoliciesTheAnswer(unittest.TestCase):
         )
         self.assertIn("planned by desktop", " ".join(plan.notes))
 
+    def test_invalid_native_app_parameters_fall_back_before_rendering(self) -> None:
+        from actionmesh.agent.definitions import register_device_actions
+        from actionmesh.core.registry import ActionRegistry
+
+        registry = ActionRegistry.with_seeds()
+        register_device_actions(registry)
+        planner = LlmPlanner(
+            provider=_desktop(),
+            fallback=RuleBasedPlanner(known_action=registry.has),
+            known_action=registry.has,
+            definition_for=registry.get,
+        )
+        for params in ({}, {"app": 42}, {"app": "Terminal"}):
+            with self.subTest(params=params), mock.patch(
+                "actionmesh.voiceos.llm.model_bridge.generate",
+                return_value={"actions": [
+                    {"type": "device.app.launch_native", "parameters": params},
+                ]},
+            ) as generate:
+                plan = planner.plan("Please bring up my arithmetic utility")
+                self.assertFalse(plan.actions)
+                self.assertIn("invalid action parameters", " ".join(plan.notes))
+                generate.reset_mock()
+                plan = planner.plan("Open Calculator, then is Calculator running?")
+                generate.assert_not_called()
+                self.assertEqual(
+                    [action.type for action in plan.actions],
+                    ["device.app.launch_native", "device.app.status_native"],
+                )
+                self.assertTrue(all(a.parameters == {"app": "calculator"} for a in plan.actions))
+
     def test_an_unregistered_action_never_reaches_the_plan(self) -> None:
         raw = {"actions": [{"type": "system.wipe_everything", "parameters": {}}]}
         with mock.patch("actionmesh.voiceos.llm.model_bridge.generate", return_value=raw):

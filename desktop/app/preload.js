@@ -44,6 +44,8 @@ contextBridge.exposeInMainWorld('actionmesh', {
   purposeRemove: (payload) => ipcRenderer.invoke('purpose:remove', payload),
   purposeSetModel: (payload) => ipcRenderer.invoke('purpose:model', payload),
   purposeSetDefault: (payload) => ipcRenderer.invoke('purpose:default', payload),
+  transcribeVoice: (recording) => ipcRenderer.invoke('voice:transcribe', recording),
+  requestVoiceMic: () => ipcRenderer.invoke('voice:request-mic'),
 
   // managed backend
   startBackend: () => ipcRenderer.invoke('backend:start'),

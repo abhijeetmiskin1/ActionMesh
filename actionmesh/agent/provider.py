@@ -34,6 +34,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
+from actionmesh.agent import apps, connectors
 from actionmesh.agent.browser import BridgeDriver, BrowserEngine
 from actionmesh.agent.browser_bridge import BrowserBridgeConfig
 from actionmesh.agent.browser_bridge import make_request as _make_browser_request
@@ -112,6 +113,9 @@ class LaptopProvider(ActionProvider):
             "device.ide.list",
             "device.ide.open",
             "device.ide.command",
+            *connectors.CONNECTOR_ACTIONS,
+            apps.MAC_APP_ACTION,
+            apps.MAC_APP_STATUS,
             "device.app.open",
             "device.app.close",
             "device.project.list",
@@ -181,6 +185,9 @@ class LaptopProvider(ActionProvider):
             "device.ide.list",
             "device.ide.open",
             "device.ide.command",
+            *connectors.CONNECTOR_ACTIONS,
+            apps.MAC_APP_ACTION,
+            apps.MAC_APP_STATUS,
             "device.app.open",
             "device.app.close",
             "device.project.status",
@@ -394,6 +401,9 @@ class LaptopProvider(ActionProvider):
             "device.ide.command": lambda: self._ide_command(action),
             "device.project.status": lambda: self._project_status(action),
             "device.project.open": lambda: self._ide_open(action, project=True),
+            **{name: lambda: self._connector_read(action) for name in connectors.CONNECTOR_ACTIONS},
+            apps.MAC_APP_ACTION: lambda: self._launch_native_app(action),
+            apps.MAC_APP_STATUS: lambda: self._native_app_status(action),
             "device.app.open": lambda: self._app_open(action),
             "device.app.close": lambda: self._app_close(action),
             "device.screen.capture": lambda: self._screen_capture(action),
@@ -502,7 +512,7 @@ class LaptopProvider(ActionProvider):
             raise ProviderError("browser.search engine must be a string", FailureKind.INVALID_INPUT)
         result = await self.browser.search(query, engine)
         self._record_browser_effect(action, result)
-        return result
+        return {key: value for key, value in result.items() if key != "results"}
 
     async def _browser_inspect(self, action: Action) -> dict[str, Any]:
         result = await self.browser.inspect()
@@ -622,10 +632,10 @@ class LaptopProvider(ActionProvider):
         # references into the window subtree, credentials) stays out.
         for key in (
             "url", "title", "url_after", "changed", "inserted",
-            "element_count", "count", "ref_map_size", "truncated", "results",
+            "element_count", "count", "ref_map_size", "truncated",
         ):
             if key in result:
-                effect[key] = result[key] if key != "results" else result[key][:10]
+                effect[key] = result[key]
         self._effects[action.action_id] = effect
 
     # -- C42: files -------------------------------------------------------
@@ -1690,6 +1700,35 @@ class LaptopProvider(ActionProvider):
             )
         ]
 
+    async def _connector_read(self, action: Action) -> dict[str, Any]:
+        first = await connectors.read(action)
+        observed = await connectors.read(action)
+        if first != observed:
+            raise ProviderError(
+                "The result changed between reads. Narrow the search and retry.",
+                FailureKind.PROVIDER,
+            )
+        observed.pop("_membership")
+        self._effects[action.action_id] = {
+            "action_type": action.type,
+            "idempotency_key": action.idempotency_key,
+            "parameters": dict(action.parameters),
+            "state": {"count": observed["count"], "truncated": observed["truncated"]},
+        }
+        return observed
+
+    async def _launch_native_app(self, action: Action) -> dict[str, Any]:
+        app = action.parameters.get("app")
+        await asyncio.to_thread(apps.launch, app)
+        return {"app": app}
+
+    async def _native_app_status(self, action: Action) -> dict[str, Any]:
+        app = action.parameters.get("app")
+        running = await asyncio.to_thread(apps.running, app)
+        if running is None:
+            raise ProviderError("macOS app status is unavailable.", FailureKind.PERMANENT)
+        return {"app": app, "running": running}
+
     async def _app_open(self, action: Action) -> dict[str, Any]:
         params = action.parameters
         app = params.get("app")
@@ -2253,6 +2292,17 @@ class LaptopProvider(ActionProvider):
         C6 weights this observation above any claim this provider makes, so it has to
         be an answer to "what is true now", not a recording of what the code intended.
         """
+        if action.type in {apps.MAC_APP_ACTION, apps.MAC_APP_STATUS}:
+            app = action.parameters.get("app")
+            running = apps.running(app)
+            if running is None or (action.type == apps.MAC_APP_ACTION and not running):
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"app": app},
+                "state": {"running": running},
+            }
         # -- C42 readonly file probes (live re-read, no effect, no ledger) ----
         # list/search/info/open are reads: the handlers deliberately record no
         # effect, and test_browser_files_media_provider pins that ("Reads do not
@@ -2360,6 +2410,8 @@ class LaptopProvider(ActionProvider):
             # time would build a description of a description -- and report an exit code
             # of None for a command that exited 0.
             return recovered
+        if action.type in connectors.CONNECTOR_ACTIONS:
+            return recorded
         # -- screen capabilities, deliberately above the workspace guard ---------
         # `observe()` below starts by refusing to answer without a workspace root,
         # because most branch below rebuilds a path. Screen work has no path: it reads
@@ -2471,7 +2523,7 @@ class LaptopProvider(ActionProvider):
                 "state": {
                     key: recorded[key]
                     for key in ("changed", "inserted", "element_count",
-                                "count", "ref_map_size", "truncated", "results")
+                                "count", "ref_map_size", "truncated")
                     if key in recorded
                 },
             }

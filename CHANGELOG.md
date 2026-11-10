@@ -7,7 +7,17 @@ complete when its tests have actually been executed and passed.
 
 ---
 
-## [Unreleased] — 2026-10-19
+## [Unreleased]
+
+## [0.2.0] - 2026-11-08
+
+- Voice Commands supports hands-free follow-ups, spoken task results and spoken stop and repeat controls.
+- Mac app launches, browser navigation and deal discovery can run in one ordered task.
+- Automatic runs pause for approval and stop after failed or unverified steps.
+- Task Center adds search, filters, keyboard navigation and command reuse.
+- Providers has separate controls for chat, reasoning, image and audio. Image generation remains unavailable.
+- The Apple Silicon desktop release includes the matching ActionMesh backend.
+
 
 ## C41 — the real AI brain, wired into the VoiceOS pipeline
 

@@ -19,8 +19,8 @@
  *
  * Two rules keep this from becoming a general-purpose HTTP client:
  *   * the destination is chosen from a closed table, never from the renderer — the one
- *     exception is `openai_compatible`, whose base URL is validated here as https,
- *     port 443, no userinfo, no fragment;
+ *     exception is `openai_compatible`, which allows HTTPS on port 443 or HTTP
+ *     pinned to the loopback interface, with no userinfo or fragment;
  *   * responses are read to a fixed 4 KiB ceiling and only the status decides the
  *     state. A provider's error body can echo the request, so its text is never
  *     surfaced; every `detail` below is a sentence written in this file.
@@ -28,9 +28,12 @@
  * This module reads no settings and touches no disk. Everything it needs arrives as an
  * argument, which is also what makes it testable without a network.
  */
+const http = require('node:http');
+const { randomUUID } = require('node:crypto');
 const https = require('https');
 
 const MAX_BODY = 4096;
+const MAX_AUDIO_BYTES = 1024 * 1024;
 /** Generation answers are JSON documents, not a status line, so they get a bigger cap. */
 const MAX_GENERATION_BODY = 256 * 1024;
 const DEFAULT_TIMEOUT_S = 12;
@@ -101,11 +104,8 @@ const SPECS = [
 ];
 
 /**
- * Media purposes are deliberately not the text adapters. They are closed tables of
- * vendors this build knows about, and every entry is `implemented: false` — a metered
- * image or audio call is not made up because the chat adapter works. The entries exist
- * so the bars can say which vendors are planned; choosing one is refused until a real
- * adapter and a real probe exist.
+ * Media adapters are separate from text. Only configured, implemented adapters
+ * may receive a credential from the corresponding purpose.
  */
 const MEDIA_SPECS = {
   image: [
@@ -141,6 +141,16 @@ const MEDIA_SPECS = {
     },
   ],
   audio: [
+    {
+      id: 'openai_compatible_stt',
+      label: 'OpenAI-compatible transcription',
+      implemented: true,
+      requiresKey: true,
+      requiresBaseUrl: true,
+      defaultModel: '',
+      models: [],
+      unavailableReason: '',
+    },
     {
       id: 'elevenlabs',
       label: 'ElevenLabs',
@@ -259,35 +269,25 @@ function post(url, headers, body, timeoutSeconds, requestImpl, maxBody) {
       done({ kind: 'invalid_url', status: 0 });
       return;
     }
-    if (parsed.protocol !== 'https:') {
-      done({ kind: 'invalid_url', status: 0 });
-      return;
-    }
-    if (parsed.username || parsed.password) {
-      done({ kind: 'invalid_url', status: 0 });
-      return;
-    }
-    if (parsed.port && Number(parsed.port) !== ALLOWED_PORT) {
-      done({ kind: 'invalid_url', status: 0 });
-      return;
-    }
-    if (parsed.hash) {
+    if (endpointError(parsed)) {
       done({ kind: 'invalid_url', status: 0 });
       return;
     }
 
-    const payload = Buffer.from(JSON.stringify(body), 'utf8');
+    const local = parsed.protocol === 'http:';
+    const send = requestImpl || (local ? http.request : https.request);
+    const payload = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body), 'utf8');
     let req;
     try {
-      req = requestImpl({
+      req = send({
         method: 'POST',
-        protocol: 'https:',
-        hostname: parsed.hostname,
-        port: ALLOWED_PORT,
+        protocol: parsed.protocol,
+        hostname: local ? '127.0.0.1' : parsed.hostname,
+        port: local ? Number(parsed.port || 80) : ALLOWED_PORT,
         path: `${parsed.pathname}${parsed.search}`,
         headers: {
-          ...headers,
           'content-type': 'application/json',
+          ...headers,
           'content-length': payload.length,
         },
         timeout: timeoutMs,
@@ -373,24 +373,64 @@ function classify(probe) {
  * Validate an OpenAI-compatible base URL and build the completions endpoint.
  * Returns `{ url }` or `{ error }`, and never a URL it has not checked.
  */
-function compatibleEndpoint(baseUrl) {
+function endpointError(parsed) {
+  if (parsed.username || parsed.password) return 'The base URL must not contain credentials.';
+  if (parsed.hash) return 'The base URL must not contain a fragment.';
+  if (parsed.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(parsed.hostname)) {
+    return '';
+  }
+  if (parsed.protocol !== 'https:') return 'Use HTTPS or an HTTP loopback address.';
+  if (parsed.port && Number(parsed.port) !== ALLOWED_PORT) return 'The base URL must use port 443.';
+  return '';
+}
+
+function compatibleEndpoint(baseUrl, route = 'chat/completions') {
   let parsed;
   try {
     parsed = new URL(baseUrl);
   } catch {
     return { error: 'The base URL is not a valid URL.' };
   }
-  if (parsed.protocol !== 'https:') return { error: 'The base URL must use https.' };
-  if (parsed.username || parsed.password) {
-    return { error: 'The base URL must not contain credentials.' };
-  }
-  if (parsed.port && Number(parsed.port) !== ALLOWED_PORT) {
-    return { error: 'The base URL must use port 443.' };
-  }
-  if (parsed.hash) return { error: 'The base URL must not contain a fragment.' };
+  const error = endpointError(parsed);
+  if (error) return { error };
   // Query strings are dropped rather than carried: this builder decides the path.
   const path = parsed.pathname.replace(/\/+$/, '');
-  return { url: `${parsed.origin}${path}/chat/completions` };
+  return { url: `${parsed.origin}${path}/${route}` };
+}
+
+async function transcribe({ baseUrl, model, apiKey, timeoutSeconds, language = 'en' }, bytes, mime, options = {}) {
+  const endpoint = compatibleEndpoint(baseUrl, 'audio/transcriptions');
+  if (endpoint.error || !model || !apiKey || !keyIsHeaderSafe(apiKey)) {
+    return result('not_configured', 'Configure an Audio endpoint, model and key in Providers.');
+  }
+  if (!(bytes instanceof Uint8Array) || !bytes.length || bytes.length > MAX_AUDIO_BYTES
+      || !['audio/webm', 'audio/wav'].includes(mime)) {
+    return result('provider_unavailable', 'The recording is empty, too large, or uses an unsupported format.');
+  }
+  const boundary = randomUUID();
+  const extension = mime === 'audio/wav' ? 'wav' : 'webm';
+  const languagePart = ['en', 'hi'].includes(language)
+    ? `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\n${language}\r\n`
+    : '';
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n`
+      + languagePart
+      + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="utterance.${extension}"\r\n`
+      + `Content-Type: ${mime}\r\n\r\n`),
+    bytes,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const reply = await post(endpoint.url, {
+    authorization: `Bearer ${apiKey}`, 'content-type': `multipart/form-data; boundary=${boundary}`,
+  }, body, timeoutSeconds, options.request);
+  const verdict = classify(reply);
+  if (verdict.state !== 'connected') return verdict;
+  let text;
+  try { text = JSON.parse(reply.body)?.text; } catch { /* malformed reply */ }
+  if (typeof text !== 'string' || !text.trim() || text.length > MAX_BODY) {
+    return result('provider_unavailable', 'The audio provider returned no usable transcript.');
+  }
+  return { ...verdict, transcript: text.trim() };
 }
 
 /**
@@ -406,7 +446,7 @@ async function test(config, options = {}) {
   const model = String(source.model || '').trim();
   const baseUrl = String(source.baseUrl || '').trim();
   const apiKey = String(source.apiKey || '').trim();
-  const requestImpl = (options && options.request) || https.request;
+  const requestImpl = options && options.request;
 
   const spec = specFor(provider, source.purpose);
   if (!spec) return result('not_configured', 'Choose a provider first.');
@@ -426,6 +466,9 @@ async function test(config, options = {}) {
 
   const chosen = model || spec.defaultModel;
   if (!chosen) return result('not_configured', 'Choose a model first.');
+  if (provider === 'openai_compatible_stt') {
+    return result('not_configured', 'Save the Audio settings and record a short utterance to test transcription.');
+  }
 
   let probe;
   if (provider === 'anthropic') {
@@ -461,7 +504,7 @@ async function test(config, options = {}) {
     probe = await post(
       endpoint.url,
       { authorization: `Bearer ${apiKey}` },
-      { model: chosen, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] },
+      { model: chosen, max_tokens: 1, stream: false, messages: [{ role: 'user', content: 'ping' }] },
       source.timeoutSeconds,
       requestImpl,
     );
@@ -647,7 +690,7 @@ async function generate(config, request, options = {}) {
   const model = String(source.model || '').trim();
   const baseUrl = String(source.baseUrl || '').trim();
   const apiKey = String(source.apiKey || '').trim();
-  const requestImpl = (options && options.request) || https.request;
+  const requestImpl = options && options.request;
 
   const spec = specFor(provider, source.purpose);
   if (!spec) return generationResult('not_configured', 'Choose a provider first.');
@@ -762,10 +805,11 @@ async function generate(config, request, options = {}) {
         model: chosen,
         max_tokens: maxTokens,
         messages: [
-          { role: 'system', content: systemText },
+          { role: 'system', content: systemText + '\nJSON Schema: ' + JSON.stringify(schema) },
           { role: 'user', content: user },
         ],
         response_format: { type: 'json_object' },
+        stream: false,
       },
       timeoutSeconds,
       requestImpl,
@@ -836,6 +880,7 @@ module.exports = {
   specFor,
   test,
   generate,
+  transcribe,
   _withRequest,
   STATE_TEXT,
   MAX_BODY,

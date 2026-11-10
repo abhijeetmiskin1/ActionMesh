@@ -1,18 +1,15 @@
 # Roadmap
 
-*Derived from the existing project record (`TASK_BOARD.md`,
-`docs/c42-*`) and current source. Numbers re-verified 2026-11-04
-(Phase 4 P0-4): 60 implemented ops, 49 routes, CSP present at
-`desktop/ui/index.html:5`, 150 MB `.deb` present, submit fail-closed,
-MPRIS not live-verified. Completed work is not listed. Missing live
-credentials ≠ missing source.*
+*Derived from `TASK_BOARD.md`, `docs/c42-*`, and the source. The
+2026-11-08 acceptance run is recorded in
+[Testing and Acceptance](TESTING_AND_ACCEPTANCE.md).*
 
 ## P0 — Security, execution correctness, essential integrations
 
 | # | Objective | Current state | Required files | Dependencies | Acceptance criteria | Verification | External prerequisites |
 |---|---|---|---|---|---|---|---|
-| P0-1 | Live-verify MPRIS media against a real player | `MprisMediaDriver` implemented, explicitly not exercised (`media.py:326-328`) — TESTED WITH FIXTURES | `actionmesh/agent/media.py`, `tests/unit/test_media_agent.py` | Linux desktop with a real MPRIS player | `media.status/play/volume` verified against a live player; result recorded | New live test + manual run; honest `unavailable` if no player | Linux desktop + player (e.g. mpv/VLC) |
-| P0-2 | Live browser acceptance (real sites) | Fixture-tested only (`tests/fixtures/`) — TESTED WITH FIXTURES | `actionmesh/agent/browser.py`, `desktop/app/browser_window.js` | Electron app + backend | Real navigation/search/click on a live site; gates (`REQUIRES_USER`) behave | `tests/e2e/` live slice (opt-in `ACTIONMESH_LIVE_ACCEPTANCE=1`) + manual run; BLOCKED otherwise | Network access; no credentials |
+| P0-1 | Live-verify MPRIS media against a real player | **DONE (2026-11-08)** — mpv on an isolated Debian D-Bus session | `actionmesh/agent/media.py`, `tests/e2e/test_phase4_live_acceptance.py` | Linux with a dedicated MPRIS player | Status, play, pause and volume confirmed by player readback | Opt-in mpv test passed. A separate run also confirmed local file opening | Linux session bus and test player |
+| P0-2 | Live browser acceptance | **DONE (2026-11-08)** — real Electron bridge on macOS | `desktop/app/browser_window.js`, `tests/e2e/` | Electron app + backend | Public-site navigation and search, plus click and sign-in handoff on a controlled page | Real readback from Example Domain, DuckDuckGo, IRCTC and Zomato. Loopback click reached the gate and a second click was refused | Electron bridge and network access for public sites |
 | P0-3 | Verify CSP + header posture in the Electron shell | **DONE (2026-11-04)** — CSP verified at `desktop/ui/index.html:5`: `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'` | `desktop/ui/index.html` | — | CSP documented in [SECURITY_MODEL.md](SECURITY_MODEL.md) with a test | Source read, 2026-11-04 | — |
 | P0-4 | Refresh stale root docs (`README.md` status table/counts) | **DONE (2026-11-04)** — README/PROJECT/HANDOFF/CURRENT_STATUS/ROADMAP/AI_HANDOFF rewritten with source-verified numbers (60 ops, 49 routes, CSP, 150 MB deb, fail-closed submit, MPRIS not live-verified); "What is NOT done / BLOCKED" added; historical counts labeled | `README.md`, `PROJECT.md`, `HANDOFF.md`, `docs/project/CURRENT_STATUS.md` | This documentation package | Counts match source; historical labeled | Grep cross-check of every number; `test_voiceos.py` 40 passed | — |
 
@@ -48,3 +45,18 @@ credentials ≠ missing source.*
   [SECURITY_MODEL.md](SECURITY_MODEL.md).
 - Claiming live verification from fixture tests; `REQUIRES_USER` or
   unverified is never success.
+
+## Remaining Jarvis work plan
+
+| Order | Deliverable | Completion check | Prerequisite |
+|---|---|---|---|
+| 1 | Make task progression single-owner and preserve outcome across retries, interruption and approval. | Two simultaneous requests advance a session once. Reading a running task cannot overwrite its checkpoint. A stopped task never dispatches its next step. | Existing executor and session store. The desktop backend uses a single server process. |
+| 2 | Make voice sessions reliable on macOS, including follow-up commands, interruption and microphone errors. | Record a live two-turn conversation on the target Mac, verify a task result, then confirm the mic closes on stop. | Microphone permission and working transcription for the active audio model. |
+| 3 | Add GitHub and Google Workspace read capabilities. Start with repository and issue lookup, Drive search and Calendar lookup. | Each action identifies its source, respects account scope, handles denied or expired credentials, and has fixture plus live acceptance. | Authorized test accounts and connector credentials. |
+| 4 | Add bounded, evidence-driven planning. Feed permitted observations into the next planning decision and pause for missing information. | A multi-step task can change its next action after a real observation, with a step budget and safe stop on denial, ambiguity or unverifiable results. | Typed, independently verifiable tool capabilities from earlier phases. |
+| 5 | Build product comparison and order review. | Compare matching products using retailer, delivered price, availability and timestamp. Present the exact cart and total before approval. Confirm completion from a retailer receipt. | A retailer or comparison data source and a test checkout account. |
+| 6 | Complete media and release acceptance. | Image output works through a real provider. Live voice, connectors, browser, recovery and permission checks pass on the packaged Mac build. | Image provider endpoint and test credentials. |
+
+The same ActionMesh policy and executor apply at every stage. External reads and
+writes use separately registered capabilities, and the planner cannot grant itself
+access or approve a purchase.

@@ -25,6 +25,7 @@ from actionmesh.agent.config import (
     AgentConfig,
     AgentConfigError,
 )
+from actionmesh.agent.connectors import CONNECTOR_ACTIONS
 from actionmesh.agent.definitions import (
     CAPABILITIES,
     IMPLEMENTED,
@@ -110,7 +111,7 @@ class TestConfig(unittest.TestCase):
             - set(REQUIRING_DESKTOP)
             - set(REQUIRING_PAYMENT)
             - set(REQUIRING_BROWSER)
-            - set(REQUIRING_MEDIA),
+            - set(REQUIRING_MEDIA) - {"device.app.launch_native", "device.app.status_native"} - CONNECTOR_ACTIONS,
         )
         self.assertIn("device.terminal.execute", rooted.advertise())
         self.assertIn("device.file.read", rooted.advertise())
@@ -127,12 +128,12 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(
             advertised,
             set(CAPABILITIES) - set(REQUIRING_DESKTOP) - set(REQUIRING_PAYMENT)
-            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA),
+            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA) - {"device.app.launch_native", "device.app.status_native"} - CONNECTOR_ACTIONS,
         )
         self.assertEqual(
             advertised,
             set(IMPLEMENTED) - set(REQUIRING_DESKTOP) - set(REQUIRING_PAYMENT)
-            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA),
+            - set(REQUIRING_BROWSER) - set(REQUIRING_MEDIA) - {"device.app.launch_native", "device.app.status_native"} - CONNECTOR_ACTIONS,
         )
         for capability in advertised:
             self.assertTrue(registry.has(capability), capability)

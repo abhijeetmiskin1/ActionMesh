@@ -884,7 +884,12 @@ class BrowserEngine:
             result["url"] = _redact(facts.url, limit=2048)
             return result
         results = _search_results(records, facts.url)
-        return {"status": STATUS_OK, "url": _redact(facts.url, limit=2048), "results": results}
+        return {
+            "status": STATUS_OK,
+            "url": _redact(facts.url, limit=2048),
+            "count": len(results),
+            "results": results,
+        }
 
     async def inspect(self) -> dict[str, Any]:
         """Bounded page summary; the full (redacted) element document goes to

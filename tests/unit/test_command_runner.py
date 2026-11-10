@@ -308,7 +308,11 @@ class TestEnvironmentIsolation(_Spawn):
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", seen)
         self.assertNotIn("GITHUB_TOKEN", seen)
         self.assertLessEqual(
-            seen, {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "PWD", "OLDPWD", "_"}
+            seen,
+            {
+                "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "PWD", "OLDPWD", "_",
+                "__CF_USER_TEXT_ENCODING", "LC_CTYPE",  # macOS injects these
+            },
         )
 
     def test_the_child_runs_in_the_configured_directory(self) -> None:
