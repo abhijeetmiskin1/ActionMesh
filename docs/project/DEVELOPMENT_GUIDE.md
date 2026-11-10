@@ -4,7 +4,7 @@
 
 | Requirement | Source |
 |---|---|
-| Python **≥ 3.11** (verified on 3.12.10 and 3.14 per `PROJECT.md`/`HANDOFF.md`) | `pyproject.toml` `requires-python` |
+| Python **≥ 3.11** (verified on 3.12.10 and 3.14 per `PROJECT.md`) | `pyproject.toml` `requires-python` |
 | Node.js (Electron 45.2.1) | `desktop/package.json` |
 | Package managers | `pip` (Python), `npm` (desktop), setuptools build backend |
 | Runtime dependency | `fastapi>=0.115` only (`pyproject.toml`) |

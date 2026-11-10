@@ -5,7 +5,7 @@
   <p>macOS desktop · Python execution engine · Apache 2.0</p>
 </div>
 
-[One-page solution pitch](docs/SOLUTION_PITCH.md) · [How it works](#how-it-works) · [Run locally](#run-locally) · [Project documentation](docs/project/AI_HANDOFF.md)
+[One-page solution pitch](docs/SOLUTION_PITCH.md) · [How it works](#how-it-works) · [Run locally](#run-locally) · [Project documentation](docs/project/PROJECT_OVERVIEW.md)
 
 ## Try the demo
 

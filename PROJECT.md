@@ -7,8 +7,7 @@ platform. VoiceOS is a voice interaction layer built on it. Principle:
 *AI proposes. Policy decides. User controls. Executor acts. Verifier
 confirms. Audit remembers.*
 
-**New AI agent? Start at [docs/project/AI_HANDOFF.md](docs/project/AI_HANDOFF.md).**
-Permanent rules: [AGENTS.md](AGENTS.md). Quick handoff: [HANDOFF.md](HANDOFF.md).
+**Start with the [project overview](docs/project/PROJECT_OVERVIEW.md).**
 
 ## Verified facts (2026-11-04, Phase 4 P0-4)
 
@@ -57,12 +56,10 @@ current claims.
 | [TESTING_AND_ACCEPTANCE.md](docs/project/TESTING_AND_ACCEPTANCE.md) | Suite map; historical counts (labeled) |
 | [CURRENT_STATUS.md](docs/project/CURRENT_STATUS.md) | Evidence-based implementation inventory |
 | [ROADMAP.md](docs/project/ROADMAP.md) | P0–P3 work with acceptance criteria |
-| [AI_HANDOFF.md](docs/project/AI_HANDOFF.md) | **The AI entry point** |
+| [PROJECT_OVERVIEW.md](docs/project/PROJECT_OVERVIEW.md) | Project overview |
 
 ## Existing documents (kept, not duplicated)
 
-- [HANDOFF.md](HANDOFF.md) — continuation notes (quick handoff).
-- [TASK_BOARD.md](TASK_BOARD.md) — phase-by-phase status record.
 - [docs/architecture.md](docs/architecture.md), [docs/security.md](docs/security.md),
   [docs/permissions.md](docs/permissions.md), [docs/registry.md](docs/registry.md),
   [docs/action-graph.md](docs/action-graph.md), [docs/providers.md](docs/providers.md),
