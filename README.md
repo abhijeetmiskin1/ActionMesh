@@ -17,7 +17,7 @@ Speak or type a request. Follow the task as it runs. See what was verified, what
 
 <br>
 
-[⚡ Quick demo](#quick-demo) · [🧪 Continuum Lab](#continuum-lab-v5) · [🌐 ParallelWorld](#parallelworld) · [🎬 Demo scripts](docs/DEMO_RUN_OF_SHOW.md) · [🧭 How it works](#from-request-to-result) · [✅ Capabilities](#capabilities) · [🗺️ Roadmap](#roadmap) · [🛠️ Setup](#run-locally)
+[⚡ Quick demo](#quick-demo) · [📁 Projects and goals](#projects-and-goal-contracts) · [🧪 Continuum Lab](#continuum-lab-v5) · [🌐 ParallelWorld](#parallelworld) · [🎬 Demo scripts](docs/DEMO_RUN_OF_SHOW.md) · [🧭 How it works](#from-request-to-result) · [✅ Capabilities](#capabilities) · [🗺️ Roadmap](#roadmap) · [🛠️ Setup](#run-locally)
 
 </div>
 
@@ -47,6 +47,18 @@ Open **Voice Commands**, press the microphone, and try these. For a quiet room, 
 
 In **Task Results**, check whether each step succeeded, failed, needs approval, or could not be verified. Enable **Keep listening after replies** to try **“Jarvis, repeat that”** and **“Jarvis, stop listening.”**
 
+## 📁 Projects and Goal Contracts
+
+The **Projects** workspace registers local folders beneath the configured workspace root, detects Git repositories, selects a project, and displays its real path and inspection result. You can register loopback HTTP services against a project with a structured executable, arguments, working directory, port, health path, expected status, and timeout.
+
+Goal Contracts are stored separately per project and resource. A service goal can observe the registered endpoint and keep its event history across backend and app restarts. If the goal is violated, ActionMesh can propose a restart of that exact registered service through the existing policy and approval pipeline. The proposal waits for approval when policy requires it; a successful action is not treated as recovered until a fresh observation confirms the endpoint. Service process identity that is unknown or uncertain is not treated as permission to stop a listener.
+
+Workspace file-integrity goals can capture a SHA-256 baseline through the normal `file.read` permission and verification pipeline. Hashing is confined to the selected project, rejects symlinks and non-regular files, is capped at 16 MiB, and refuses a file that changes during the read. The goal stores the verified baseline execution link and later observations persist the actual digest; contents are not returned or logged.
+
+Projects can also monitor the lifecycle of a registered ActionMesh-managed process without an HTTP health check. Lifecycle goals distinguish running, ActionMesh-stopped, successful exit, failed exit, and uncertain evidence. A missing process record remains unknown; it is not treated as proof that an external process is stopped.
+
+Service probes are restricted to the registered loopback endpoint and do not follow redirects. Project status reads and service control still require their configured permissions, and risky control actions can require exact-action approval. The app reports a missing permission or an unknown observation as such; it does not infer health from a process label.
+
 ## 🧪 Continuum Lab V5
 
 The Continuum Lab adds judge-ready control and evidence views to the existing ActionMesh pipeline:
@@ -56,10 +68,10 @@ The Continuum Lab adds judge-ready control and evidence views to the existing Ac
 | **Mission Control** | Live backend readiness, goal state, approvals, active executions, devices, and verified receipts. |
 | **ChaosStage** | A controlled fault against a dedicated local HTTP demo service, followed by a bounded repair proposal through registered actions and exact-action approvals. |
 | **ProofLens** | Compares the managed-service observation with a clearly labeled, untrusted healthy fixture claim; shows when they conflict and when the service is observed healthy again. |
-| **IntentCanvas** | Selects a supported first-party target and previews a typed `server_health` Goal Contract before saving it. |
+| **IntentCanvas** | In the lab, selects its supported first-party target and previews a typed `server_health` Goal Contract before saving it. |
 | **GoalGuard** | Retains the existing goal contract, bounded recovery, and evidence timeline. |
 
-The packaged native macOS rehearsal demonstrated the service fault, the contradictory observation, approval of the specific recovery action, and a fresh HTTP 200 health observation afterward. ProofLens labels the dashboard claim as a fixture, not a live independent dashboard. Process and HTTP observations share the managed-service adapter, so the UI does not claim fully independent sources.
+The packaged native macOS V5 rehearsal demonstrated the fixed demo service fault and recovery. The Projects workspace now supports registered project-specific loopback services and independent Goal Contracts. ProofLens labels its dashboard claim as a fixture, not a live independent dashboard. Process and HTTP observations share the managed-service adapter, so the UI does not claim fully independent sources.
 
 Start with the [Continuum Lab demo and setup guide](docs/continuum-demo/V5_CONTINUUM_LAB.md). It uses only a disposable local workspace and a loopback service. Broader proposed concepts such as TrustSwitch, AgentArena, CausalXRay, and RealityForks are not implemented features.
 
@@ -102,8 +114,9 @@ The proposal cannot grant itself authority. If the result is uncertain, the task
 | **Voice** | Microphone capture, transcription, spoken replies, and follow-up turns | Requires microphone access and a configured transcription service. |
 | **Typed fallback** | Submit the same request path from the Voice Commands screen | Useful for rehearsal or noisy rooms. |
 | **Workspace comparison** | Compare two bounded regular files and report a verified boolean result | File contents do not cross the result boundary; workspace and size limits apply. |
+| **Projects and goals** | Register local projects and managed loopback services; create persistent HTTP health goals with approval-controlled restart proposals | The laptop agent must be configured and granted the relevant project/server permissions. Unknown process ownership is not stoppable. |
 | **ParallelWorld** | Preview and review bounded file operations in a shadow before applying them | Each real action remains policy-checked and separately approvable; apply is sequential, not transactional. |
-| **Continuum Lab** | Monitor a typed local service goal, inspect a controlled fault, and propose bounded recovery | This V5 demo target is the supported local service. Risky start/stop actions still require exact-action approval. |
+| **Continuum Lab** | Inspect the legacy controlled fault and evidence views | Its rehearsal target is a fixed demo service; use Projects for registered project-specific services. |
 | **GitHub** | Public repository and issue lookup | Private repository reads need a scoped connection. |
 | **Google Drive** | File search adapter and fixture coverage | Live search needs a read-only OAuth connection. |
 | **Shopping research** | Product search links | Seller checks, offer matching, and delivered totals are not yet verified. |
@@ -112,6 +125,7 @@ The proposal cannot grant itself authority. If the result is uncertain, the task
 
 ```text
 READY TO TRY       Mac app control · controlled browser · voice and typed tasks
+PROJECT WORKSPACE  Registered folders · loopback service goals · durable activity history
 DEMO WORKSPACES    Continuum Lab V5 · ParallelWorld bounded file preview
 CONNECT WHEN READY GitHub reads · Google Drive read-only search
 IN DEVELOPMENT    Natural multi-step follow-through · richer deal comparison

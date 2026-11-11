@@ -101,6 +101,11 @@ function fakeBridge() {
     audio: statusFor('audio'),
   };
   const calls = [];
+  const savedSettings = {
+    shortcut: 'CommandOrControl+Shift+Space', shortcutEnabled: true, notificationsEnabled: true,
+    agentEnabled: true, deviceName: 'This laptop', workspaceRoot: '', allowShell: false,
+    allowDesktop: false, allowedCommands: [],
+  };
   const record = (name, answer) => (...args) => {
     calls.push({ name, args });
     return Promise.resolve(typeof answer === 'function' ? answer(...args) : answer);
@@ -117,15 +122,7 @@ function fakeBridge() {
     userData: '/tmp/actionmesh',
     backend: { status: 'stopped', port: 0, runtimeMode: 'bundled', dataDir: '/tmp/actionmesh', lastError: '' },
     settings: {
-      shortcut: 'CommandOrControl+Shift+Space',
-      shortcutEnabled: true,
-      notificationsEnabled: true,
-      agentEnabled: true,
-      deviceName: 'This laptop',
-      workspaceRoot: '',
-      allowShell: false,
-      allowDesktop: false,
-      allowedCommands: [],
+      ...savedSettings,
       encryptionAvailable: true,
       providerDefault: false,
       secrets: { chatApiKey: { present: false, status: 'empty' } },
@@ -171,7 +168,10 @@ function fakeBridge() {
     // The backend is stopped in this fake, so every route read is refused the way an
     // offline backend would be. Home must still render its lanes.
     request: record('request', () => ({ ok: false, status: 0, error: 'backend offline' })),
-    updateSettings: record('updateSettings', () => ({ ok: true, settings: appState().settings })),
+    updateSettings: record('updateSettings', (patch) => {
+      Object.assign(savedSettings, patch);
+      return { ok: true, settings: appState().settings };
+    }),
     startStream: record('startStream', () => ({ ok: true })),
     stopStream: record('stopStream', () => ({ ok: true })),
     startBackend: record('startBackend', () => ({ ok: true })),
@@ -233,6 +233,29 @@ test('the renderer boots with no exception and shows one lane per job', async ()
   // And the header's chat bar was populated from the chat lane's provider table only.
   const select = document.querySelector('.provider-bar[data-purpose="chat"] .purpose-provider-select');
   assert.deepEqual(select.options.map((option) => option.value), SPECS.chat.map((spec) => spec.id));
+});
+
+test('a periodic refresh preserves an unsaved shell setting until Save', async () => {
+  const { document, bridge, timers } = await bootPage();
+  document.querySelector('[data-view="settings"]').click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const shell = document.getElementById('setAllowShell');
+  assert.equal(shell.checked, false);
+  shell.checked = true;
+  shell.dispatch('change', {});
+  const poll = timers.find((timer) => timer.repeat && timer.ms === 5000);
+  assert.ok(poll, 'the renderer polls the active view');
+  await poll.fn();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(shell.checked, true, 'refresh did not replace the operator’s pending edit');
+  assert.equal(bridge.calls.filter((call) => call.name === 'updateSettings').length, 0);
+  document.getElementById('settingsSave').click();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bridge.calls.find((call) => call.name === 'updateSettings').args[0].allowShell, true);
+  assert.equal((await bridge.state()).settings.allowShell, true);
 });
 
 test('a lane that is configured but untested says so rather than looking connected', async () => {

@@ -35,7 +35,7 @@ import time
 import unittest
 
 from actionmesh.core.sqlite_guard import assert_guarded
-from actionmesh.core.storage import SQLiteStore
+from actionmesh.core.storage import SCHEMA_VERSION, SQLiteStore
 from actionmesh.voiceos.automation_store import AutomationStore
 from actionmesh.voiceos.models import Conversation, TaskSession
 from actionmesh.voiceos.store import VoiceOsStore
@@ -83,10 +83,10 @@ class TestGuardPinsOwnedStores(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteStore(pathlib.Path(directory) / "v.db")
             self.addCleanup(store.close)
-            self.assertEqual(store.schema_version, 3)
+            self.assertEqual(store.schema_version, SCHEMA_VERSION)
             # Holding the lock externally must not deadlock a read (RLock).
             with store._lock:  # type: ignore[attr-defined]
-                self.assertEqual(store.schema_version, 3)
+                self.assertEqual(store.schema_version, SCHEMA_VERSION)
 
     def test_automation_store_public_methods_guarded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,11 +1,30 @@
+import asyncio
 import socket
 from time import monotonic, sleep
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from actionmesh.agent.processes import CONTINUUM_PORT
 from actionmesh.api import create_app
+from actionmesh.core.permissions.context import PolicyContext
+from actionmesh.voiceos.continuum import Continuum, GoalContract, GoalState
+
+
+def test_continuum_refuses_to_dispatch_without_authenticated_actor(tmp_path):
+    orchestrator = AsyncMock()
+    continuum = Continuum(
+        str(tmp_path / "continuum.db"), orchestrator,
+        lambda: PolicyContext(actor=None), lambda: "device-local",
+    )
+    goal = GoalState(contract=GoalContract(description="observe"), device_id="device-local")
+
+    step = asyncio.run(continuum.run_action(goal, "device.server.status", {"name": "local"}))
+
+    assert step.state == "denied"
+    assert step.error == "No authenticated local operator identity is available."
+    orchestrator.advance.assert_not_awaited()
 
 
 def test_continuum_live_approval_and_recovery(tmp_path, monkeypatch):

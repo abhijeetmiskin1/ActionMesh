@@ -18,7 +18,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NoReturn
 
 from actionmesh.agent.files import MAX_WRITE_BYTES, FilesEngine
 from actionmesh.agent.paths import Workspace
@@ -50,7 +50,7 @@ class PreviewRecord:
 _PREVIEWS: dict[str, PreviewRecord] = {}
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise ProviderError(message, FailureKind.INVALID_INPUT)
 
 

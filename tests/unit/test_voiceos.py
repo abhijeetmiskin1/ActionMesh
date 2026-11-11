@@ -823,6 +823,16 @@ class TestStepIsNamedBeforeItRuns(unittest.TestCase):
             ),
         )
 
+    def test_stable_step_idempotency_key_reaches_the_existing_action_graph(self) -> None:
+        step = TaskStep(
+            index=0, label="restart service", action_type="device.server.start",
+            parameters={"name": "api"}, idempotency_key="repair-attempt-1",
+        )
+        graph = self.orchestrator._graph(self.session, step)
+        action_node = next(node for node in graph.nodes if node.action is not None)
+        assert action_node.action is not None
+        self.assertEqual(action_node.action.idempotency_key, "repair-attempt-1")
+
     def test_automatic_execution_does_not_continue_after_unverified_result(self) -> None:
         from actionmesh.agent.definitions import register_device_actions
         from actionmesh.core.executor.engine import ExecutionResult

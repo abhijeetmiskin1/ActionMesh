@@ -42,6 +42,9 @@
         <span class="nav-glyph" aria-hidden="true">✦</span><span class="nav-label">Tasks</span>
         <span class="nav-badge" data-badge="tasks" hidden></span>
       </button>
+      <button class="nav-item" data-view="projects" type="button" title="Projects">
+        <span class="nav-glyph" aria-hidden="true">⌘</span><span class="nav-label">Projects</span>
+      </button>
       <button class="nav-item" data-view="continuum" type="button" title="Continuum Lab">
         <span class="nav-glyph" aria-hidden="true">◉</span><span class="nav-label">Continuum Lab</span>
       </button>
@@ -391,6 +394,102 @@
           <div class="empty-state">
             <p>Choose a task to see its steps.</p>
           </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- Projects and durable Goal Contracts (V6 foundation) ---------------- -->
+    <section class="view" data-view="projects" hidden>
+      <div class="page-header"><div><h2 class="page-title">Projects</h2><p class="page-sub">Register local folders under the approved workspace, inspect real Git state, and monitor independent goals.</p></div>
+        <button id="projectsRefresh" class="btn ghost" type="button">Refresh</button></div>
+      <article class="card">
+        <h3 class="card-title">Register a local project</h3>
+        <form class="form-grid" id="projectRegisterForm">
+          <label for="projectPath">Workspace relative folder</label>
+          <input class="form-input" id="projectPath" required placeholder="my-repository or . for workspace root" autocomplete="off">
+          <button class="btn ghost" id="projectPickFolder" type="button">Choose folder…</button>
+          <label for="projectName">Display name (optional)</label>
+          <input class="form-input" id="projectName" maxlength="120" placeholder="Detected from folder">
+          <button class="btn primary" type="submit">Register project</button>
+        </form>
+        <p id="projectMessage" role="status" aria-live="polite"></p>
+      </article>
+      <div class="split">
+        <aside class="card list-card">
+          <div class="card-head"><h3 class="card-title">Registered projects</h3><span class="chip" id="projectCount">0</span></div>
+          <ul class="rows selectable" id="projectList"><li class="empty">No registered projects.</li></ul>
+        </aside>
+        <article class="card detail-card">
+          <div class="card-head"><h3 class="card-title" id="projectDetailTitle">Select a project</h3></div>
+          <p class="card-note" id="projectLocation"></p>
+          <div class="btn-row">
+            <label for="projectIde">Editor</label>
+            <input class="form-input" id="projectIde" value="vscode" aria-label="Editor to open project with">
+            <button id="projectOpen" class="btn ghost" type="button">Open project</button>
+          </div>
+          <pre class="result-block" id="projectStatus">Select a project to inspect its current state.</pre>
+          <form class="form-grid" id="projectGoalForm">
+            <h3 class="card-title">Create Goal Contract</h3>
+            <label for="projectGoalDescription">Goal description</label>
+            <input class="form-input" id="projectGoalDescription" maxlength="120" placeholder="Required file is present">
+            <label for="projectGoalType">Observed condition</label>
+            <select class="form-input" id="projectGoalType">
+              <option value="file_exists">Workspace file exists / is absent</option>
+              <option value="file_sha256">Workspace file SHA-256 matches baseline</option>
+              <option value="managed_process">Registered managed process lifecycle</option>
+              <option value="app_running">Supported macOS application is running / closed</option>
+              <option value="git_clean">Git working tree is clean / changed</option>
+              <option value="http_service">Managed local HTTP service responds as expected</option>
+            </select>
+            <label for="projectGoalResource" id="projectGoalResourceLabel">Project relative file or supported app</label>
+            <input class="form-input" id="projectGoalResource" placeholder="required.txt or TextEdit">
+            <button id="projectGoalCaptureHash" class="btn ghost" type="button" hidden>Capture SHA-256 baseline (requires file.read)</button>
+            <p id="projectGoalHashBaseline" class="card-note" role="status" aria-live="polite" hidden></p>
+            <label for="projectGoalService" id="projectGoalServiceLabel">Registered local service</label>
+            <select class="form-input" id="projectGoalService" disabled><option value="">Register a service first</option></select>
+            <label for="projectGoalExpected">Expected condition</label>
+            <select class="form-input" id="projectGoalExpected">
+              <option value="true">Present / running / clean</option>
+              <option value="false">Absent / closed / changed</option>
+            </select>
+            <label for="projectGoalProcessExpected" id="projectGoalProcessExpectedLabel" hidden>Expected process condition</label>
+            <select class="form-input" id="projectGoalProcessExpected" hidden>
+              <option value="running">Running</option>
+              <option value="stopped">Stopped by ActionMesh</option>
+              <option value="exited_successfully">Exited successfully</option>
+              <option value="failed">Exited with failure</option>
+              <option value="uncertain">Identity or lifecycle uncertain</option>
+            </select>
+            <label for="projectGoalInterval">Observation interval (seconds)</label>
+            <input class="form-input" id="projectGoalInterval" type="number" min="3" max="3600" value="60">
+            <label><input id="projectGoalMonitoring" type="checkbox"> Enable recurring observation</label>
+            <label><input id="projectGoalRecovery" type="checkbox"> Allow manual restart proposal after a violation (ActionMesh approval required)</label>
+            <button class="btn primary" type="submit">Save goal</button>
+          </form>
+          <p id="projectGoalMessage" role="status" aria-live="polite"></p>
+          <h3 class="card-title">Managed services</h3>
+          <ul class="rows" id="projectServiceList"><li class="empty">Select a project to view its registered services.</li></ul>
+          <details class="card" id="projectServiceSetup">
+            <summary class="card-title">Register a managed local service</summary>
+            <form class="form-grid" id="projectServiceForm">
+              <label for="projectServiceName">Service name</label><input class="form-input" id="projectServiceName" required maxlength="80" placeholder="api-dev">
+              <label for="projectServiceCommand">Allowed executable</label><input class="form-input" id="projectServiceCommand" required placeholder="python3">
+              <label for="projectServiceArguments">Arguments (JSON array)</label><input class="form-input" id="projectServiceArguments" value="[]" placeholder='["-m","http.server","9000","--bind","127.0.0.1"]'>
+              <label for="projectServiceWorkdir">Project relative working directory</label><input class="form-input" id="projectServiceWorkdir" placeholder=".">
+              <label for="projectServicePort">Loopback port</label><input class="form-input" id="projectServicePort" type="number" min="1024" max="65535" required>
+              <label for="projectServiceHealthPath">Health path</label><input class="form-input" id="projectServiceHealthPath" value="/" required>
+              <label for="projectServiceStatus">Expected HTTP status</label><input class="form-input" id="projectServiceStatus" type="number" min="100" max="599" value="200" required>
+              <label for="projectServiceTimeout">HTTP timeout (milliseconds)</label><input class="form-input" id="projectServiceTimeout" type="number" min="100" max="10000" value="1500" required>
+              <button class="btn primary" type="submit">Register service</button>
+            </form>
+            <p id="projectServiceMessage" role="status" aria-live="polite"></p>
+          </details>
+          <h3 class="card-title">Goal Contracts</h3>
+          <ul class="rows selectable" id="projectGoalList"><li class="empty">Select a project.</li></ul>
+          <div class="card-head"><h3 class="card-title">Project activity</h3>
+            <div class="btn-row"><button id="projectAllEvents" class="btn ghost small" type="button">All project events</button>
+              <button id="projectOlderEvents" class="btn ghost small" type="button">Older events</button></div></div>
+          <ul class="rows" id="projectGoalEvents"><li class="empty">Select a goal to load its stored events.</li></ul>
         </article>
       </div>
     </section>

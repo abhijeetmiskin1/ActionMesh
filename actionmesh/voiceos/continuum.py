@@ -72,10 +72,22 @@ class Continuum:
             goal.events = [*goal.events[-39:], entry]
         self.save(goal)
 
-    async def run_action(self, goal: GoalState, action: str, params: dict[str, Any]) -> TaskStep:
-        step = TaskStep(index=0, label=action, action_type=action, parameters=params)
+    async def run_action(
+        self, goal: GoalState, action: str, params: dict[str, Any],
+        on_checkpoint: Callable[[TaskSession], None] | None = None,
+        idempotency_key: str = "",
+    ) -> TaskStep:
+        step = TaskStep(
+            index=0, label=action, action_type=action, parameters=params,
+            idempotency_key=idempotency_key,
+        )
+        context = self.context()
+        if context.actor is None:
+            step.state = "denied"
+            step.error = "No authenticated local operator identity is available."
+            return step
         session = TaskSession(
-            session_id=uuid4().hex, actor_id=self.context().actor.id,
+            session_id=uuid4().hex, actor_id=context.actor.id,
             request=goal.contract.description, device_id=goal.device_id, steps=[step],
         )
 
@@ -86,9 +98,11 @@ class Continuum:
             elif action == "device.server.stop":
                 goal.stop_pending = current.steps[0].execution_id
                 self.save(goal)
+            if on_checkpoint is not None:
+                on_checkpoint(current)
 
         await self.orchestrator.advance(
-            session, self.context(), stop_on_unverified=True, checkpoint=checkpoint,
+            session, context, stop_on_unverified=True, checkpoint=checkpoint,
         )
         return step
 

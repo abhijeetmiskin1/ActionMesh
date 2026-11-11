@@ -59,6 +59,8 @@ class TaskStep:
     label: str
     action_type: str
     parameters: dict[str, Any] = field(default_factory=dict)
+    #: Optional stable identity for a retryable typed action; never authority.
+    idempotency_key: str = ""
     #: A condition on an earlier step's observed result, e.g. ``{"step": 0, "exit_code": 0}``.
     #: Operator-authored, never model-authored.
     when: dict[str, Any] = field(default_factory=dict)
@@ -120,6 +122,7 @@ class TaskStep:
             "label": self.label,
             "action_type": self.action_type,
             "parameters": dict(self.parameters),
+            "idempotency_key": self.idempotency_key,
             "when": dict(self.when),
             "state": self.state,
             "execution_id": self.execution_id,
@@ -149,6 +152,7 @@ class TaskStep:
             label=str(raw.get("label", "")),
             action_type=str(raw.get("action_type", "")),
             parameters=dict(raw.get("parameters") or {}),
+            idempotency_key=str(raw.get("idempotency_key") or ""),
             when=dict(raw.get("when") or {}),
             state=str(raw.get("state") or "pending"),
             execution_id=str(raw.get("execution_id") or ""),

@@ -1,7 +1,7 @@
 {
   "name": "actionmesh-desktop",
   "productName": "ActionMesh",
-  "version": "0.2.0",
+  "version": "6.3.0",
   "description": "ActionMesh — your devices, one intent. AI proposes, policy decides, you approve, the laptop acts, verification confirms.",
   "license": "Apache-2.0",
   "author": {

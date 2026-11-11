@@ -84,6 +84,30 @@ class TestSchemaVersioning(unittest.TestCase):
             self.assertEqual(store.schema_version, SCHEMA_VERSION)
             self.assertIsNotNone(store.get_record("legacy"))
 
+    def test_v3_dispatch_rows_migrate_without_losing_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._path(directory)
+            raw = sqlite3.connect(str(path))
+            raw.execute(
+                "CREATE TABLE agent_dispatch (action_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, "
+                "process_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT '', "
+                "pid INTEGER NOT NULL DEFAULT 0, pgid INTEGER NOT NULL DEFAULT 0, "
+                "state TEXT NOT NULL DEFAULT 'running', exit_code INTEGER, "
+                "observation TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '', "
+                "ended_at TEXT NOT NULL DEFAULT '')"
+            )
+            raw.execute("INSERT INTO agent_dispatch(action_id, execution_id, state) VALUES ('a1','e1','running')")
+            raw.execute("PRAGMA user_version=3")
+            raw.commit()
+            raw.close()
+            store = SQLiteStore(path)
+            self.addCleanup(store.close)
+            row = store.get_dispatch("a1")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["execution_id"], "e1")
+            self.assertEqual(row["state"], "running")
+            self.assertEqual(row["identity"], "")
+
 
 class TestRecordRoundTrip(unittest.TestCase):
     def test_timestamps_and_results_survive_the_store(self) -> None:

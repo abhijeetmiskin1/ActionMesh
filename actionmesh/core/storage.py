@@ -36,7 +36,7 @@ _TERMINAL_STATES = frozenset(
 )
 
 #: The schema this code writes. Bump by one with each migration appended below.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _migrate_v0_to_v1(connection: sqlite3.Connection) -> None:
@@ -117,12 +117,24 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE execution_parked RENAME TO execution_body")
 
 
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Persist OS process-start identity so PID reuse cannot impersonate a child."""
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(agent_dispatch)").fetchall()
+    }
+    if "identity" not in columns:
+        connection.execute(
+            "ALTER TABLE agent_dispatch ADD COLUMN identity TEXT NOT NULL DEFAULT ''"
+        )
+
+
 #: Each entry upgrades from its index to index+1. Appending a step is the only way the
 #: version moves; there is no branching on "does this table exist".
 MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _migrate_v0_to_v1,
     _migrate_v1_to_v2,
     _migrate_v2_to_v3,
+    _migrate_v3_to_v4,
 )
 
 
@@ -331,13 +343,17 @@ class SQLiteStore:
                 row.get("ended_at", ""),
             ),
         )
+        self.connection.execute(
+            "UPDATE agent_dispatch SET identity = ? WHERE action_id = ?",
+            (row.get("identity", ""), row.get("action_id", "")),
+        )
         self.connection.commit()
 
     @guarded
     def list_dispatch(self, execution_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT action_id, execution_id, process_id, kind, pid, pgid, state, "
-            "exit_code, observation, started_at, ended_at FROM agent_dispatch "
+            "exit_code, observation, started_at, ended_at, identity FROM agent_dispatch "
             "WHERE execution_id = ? ORDER BY started_at",
             (execution_id,),
         ).fetchall()
@@ -349,7 +365,7 @@ class SQLiteStore:
     def get_dispatch(self, action_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT action_id, execution_id, process_id, kind, pid, pgid, state, "
-            "exit_code, observation, started_at, ended_at FROM agent_dispatch "
+            "exit_code, observation, started_at, ended_at, identity FROM agent_dispatch "
             "WHERE action_id = ?",
             (action_id,),
         ).fetchone()
@@ -449,6 +465,7 @@ _DISPATCH_COLUMNS = (
     "observation",
     "started_at",
     "ended_at",
+    "identity",
 )
 
 

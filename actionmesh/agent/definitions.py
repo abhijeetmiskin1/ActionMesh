@@ -181,7 +181,7 @@ def device_definitions() -> list[ActionDefinition]:
         ),
         _def(
             "device.server.status", RiskLevel.LOW, ["device.server.read"],
-            {"name": _S}, [],
+            {"name": _S, "health_path": _S, "expected_status": _NUM, "service_id": _S}, [],
             "Report which development servers are running and their ports",
         ),
         # --- projects -----------------------------------------------------
@@ -436,6 +436,11 @@ def device_definitions() -> list[ActionDefinition]:
             "Report metadata for one path inside the workspace root",
         ),
         _def(
+            "device.files.hash", RiskLevel.MEDIUM, ["file.read"],
+            {"path": _S}, ["path"],
+            "Calculate a bounded SHA-256 digest for one regular workspace file without returning its contents",
+        ),
+        _def(
             "device.files.create", RiskLevel.HIGH, ["file.write"],
             {"path": _S, "content": _S}, ["path", "content"],
             "Create one file inside the workspace root",
@@ -560,6 +565,7 @@ REQUIRING_FILE_ROOT: frozenset[str] = frozenset(
         "device.files.compare",
         "device.files.open",
         "device.files.info",
+        "device.files.hash",
         "device.files.create",
         "device.files.rename",
         "device.files.move",
@@ -669,6 +675,7 @@ IMPLEMENTED: frozenset[str] = frozenset(
         "device.files.compare",
         "device.files.open",
         "device.files.info",
+        "device.files.hash",
         "device.files.create",
         "device.files.rename",
         "device.files.move",

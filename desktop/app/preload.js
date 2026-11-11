@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('actionmesh', {
   restartBackend: () => ipcRenderer.invoke('backend:restart'),
   backendLogs: () => ipcRenderer.invoke('backend:logs'),
   openDataDir: () => ipcRenderer.invoke('backend:open-data-dir'),
+  pickProjectFolder: () => ipcRenderer.invoke('projects:pick-folder'),
 
   // the control plane API, proxied through the main process
   request: (request) => ipcRenderer.invoke('api:request', request),

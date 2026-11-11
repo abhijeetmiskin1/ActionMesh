@@ -147,6 +147,7 @@ async function api(method, path, body, { long = false } = {}) {
 const GET = (path) => api('GET', path);
 const POST = (path, body, opts) => api('POST', path, body === undefined ? {} : body, opts);
 const PUT = (path, body) => api('PUT', path, body === undefined ? {} : body);
+const PATCH = (path, body) => api('PATCH', path, body === undefined ? {} : body);
 const DELETE = (path) => api('DELETE', path);
 
 // ---------------------------------------------------------------------------
@@ -188,6 +189,13 @@ const state = {
   // and there is no half-understood plan waiting to be saved by surprise.
   selectedAutomation: '',
   automationDraft: null,
+  selectedProject: '',
+  selectedProjectRoot: '',
+  selectedGoal: '',
+  editingGoal: '',
+  projectGoalBaseline: null,
+  projectEventOffset: 0,
+  projectEventsScope: 'goal',
   // The agent's declared capabilities, read from `/capabilities`. The command guide
   // uses it to say whether screen *analysis* is offered in this build; null means it
   // has not been read, and the guide then says "not supported" rather than guessing.
@@ -230,6 +238,7 @@ const VIEWS = {
   home: { eyebrow: 'Control plane', title: 'Home' },
   voice: { eyebrow: 'Voice', title: 'Voice Commands' },
   tasks: { eyebrow: 'VoiceOS', title: 'Task Center' },
+  projects: { eyebrow: 'Local workspaces', title: 'Projects' },
   continuum: { eyebrow: 'Autonomous systems', title: 'Continuum Lab' },
   parallelworld: { eyebrow: 'Shadow execution', title: 'ParallelWorld' },
   automations: { eyebrow: 'Personal automation', title: 'Automations' },
@@ -2497,24 +2506,27 @@ async function refreshSettings() {
   ]);
 
   const settings = appState.settings || {};
+  const setUntouched = (id, property, value) => {
+    const input = byId(id);
+    if (input && !input.dataset.touched) input[property] = value;
+  };
   // The provider card reads the main-process status, not the raw settings: the words
   // "Connected" only appear once a probe said so.
   state.providerStatus = appState.provider || state.providerStatus;
   renderSettingsProviderCard();
-  const shortcutInput = byId('setShortcut');
-  if (!shortcutInput.dataset.touched) shortcutInput.value = settings.shortcut || '';
-  byId('setShortcutEnabled').checked = Boolean(settings.shortcutEnabled);
-  byId('setNotifications').checked = Boolean(settings.notificationsEnabled);
-  byId('setAgent').checked = Boolean(settings.agentEnabled);
-  byId('setDeviceName').value = settings.deviceName || '';
-  byId('setWorkspace').value = settings.workspaceRoot || '';
-  byId('setAllowShell').checked = Boolean(settings.allowShell);
-  byId('setAllowDesktop').checked = Boolean(settings.allowDesktop);
-  byId('setAllowBrowser').checked = Boolean(settings.allowBrowser);
-  byId('setAllowGithubRead').checked = Boolean(settings.allowGithubRead);
-  byId('setAllowDriveRead').checked = Boolean(settings.allowDriveRead);
-  byId('setAllowMedia').checked = Boolean(settings.allowMedia);
-  byId('setAllowedCommands').value = (settings.allowedCommands || []).join(', ');
+  setUntouched('setShortcut', 'value', settings.shortcut || '');
+  setUntouched('setShortcutEnabled', 'checked', Boolean(settings.shortcutEnabled));
+  setUntouched('setNotifications', 'checked', Boolean(settings.notificationsEnabled));
+  setUntouched('setAgent', 'checked', Boolean(settings.agentEnabled));
+  setUntouched('setDeviceName', 'value', settings.deviceName || '');
+  setUntouched('setWorkspace', 'value', settings.workspaceRoot || '');
+  setUntouched('setAllowShell', 'checked', Boolean(settings.allowShell));
+  setUntouched('setAllowDesktop', 'checked', Boolean(settings.allowDesktop));
+  setUntouched('setAllowBrowser', 'checked', Boolean(settings.allowBrowser));
+  setUntouched('setAllowGithubRead', 'checked', Boolean(settings.allowGithubRead));
+  setUntouched('setAllowDriveRead', 'checked', Boolean(settings.allowDriveRead));
+  setUntouched('setAllowMedia', 'checked', Boolean(settings.allowMedia));
+  setUntouched('setAllowedCommands', 'value', (settings.allowedCommands || []).join(', '));
 
   byId('shortcutStatus').textContent = appState.shortcutRegistered
     ? `${prettyAccelerator(settings.shortcut)} is registered system-wide.`
@@ -2563,6 +2575,10 @@ async function saveSettings() {
       if (forgetTokens.checked || input.value.trim()) patch[key] = forgetTokens.checked ? '' : input.value.trim();
     }
     const answer = await bridge.updateSettings(patch);
+    for (const id of SETTINGS_INPUT_IDS) {
+      const input = byId(id);
+      if (input) delete input.dataset.touched;
+    }
     byId('setGithubReadToken').value = '';
     byId('setDriveReadToken').value = '';
     forgetTokens.checked = false;
@@ -2578,6 +2594,12 @@ async function saveSettings() {
     button.disabled = false;
   }
 }
+
+const SETTINGS_INPUT_IDS = [
+  'setShortcut', 'setShortcutEnabled', 'setNotifications', 'setAgent', 'setDeviceName',
+  'setWorkspace', 'setAllowShell', 'setAllowDesktop', 'setAllowBrowser', 'setAllowGithubRead',
+  'setAllowDriveRead', 'setAllowMedia', 'setAllowedCommands',
+];
 
 // The pre-C42 "Save provider" / "Clear key" pair used to write the legacy single
 // provider slot — name, model, endpoint and credential — directly. Both jobs are now
@@ -5428,10 +5450,376 @@ async function applyParallelPlan() {
   }
 }
 
+function projectRow(container, title, subtitle, selected, onSelect) {
+  const item = document.createElement('li');
+  item.className = 'row';
+  item.setAttribute('aria-selected', String(Boolean(selected)));
+  const main = document.createElement('div');
+  main.className = 'row-main';
+  const name = document.createElement('div');
+  name.className = 'row-title';
+  name.textContent = title;
+  const detail = document.createElement('div');
+  detail.className = 'row-sub';
+  detail.textContent = subtitle || '';
+  main.append(name, detail);
+  const button = document.createElement('button');
+  button.className = 'btn ghost small';
+  button.type = 'button';
+  button.textContent = selected ? 'Selected' : 'Select';
+  button.disabled = Boolean(selected);
+  button.addEventListener('click', onSelect);
+  item.append(main, button);
+  container.append(item);
+}
+
+function projectEmpty(container, message) {
+  const item = document.createElement('li');
+  item.className = 'empty';
+  item.textContent = message;
+  container.append(item);
+}
+
+async function refreshProjects() {
+  const message = byId('projectMessage');
+  const goalMessage = byId('projectGoalMessage');
+  try {
+    const data = await GET('/api/v1/projects');
+    const projects = Array.isArray(data.projects) ? data.projects : [];
+    const selected = data.selected || null;
+    const previousProject = state.selectedProject;
+    if (!state.selectedProject || !projects.some((project) => project.project_id === state.selectedProject)) {
+      state.selectedProject = selected ? selected.project_id : '';
+    }
+    if (previousProject !== state.selectedProject) state.projectGoalBaseline = null;
+    const list = byId('projectList');
+    list.replaceChildren();
+    byId('projectCount').textContent = String(projects.length);
+    if (!projects.length) projectEmpty(list, 'No registered projects. Register a folder inside the configured workspace.');
+    for (const project of projects) {
+      projectRow(
+        list, project.name, `${project.kind} · ${project.root || '.'}`,
+        project.project_id === state.selectedProject,
+        async () => {
+          try {
+            await POST(`/api/v1/projects/${encodeURIComponent(project.project_id)}/select`);
+            state.selectedProject = project.project_id;
+            state.projectGoalBaseline = null;
+            state.selectedGoal = '';
+            await refreshProjects();
+          } catch (error) {
+            message.textContent = error.message;
+          }
+        },
+      );
+    }
+    const active = projects.find((project) => project.project_id === state.selectedProject);
+    if (!active) {
+      state.selectedProjectRoot = '';
+      byId('projectDetailTitle').textContent = 'Select a project';
+      byId('projectLocation').textContent = '';
+      byId('projectStatus').textContent = 'Select a registered project to inspect its current state.';
+      byId('projectGoalList').replaceChildren();
+      projectEmpty(byId('projectGoalList'), 'Select a project.');
+      return;
+    }
+    byId('projectDetailTitle').textContent = active.name;
+    state.selectedProjectRoot = active.root || '';
+    const serviceData = await GET(`/api/v1/projects/${encodeURIComponent(active.project_id)}/services`);
+    const serviceSelect = byId('projectGoalService');
+    serviceSelect.replaceChildren();
+    for (const service of serviceData.services || []) {
+      const option = document.createElement('option');
+      option.value = service.service_id;
+      option.textContent = `${service.name} · 127.0.0.1:${service.port}${service.health_path}`;
+      serviceSelect.append(option);
+    }
+    if (!serviceSelect.options.length) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = 'Register a service first';
+      serviceSelect.append(option);
+    }
+    serviceSelect.disabled = !(serviceData.services || []).length;
+    const syncGoalResource = () => {
+      const type = byId('projectGoalType').value;
+      const httpGoal = type === 'http_service';
+      const hashGoal = type === 'file_sha256';
+      const processGoal = type === 'managed_process';
+      const serviceGoal = httpGoal || processGoal;
+      byId('projectGoalResource').hidden = serviceGoal;
+      byId('projectGoalService').hidden = !serviceGoal;
+      byId('projectGoalRecovery').closest('label').hidden = !httpGoal;
+      byId('projectGoalProcessExpectedLabel').hidden = !processGoal;
+      byId('projectGoalProcessExpected').hidden = !processGoal;
+      byId('projectGoalExpected').hidden = processGoal || hashGoal;
+      byId('projectGoalCaptureHash').hidden = !hashGoal;
+      byId('projectGoalHashBaseline').hidden = !hashGoal;
+      byId('projectGoalServiceLabel').textContent = processGoal
+        ? 'Registered managed process' : 'Registered local service';
+      byId('projectGoalResourceLabel').textContent = hashGoal
+        ? 'Project relative file to monitor' : 'Project relative file or supported app';
+      byId('projectGoalHashBaseline').textContent = hashGoal
+        ? (state.projectGoalBaseline?.sha256
+          ? `Captured ${state.projectGoalBaseline.sha256} · ${state.projectGoalBaseline.size ?? 'existing'} bytes · execution ${state.projectGoalBaseline.execution_id}`
+          : 'Capture an explicit baseline before saving this integrity goal.')
+        : '';
+    };
+    syncGoalResource();
+    let projectStatusData = null;
+    try {
+      projectStatusData = await GET(`/api/v1/projects/${encodeURIComponent(active.project_id)}/status`);
+      byId('projectLocation').textContent = projectStatusData.location || active.root || '.';
+      byId('projectStatus').textContent = projectStatusData.verified
+        ? JSON.stringify({ state: projectStatusData.state, execution_id: projectStatusData.execution_id, ...projectStatusData.status }, null, 2)
+        : JSON.stringify({ state: projectStatusData.state, execution_id: projectStatusData.execution_id, error: projectStatusData.error }, null, 2);
+    } catch (error) {
+      byId('projectStatus').textContent = `Project status unavailable: ${error.message}`;
+    }
+    const goalData = await GET(`/api/v1/goals?project_id=${encodeURIComponent(active.project_id)}&limit=100`);
+    const goals = Array.isArray(goalData.goals) ? goalData.goals : [];
+    const serviceList = byId('projectServiceList');
+    serviceList.replaceChildren();
+    const services = serviceData.services || [];
+    if (!services.length) projectEmpty(serviceList, 'No managed services registered for this project.');
+    for (const service of services) {
+      const item = document.createElement('li');
+      item.className = 'row';
+      const main = document.createElement('div');
+      main.className = 'row-main';
+      const title = document.createElement('div');
+      title.className = 'row-title';
+      title.textContent = service.name;
+      const processRecord = (projectStatusData?.status?.services || [])
+        .find((candidate) => candidate.label === service.name);
+      const detail = document.createElement('div');
+      detail.className = 'row-sub';
+      const processState = processRecord?.state || 'unknown';
+      const processIdentity = processRecord?.pid ? ` · PID ${processRecord.pid}` : '';
+      detail.textContent = `Registered loopback target · 127.0.0.1:${service.port}${service.health_path} · ${service.timeout_ms || 1500} ms timeout · process ${processState}${processIdentity}`;
+      main.append(title, detail);
+      item.append(main);
+      const linkedGoal = goals.find((goal) => goal.contract_type === 'http_service'
+        && goal.resource_identity === service.service_id);
+      const check = document.createElement('button');
+      check.className = 'btn ghost small';
+      check.type = 'button';
+      check.textContent = linkedGoal ? 'Check health' : 'Create health goal';
+      check.addEventListener('click', async () => {
+        if (!linkedGoal) {
+          byId('projectGoalType').value = 'http_service';
+          byId('projectGoalService').value = service.service_id;
+          byId('projectGoalMessage').textContent = 'Configure and save a Goal Contract for this registered service, then use its Observe control.';
+          byId('projectGoalForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return;
+        }
+        try {
+          await POST(`/api/v1/goals/${encodeURIComponent(linkedGoal.goal_id)}/observe`);
+          await refreshProjects();
+        } catch (error) {
+          byId('projectServiceMessage').textContent = `Health observation failed: ${error.message}`;
+        }
+      });
+      item.append(check);
+      const control = document.createElement('button');
+      control.className = 'btn ghost small';
+      control.type = 'button';
+      const operation = processRecord?.state === 'running' ? 'stop' : 'start';
+      control.textContent = operation === 'stop' ? 'Stop managed process' : 'Start managed process';
+      control.addEventListener('click', async () => {
+        try {
+          const result = await POST(
+            `/api/v1/projects/${encodeURIComponent(active.project_id)}/services/${encodeURIComponent(service.service_id)}/actions`,
+            { operation },
+          );
+          byId('projectServiceMessage').textContent = `${result.operation} · ${result.state} · ${result.execution_id}${result.error ? ` · ${result.error}` : ''}`;
+          await refreshProjects();
+        } catch (error) {
+          byId('projectServiceMessage').textContent = `Managed process ${operation} failed: ${error.message}`;
+        }
+      });
+      item.append(control);
+      const processGoalButton = document.createElement('button');
+      processGoalButton.className = 'btn ghost small';
+      processGoalButton.type = 'button';
+      processGoalButton.textContent = 'Create process goal';
+      processGoalButton.addEventListener('click', () => {
+        byId('projectGoalType').value = 'managed_process';
+        byId('projectGoalService').value = service.service_id;
+        byId('projectGoalProcessExpected').value = 'running';
+        byId('projectGoalType').dispatchEvent(new Event('change'));
+        byId('projectGoalDescription').value = `${service.name} process is running`;
+        byId('projectGoalForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+      item.append(processGoalButton);
+      serviceList.append(item);
+    }
+    const goalList = byId('projectGoalList');
+    goalList.replaceChildren();
+    if (!goals.length) projectEmpty(goalList, 'No Goal Contracts for this project.');
+    for (const goal of goals) {
+      const item = document.createElement('li');
+      item.className = 'row';
+      const main = document.createElement('div');
+      main.className = 'row-main';
+      const title = document.createElement('div');
+      title.className = 'row-title';
+      title.textContent = goal.description || goal.contract_type;
+      const detail = document.createElement('div');
+      detail.className = 'row-sub';
+      const expectedCondition = goal.expected?.condition || goal.expected?.sha256 || goal.expected?.value;
+      detail.textContent = `${goal.current_observation} · expects ${expectedCondition ?? 'unknown'} · ${goal.observer} · ${goal.resource_identity} · monitoring ${goal.monitoring_enabled ? 'on' : 'off'}`;
+      main.append(title, detail);
+      item.append(main);
+      const actions = [
+        ['Edit', 'edit'],
+        ['Observe', 'observe'],
+        [goal.monitoring_enabled ? 'Disable monitoring' : 'Enable monitoring', 'monitor'],
+        [goal.state === 'PAUSED' ? 'Resume' : 'Pause', goal.state === 'PAUSED' ? 'resume' : 'pause'],
+        ['History', 'history'],
+        ['Archive', 'archive'],
+      ];
+      if (goal.contract_type === 'http_service' && goal.recovery?.enabled && goal.current_observation === 'VIOLATED') {
+        actions.splice(2, 0, ['Propose restart', 'recover']);
+      }
+      for (const [label, action] of actions) {
+        const button = document.createElement('button');
+        button.className = 'btn ghost small';
+        button.type = 'button';
+        button.textContent = label;
+        if (action === 'observe' && goal.state !== 'ACTIVE') button.disabled = true;
+        button.addEventListener('click', async () => {
+          state.selectedGoal = goal.goal_id;
+          try {
+            if (action === 'history') return await refreshProjectGoalEvents(goal.goal_id);
+            if (action === 'recover') {
+              const proposal = await POST(`/api/v1/goals/${encodeURIComponent(goal.goal_id)}/recover`);
+              goalMessage.textContent = `${proposal.state} · ${proposal.execution_id || 'approval or execution record pending'}`;
+              await refreshProjects();
+              return;
+            }
+            if (action === 'monitor') {
+              const result = await POST(
+                `/api/v1/goals/${encodeURIComponent(goal.goal_id)}/monitor`,
+                { enabled: !goal.monitoring_enabled },
+              );
+              goalMessage.textContent = `Recurring observation ${result.monitoring_enabled ? 'enabled' : 'disabled'}.`;
+              await refreshProjects();
+              return;
+            }
+            if (action === 'edit') {
+              state.editingGoal = goal.goal_id;
+              byId('projectGoalDescription').value = goal.description || '';
+              byId('projectGoalType').value = goal.contract_type;
+              byId('projectGoalResource').value = ['file_exists', 'file_sha256'].includes(goal.contract_type)
+                && state.selectedProjectRoot
+                && goal.resource_identity.startsWith(`${state.selectedProjectRoot}/`)
+                ? goal.resource_identity.slice(state.selectedProjectRoot.length + 1)
+                : goal.resource_identity;
+              byId('projectGoalExpected').value = String(Boolean(goal.expected.value));
+              state.projectGoalBaseline = goal.contract_type === 'file_sha256'
+                ? { sha256: goal.expected.sha256, size: null, execution_id: '' }
+                : null;
+              const hashGoal = goal.contract_type === 'file_sha256';
+              const processGoal = goal.contract_type === 'managed_process';
+              byId('projectGoalCaptureHash').hidden = !hashGoal;
+              byId('projectGoalHashBaseline').hidden = !hashGoal;
+              byId('projectGoalProcessExpectedLabel').hidden = !processGoal;
+              byId('projectGoalProcessExpected').hidden = !processGoal;
+              byId('projectGoalExpected').hidden = hashGoal || processGoal;
+              byId('projectGoalService').hidden = !['http_service', 'managed_process'].includes(goal.contract_type);
+              byId('projectGoalServiceLabel').textContent = processGoal
+                ? 'Registered managed process' : 'Registered local service';
+              if (processGoal || goal.contract_type === 'http_service') {
+                byId('projectGoalService').value = goal.resource_identity;
+              }
+              if (processGoal) byId('projectGoalProcessExpected').value = goal.expected.condition;
+              byId('projectGoalHashBaseline').textContent = hashGoal
+                ? `Saved baseline ${goal.expected.sha256} · capture a new baseline to change it.`
+                : '';
+              byId('projectGoalInterval').value = goal.interval_seconds;
+              byId('projectGoalMonitoring').checked = Boolean(goal.monitoring_enabled);
+              byId('projectGoalResource').disabled = goal.contract_type === 'git_clean';
+              byId('projectGoalForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+              return;
+            }
+            await POST(`/api/v1/goals/${encodeURIComponent(goal.goal_id)}/${action}`);
+            if (action === 'archive') state.selectedGoal = '';
+            await refreshProjects();
+          } catch (error) {
+            goalMessage.textContent = error.message;
+          }
+        });
+        item.append(button);
+      }
+      goalList.append(item);
+    }
+    const selectedGoal = goals.find((goal) => goal.goal_id === state.selectedGoal) || goals[0];
+    if (selectedGoal) {
+      state.selectedGoal = selectedGoal.goal_id;
+      await refreshProjectGoalEvents(selectedGoal.goal_id);
+    } else {
+      byId('projectGoalEvents').replaceChildren();
+      projectEmpty(byId('projectGoalEvents'), 'Select a goal to load its stored events.');
+    }
+    if (message) message.textContent = '';
+  } catch (error) {
+    if (message) message.textContent = `Project data could not be loaded: ${error.message}`;
+  }
+}
+
+async function refreshProjectGoalEvents(goalId) {
+  state.projectEventsScope = 'goal';
+  state.projectEventOffset = 0;
+  const response = await GET(`/api/v1/goals/${encodeURIComponent(goalId)}/events?limit=40&offset=0`);
+  renderProjectEvents(response.events);
+}
+
+async function refreshProjectEventsPage(offset) {
+  const projectId = state.selectedProject;
+  if (!projectId) return;
+  const response = await GET(`/api/v1/events?project_id=${encodeURIComponent(projectId)}&limit=40&offset=${offset}`);
+  state.projectEventsScope = 'project';
+  state.projectEventOffset = offset;
+  renderProjectEvents(response.events, offset > 0);
+}
+
+async function refreshOlderGoalEvents() {
+  if (!state.selectedGoal) return;
+  const offset = state.projectEventOffset + 40;
+  const response = await GET(
+    `/api/v1/goals/${encodeURIComponent(state.selectedGoal)}/events?limit=40&offset=${offset}`,
+  );
+  state.projectEventOffset = offset;
+  renderProjectEvents(response.events, true);
+}
+
+function renderProjectEvents(events, append = false) {
+  const list = byId('projectGoalEvents');
+  if (!append) list.replaceChildren();
+  if (!events.length && !append) projectEmpty(list, 'No stored events for this goal.');
+  for (const event of events) {
+    const item = document.createElement('li');
+    item.className = 'row';
+    const main = document.createElement('div');
+    main.className = 'row-main';
+    const title = document.createElement('div');
+    title.className = 'row-title';
+    title.textContent = `${event.goal_id ? `${event.goal_id.slice(0, 8)} · ` : ''}${event.event_type}`;
+    const detail = document.createElement('div');
+    detail.className = 'row-sub';
+    detail.textContent = `${event.occurred_at} · ${event.detail}${event.execution_id ? ` · ${event.execution_id}` : ''}`;
+    main.append(title, detail);
+    item.append(main);
+    list.append(item);
+  }
+}
+
 function refreshCurrent() {
   switch (state.view) {
     case 'home': return refreshHome();
     case 'tasks': return refreshTasks();
+    case 'projects': return refreshProjects();
     case 'automations': return refreshAutomations();
     case 'continuum': return refreshLab();
     case 'parallelworld': return refreshParallelWorld();
@@ -5573,7 +5961,11 @@ function wire() {
   const log = byId('backendLog');
   const logDetails = log ? log.closest('details') : null;
   if (logDetails) logDetails.addEventListener('toggle', () => { if (logDetails.open) loadBackendLog(); });
-  on('setShortcut', 'input', (event) => { event.target.dataset.touched = 'true'; });
+  for (const id of SETTINGS_INPUT_IDS) {
+    for (const eventName of ['input', 'change']) {
+      on(id, eventName, (event) => { event.target.dataset.touched = 'true'; });
+    }
+  }
   on('openDashboard', 'click', () => bridge.openWebPage('dashboard'));
   on('openVoice', 'click', () => bridge.openWebPage('voice'));
   on('clearWeb', 'click', async () => {
@@ -5582,6 +5974,194 @@ function wire() {
       toast('The browser pages’ local data was cleared.', 'good');
     } catch (error) {
       toast(`Could not clear the page data: ${error.message}`, 'bad');
+    }
+  });
+  byId('projectsRefresh')?.addEventListener('click', () => void refreshProjects());
+  byId('projectPickFolder')?.addEventListener('click', async () => {
+    const result = await bridge.pickProjectFolder();
+    if (result && result.ok) {
+      byId('projectPath').value = result.path;
+      byId('projectName').value = result.name;
+      byId('projectMessage').textContent = 'Folder selected inside the approved workspace. Register it to save the project.';
+    } else if (result && !result.canceled) {
+      byId('projectMessage').textContent = result.error || 'Folder selection failed.';
+    }
+  });
+  byId('projectAllEvents')?.addEventListener('click', () => void refreshProjectEventsPage(0));
+  byId('projectOlderEvents')?.addEventListener('click', () => {
+    if (state.projectEventsScope === 'project') {
+      void refreshProjectEventsPage(state.projectEventOffset + 40);
+    } else {
+      void refreshOlderGoalEvents();
+    }
+  });
+  byId('projectOpen')?.addEventListener('click', async () => {
+    const message = byId('projectMessage');
+    if (!state.selectedProject) {
+      message.textContent = 'Select a registered project first.';
+      return;
+    }
+    try {
+      const result = await POST(
+        `/api/v1/projects/${encodeURIComponent(state.selectedProject)}/open`,
+        { ide: byId('projectIde').value.trim() },
+      );
+      message.textContent = result.state === 'awaiting_approval'
+        ? `Opening is awaiting approval · ${result.execution_id}`
+        : `Open request: ${result.state} · ${result.execution_id}${result.error ? ` · ${result.error}` : ''}`;
+    } catch (error) {
+      message.textContent = `Project open failed: ${error.message}`;
+    }
+  });
+  byId('projectRegisterForm')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const message = byId('projectMessage');
+    try {
+      const project = await POST('/api/v1/projects', {
+        path: byId('projectPath').value.trim(),
+        name: byId('projectName').value.trim() || undefined,
+      });
+      await POST(`/api/v1/projects/${encodeURIComponent(project.project_id)}/select`);
+      state.selectedProject = project.project_id;
+      state.projectGoalBaseline = null;
+      state.selectedGoal = '';
+      message.textContent = `Registered ${project.name} at ${project.location}.`;
+      byId('projectPath').value = '';
+      byId('projectName').value = '';
+      await refreshProjects();
+    } catch (error) {
+      message.textContent = `Project registration failed: ${error.message}`;
+    }
+  });
+  byId('projectGoalType')?.addEventListener('change', () => {
+    const type = byId('projectGoalType').value;
+    const processGoal = type === 'managed_process';
+    const serviceGoal = type === 'http_service' || processGoal;
+    byId('projectGoalResource').disabled = type === 'git_clean';
+    byId('projectGoalResource').hidden = serviceGoal;
+    byId('projectGoalService').hidden = !serviceGoal;
+    byId('projectGoalRecovery').closest('label').hidden = type !== 'http_service';
+    byId('projectGoalProcessExpectedLabel').hidden = !processGoal;
+    byId('projectGoalProcessExpected').hidden = !processGoal;
+    const hashGoal = type === 'file_sha256';
+    byId('projectGoalCaptureHash').hidden = !hashGoal;
+    byId('projectGoalHashBaseline').hidden = !hashGoal;
+    byId('projectGoalExpected').hidden = hashGoal;
+    byId('projectGoalExpected').hidden = hashGoal || processGoal;
+    byId('projectGoalServiceLabel').textContent = processGoal
+      ? 'Registered managed process' : 'Registered local service';
+    byId('projectGoalResourceLabel').textContent = hashGoal
+      ? 'Project relative file to monitor' : 'Project relative file or supported app';
+    byId('projectGoalHashBaseline').textContent = hashGoal
+      ? (state.projectGoalBaseline?.sha256
+        ? `Captured ${state.projectGoalBaseline.sha256} · ${state.projectGoalBaseline.size ?? 'existing'} bytes · execution ${state.projectGoalBaseline.execution_id}`
+        : 'Capture an explicit baseline before saving this integrity goal.')
+      : '';
+  });
+  byId('projectGoalResource')?.addEventListener('input', () => {
+    if (byId('projectGoalType').value !== 'file_sha256' || !state.projectGoalBaseline) return;
+    state.projectGoalBaseline = null;
+    byId('projectGoalHashBaseline').textContent = 'The file path changed. Capture a new SHA-256 baseline for this target.';
+  });
+  byId('projectGoalCaptureHash')?.addEventListener('click', async () => {
+    const message = byId('projectGoalMessage');
+    try {
+      if (!state.selectedProject) throw new Error('Select a registered project first.');
+      const path = byId('projectGoalResource').value.trim();
+      if (!path) throw new Error('Enter a project-relative file first.');
+      message.textContent = 'Capturing baseline through the file.read policy and verification path…';
+      const baseline = await POST(
+        `/api/v1/projects/${encodeURIComponent(state.selectedProject)}/files/hash`, { path },
+      );
+      state.projectGoalBaseline = baseline;
+      byId('projectGoalHashBaseline').textContent =
+        `Captured ${baseline.sha256} · ${baseline.size} bytes · execution ${baseline.execution_id}`;
+      message.textContent = 'Baseline captured from the current file bytes. Save the Goal Contract to monitor for changes.';
+    } catch (error) {
+      state.projectGoalBaseline = null;
+      byId('projectGoalHashBaseline').textContent = `Baseline unavailable: ${error.message}`;
+      message.textContent = error.message;
+    }
+  });
+  byId('projectGoalForm')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const message = byId('projectGoalMessage');
+    if (!state.selectedProject) {
+      message.textContent = 'Select a registered project first.';
+      return;
+    }
+    try {
+      const body = {
+        contract_type: byId('projectGoalType').value,
+        expected: byId('projectGoalType').value === 'file_sha256'
+          ? state.projectGoalBaseline?.sha256
+          : byId('projectGoalType').value === 'managed_process'
+            ? byId('projectGoalProcessExpected').value
+            : byId('projectGoalExpected').value === 'true',
+        interval_seconds: Number(byId('projectGoalInterval').value),
+        monitoring_enabled: byId('projectGoalMonitoring').checked,
+        description: byId('projectGoalDescription').value.trim(),
+      };
+      if (body.contract_type === 'file_sha256' && state.projectGoalBaseline?.execution_id) {
+        body.baseline_execution_id = state.projectGoalBaseline.execution_id;
+      }
+      if (body.contract_type === 'file_sha256' && !body.expected) {
+        throw new Error('Capture a SHA-256 baseline before saving this Goal Contract.');
+      }
+      if (body.contract_type === 'http_service') {
+        body.resource = byId('projectGoalService').value;
+        body.recovery = { enabled: byId('projectGoalRecovery').checked };
+        body.attempt_budget = byId('projectGoalRecovery').checked ? 2 : 0;
+      } else if (['http_service', 'managed_process'].includes(body.contract_type)) {
+        body.resource = byId('projectGoalService').value;
+      } else if (body.contract_type !== 'git_clean') {
+        body.resource = byId('projectGoalResource').value.trim();
+      }
+      const goal = state.editingGoal
+        ? await PATCH(`/api/v1/goals/${encodeURIComponent(state.editingGoal)}`, body)
+        : await POST('/api/v1/goals', { ...body, project_id: state.selectedProject });
+      state.editingGoal = '';
+      state.selectedGoal = goal.goal_id;
+      message.textContent = `Saved ${goal.description}. Observation: ${goal.monitoring_enabled ? 'monitoring enabled' : 'manual'}.`;
+      byId('projectGoalResource').value = '';
+      state.projectGoalBaseline = null;
+      byId('projectGoalHashBaseline').textContent = '';
+      await refreshProjects();
+    } catch (error) {
+      message.textContent = `Goal creation failed: ${error.message}`;
+    }
+  });
+  byId('projectServiceForm')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const message = byId('projectServiceMessage');
+    if (!state.selectedProject) {
+      message.textContent = 'Select a registered project first.';
+      return;
+    }
+    try {
+      const rawArguments = JSON.parse(byId('projectServiceArguments').value || '[]');
+      if (!Array.isArray(rawArguments) || rawArguments.some((part) => typeof part !== 'string')) {
+        throw new Error('Arguments must be a JSON array of strings.');
+      }
+      const service = await POST(`/api/v1/projects/${encodeURIComponent(state.selectedProject)}/services`, {
+        name: byId('projectServiceName').value.trim(),
+        command: byId('projectServiceCommand').value.trim(),
+        arguments: rawArguments,
+        working_directory: byId('projectServiceWorkdir').value.trim(),
+        port: Number(byId('projectServicePort').value),
+        health_path: byId('projectServiceHealthPath').value.trim(),
+        expected_status: Number(byId('projectServiceStatus').value),
+        timeout_ms: Number(byId('projectServiceTimeout').value),
+      });
+      message.textContent = `Registered ${service.name}. Launch and stop actions still pass through ActionMesh policy.`;
+      byId('projectServiceForm').reset();
+      byId('projectServiceArguments').value = '[]';
+      byId('projectServiceHealthPath').value = '/';
+      byId('projectServiceStatus').value = '200';
+      byId('projectServiceTimeout').value = '1500';
+      await refreshProjects();
+    } catch (error) {
+      message.textContent = `Service registration failed: ${error.message}`;
     }
   });
 

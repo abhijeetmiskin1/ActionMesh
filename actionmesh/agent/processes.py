@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import os
 import signal
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -56,6 +58,68 @@ RUNNING = "running"
 EXITED = "exited"
 STOPPED = "stopped"
 TERMINATED = "terminated"
+
+
+class ProcessObservation:
+    """The kernel's answer for a process identity, including uncertainty."""
+
+    RUNNING = "running"
+    GONE = "gone"
+    UNKNOWN = "unknown"
+
+
+def _linux_identity(pid: int) -> str | None:
+    """Return boot id + kernel start ticks; comm may contain spaces and ')' characters."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            stat = handle.read()
+        fields = stat[stat.rfind(b")") + 2 :].split()
+        if len(fields) < 20:
+            return None
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+            boot_id = handle.read().strip()
+        return f"linux:{boot_id}:{fields[19].decode('ascii')}:{fields[0].decode('ascii')}"
+    except (OSError, UnicodeError, IndexError):
+        return None
+
+
+def process_identity(pid: int | None) -> str | None:
+    """Capture a stable OS process-start token where the platform exposes one."""
+    if pid is None:
+        return None
+    if sys.platform.startswith("linux"):
+        return _linux_identity(pid)
+    # macOS exposes process start time through libproc's C ABI, but using ctypes
+    # would violate the repository's explicit unsafe-decoding primitive guard.
+    # Callers must use a live asyncio child handle or report UNKNOWN after restart.
+    return None
+
+
+def observe_process(pid: int | None, identity: str | None) -> str:
+    """Distinguish a live matching process, a gone/reused PID, and weak evidence."""
+    if pid is None or not identity:
+        return ProcessObservation.UNKNOWN
+    observed = process_identity(pid)
+    if observed is not None:
+        same_start = (
+            observed.rsplit(":", 1)[0] == identity.rsplit(":", 1)[0]
+            if observed.startswith("linux:") and identity.startswith("linux:")
+            else observed == identity
+        )
+        if not same_start or observed.endswith(":Z"):
+            return ProcessObservation.GONE
+        return ProcessObservation.RUNNING
+    # Missing/unreadable proc data is ambiguous. kill(0) can distinguish a missing
+    # PID, but EPERM and transient kernel visibility must remain UNKNOWN.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return ProcessObservation.GONE
+    except PermissionError:
+        return ProcessObservation.UNKNOWN
+    except OSError:
+        return ProcessObservation.UNKNOWN
+    return ProcessObservation.UNKNOWN
 
 
 def _noop() -> None:
@@ -110,47 +174,27 @@ def stop_group(record: ProcessRecord, *, grace_s: float = 2.0) -> bool:
     caller reports the effect as unconfirmed rather than claiming a stop it did not see.
     """
     target = record.pgid or record.pid
-    if target is None:
+    if target is None or observe_process(record.pid, record.identity) != ProcessObservation.RUNNING:
         return False
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(target, signal.SIGTERM)
     deadline = time.monotonic() + max(0.0, grace_s)
     while time.monotonic() < deadline:
-        if not _alive(record):
+        if observe_process(record.pid, record.identity) == ProcessObservation.GONE:
             return True
         time.sleep(0.02)
-    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(target, signal.SIGKILL)
-    return not _alive(record)
+    if observe_process(record.pid, record.identity) == ProcessObservation.RUNNING:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(target, signal.SIGKILL)
+    return observe_process(record.pid, record.identity) == ProcessObservation.GONE
 
 
 def _alive(record: ProcessRecord) -> bool:
-    """Is this pid still a running process -- not a zombie the kernel has not buried?
-
-    ``kill(pid, 0)`` succeeds for a zombie, so a signalled child whose parent has not
-    reaped it yet looks alive forever. ``/proc`` says what the process actually is, and
-    ``Z`` means the work is finished even if the entry is. Where ``/proc`` does not
-    exist, liveness is not answerable from here and the caller is told so.
-    """
+    """Return true only when the original process identity is still observable."""
     pid = record.pid
     if pid is None:
         return record.state == RUNNING
-    if os.path.exists("/proc"):
-        try:
-            with open(f"/proc/{pid}/stat", "rb") as handle:
-                state = handle.read().rsplit(b")", 1)[-1].split()
-        except OSError:
-            return False
-        return bool(state) and state[0] != b"Z"
-    # macOS: no /proc. kill(pid, 0) with EPERM means the pid is gone (or not ours);
-    # success means it exists. Zombies are handled by the caller's reaper.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return False
-    return True
+    return observe_process(pid, record.identity) == ProcessObservation.RUNNING
 
 
 CONTINUUM_NAME = "actionmesh-continuum-demo"
@@ -198,6 +242,85 @@ async def is_listening(port: int, *, timeout_s: float = PROBE_TIMEOUT_S) -> bool
     return True
 
 
+async def loopback_http_status(
+    port: int, path: str = "/", *, timeout_s: float = PROBE_TIMEOUT_S,
+) -> int | None:
+    """Compatibility wrapper returning the status from a loopback HTTP probe."""
+    return (await loopback_http_observation(port, path, timeout_s=timeout_s)).status
+
+
+@dataclass(frozen=True)
+class HTTPObservation:
+    """Bounded evidence from one numeric loopback HTTP request."""
+
+    state: str
+    status: int | None
+    elapsed_ms: float
+    error: str = ""
+
+
+async def loopback_http_observation(
+    port: int, path: str = "/", *, expected_status: int = 200,
+    timeout_s: float = PROBE_TIMEOUT_S,
+) -> HTTPObservation:
+    """Read one HTTP status line from a registered numeric loopback port.
+
+    The caller supplies a registered server's port, never a host. Redirects are
+    irrelevant because no HTTP client follows them, and response bodies are ignored.
+    """
+    started = time.monotonic()
+    def result(state: str, status: int | None = None, error: str = "") -> HTTPObservation:
+        return HTTPObservation(
+            state=state, status=status,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 3), error=error,
+        )
+
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return result("UNKNOWN", error="invalid_registered_port")
+    if (not isinstance(path, str) or not path.startswith("/") or path.startswith("//")
+        or any(ch in path for ch in "\r\n\x00") or len(path) > 1024):
+        return result("UNKNOWN", error="invalid_health_path")
+    if (isinstance(expected_status, bool) or not isinstance(expected_status, int)
+        or not 100 <= expected_status <= 599):
+        return result("UNKNOWN", error="invalid_expected_status")
+    writer: asyncio.StreamWriter | None = None
+    try:
+        async with asyncio.timeout(timeout_s):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                writer.write(
+                    f"GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode("ascii")
+                )
+                await writer.drain()
+                line = await reader.readline()
+                parts = line.split()
+                if len(parts) < 2 or not parts[0].startswith(b"HTTP/"):
+                    return result("UNKNOWN", error="invalid_http_status_line")
+                status = int(parts[1])
+                if not 100 <= status <= 599:
+                    return result("UNKNOWN", error="invalid_http_status_code")
+                return result(
+                    "HEALTHY" if status == expected_status else "UNHEALTHY", status,
+                    "redirect_not_followed" if 300 <= status < 400 else "",
+                )
+            finally:
+                writer.close()
+                with contextlib.suppress(OSError, asyncio.CancelledError):
+                    await writer.wait_closed()
+    except TimeoutError:
+        return result("TIMEOUT", error="request_timeout")
+    except OSError as exc:
+        category = "connection_refused" if exc.errno == errno.ECONNREFUSED else "connection_failed"
+        return result("UNREACHABLE", error=category)
+    except (ValueError, UnicodeError):
+        return result("UNKNOWN", error="invalid_http_response")
+    finally:
+        if writer is not None and not writer.is_closing():
+            writer.close()
+            with contextlib.suppress(OSError, asyncio.CancelledError):
+                await writer.wait_closed()
+
+
 @dataclass
 class ProcessRecord:
     """One child this agent started, and what became of it."""
@@ -210,6 +333,7 @@ class ProcessRecord:
     working_directory: str = ""
     port: int | None = None
     pid: int | None = None
+    identity: str | None = None
     #: The process group to signal. Equal to the pid because children are started in
     #: their own session, and it is what makes a stop work from any event loop.
     pgid: int | None = None
@@ -371,6 +495,7 @@ class ProcessRegistry:
             working_directory=working_directory,
             port=port,
             pid=process.pid,
+            identity=process_identity(process.pid),
             pgid=_pgid(process.pid),
             log_path=log_path,
             execution_id=execution_id,
@@ -424,16 +549,22 @@ class ProcessRegistry:
         ]
 
     # -- lifecycle --------------------------------------------------------
-    @staticmethod
-    def alive(record: ProcessRecord) -> bool:
-        """Is this child still a process? Asked of the kernel where it can be.
+    def observe(self, record: ProcessRecord) -> str:
+        """Use a live child handle first, then platform identity evidence."""
+        process = self._live.get(record.process_id)
+        if process is not None:
+            return (
+                ProcessObservation.RUNNING
+                if process.returncode is None
+                else ProcessObservation.GONE
+            )
+        if record.state != RUNNING:
+            return ProcessObservation.GONE
+        return observe_process(record.pid, record.identity)
 
-        ``/proc`` is checked because the exit code and liveness a transport reports
-        belong to the loop that created it, and a control plane must still be able to
-        tell whether its own server is running after that loop has gone. Where the
-        pid is unknown, the recorded state is all there is and is used as-is.
-        """
-        return _alive(record)
+    def alive(self, record: ProcessRecord) -> bool:
+        """Whether a locally owned handle or stable OS identity proves liveness."""
+        return self.observe(record) == ProcessObservation.RUNNING
 
     def reap(self) -> int:
         """Pull in exit codes for children that have finished. Returns how many.
@@ -457,8 +588,10 @@ class ProcessRegistry:
             code = process.returncode
             if code is None:
                 # The transport belongs to the loop that made it; if that loop is gone
-                # the returncode will never arrive. Fall back to the pid itself.
-                if not self.alive(record):
+                # the returncode will never arrive. Only reconcile from the PID when
+                # we captured a stable identity; missing evidence must not turn a live
+                # child into an invented exit.
+                if observe_process(record.pid, record.identity) == ProcessObservation.GONE:
                     record.state = EXITED
                     record.ended_at = datetime.now(UTC)
                     self._live.pop(process_id, None)

@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import secrets
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -57,10 +58,12 @@ from actionmesh.agent.processes import (
     RUNNING,
     STOPPED,
     MissingServerName,
+    ProcessObservation,
     ProcessRecord,
     ProcessRegistry,
     continuum_http_ready,
     is_listening,
+    loopback_http_observation,
     stop_group,
 )
 from actionmesh.agent.projects import scan as scan_projects
@@ -159,6 +162,7 @@ class LaptopProvider(ActionProvider):
             "device.files.compare",
             "device.files.open",
             "device.files.info",
+            "device.files.hash",
             "device.files.create",
             "device.files.rename",
             "device.files.move",
@@ -238,6 +242,7 @@ class LaptopProvider(ActionProvider):
             "device.files.compare",
             "device.files.open",
             "device.files.info",
+            "device.files.hash",
             "device.files.create",
             "device.files.rename",
             "device.files.move",
@@ -269,6 +274,7 @@ class LaptopProvider(ActionProvider):
         ledger: Any = None,
         device_id: str = "",
         browser_bridge: BrowserBridgeConfig | None = None,
+        managed_service_lookup: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
         self.workspace = workspace
         #: The laptop's capability boundary. `None` means no program may be run at
@@ -278,6 +284,9 @@ class LaptopProvider(ActionProvider):
         #: Children this agent started. Deliberately owned by the provider: the only
         #: processes this capability may touch are the ones in here.
         self.processes = processes or ProcessRegistry()
+        #: Persistent project service records are an allowlist for post-restart HTTP
+        #: observations. They never grant process-control authority.
+        self.managed_service_lookup = managed_service_lookup
         #: How long a declared port gets to start answering before the launch reports
         # `not listening`. Configurable because it is a patience setting, not a
         # security one -- and a test should not wait five seconds for a verdict.
@@ -446,6 +455,7 @@ class LaptopProvider(ActionProvider):
             "device.files.compare": lambda: self._files_compare(action),
             "device.files.open": lambda: self._files_open(action),
             "device.files.info": lambda: self._files_info(action),
+            "device.files.hash": lambda: self._files_hash(action),
             "device.files.create": lambda: self._files_create(action),
             "device.files.rename": lambda: self._files_rename(action),
             "device.files.move": lambda: self._files_move(action),
@@ -698,6 +708,11 @@ class LaptopProvider(ActionProvider):
         engine = self._files_engine()
         path = action.parameters.get("path", "")
         return await asyncio.to_thread(engine.info, path)
+
+    async def _files_hash(self, action: Action) -> dict[str, Any]:
+        engine = self._files_engine()
+        path = action.parameters.get("path", "")
+        return await asyncio.to_thread(engine.hash, path)
 
     async def _files_create(self, action: Action) -> dict[str, Any]:
         engine = self._files_engine()
@@ -1327,6 +1342,11 @@ class LaptopProvider(ActionProvider):
             or port != CONTINUUM_PORT or params.get("working_directory")
         ):
             raise ProviderError("The Continuum server name is reserved.", FailureKind.INVALID_INPUT)
+        if server and port is not None and await is_listening(port):
+            raise ProviderError(
+                "the requested loopback port is already occupied; refusing to claim another process as this server",
+                FailureKind.PROVIDER,
+            )
         # Everything that could make this request impossible is settled *before* the
         # process exists. `reserve` covers the name and the child cap; a refusal
         # afterwards would leave an owned-by-nobody process holding a port.
@@ -1435,10 +1455,86 @@ class LaptopProvider(ActionProvider):
             entry["listening"] = (
                 await is_listening(record.port) if record.port else None
             )
+            health_path = params.get("health_path")
+            if health_path is not None and params.get("service_id") is None:
+                if not isinstance(health_path, str) or record.port is None:
+                    raise ProviderError(
+                        "HTTP health observation requires a registered named server and path",
+                        FailureKind.INVALID_INPUT,
+                    )
+                expected_status = params.get("expected_status")
+                if (expected_status is not None and (
+                    isinstance(expected_status, bool) or not isinstance(expected_status, (int, float))
+                    or int(expected_status) != expected_status or not 100 <= int(expected_status) <= 599
+                )):
+                    raise ProviderError("expected_status must be an HTTP status code", FailureKind.INVALID_INPUT)
+                observation = await loopback_http_observation(
+                    record.port, health_path,
+                    expected_status=int(expected_status) if expected_status is not None else 200,
+                )
+                http_healthy = (
+                    None if observation.state in {"TIMEOUT", "UNKNOWN"}
+                    else observation.state == "HEALTHY"
+                )
+                entry.update({
+                    "http_status": observation.status,
+                    "http_healthy": http_healthy,
+                    "http_state": observation.state,
+                    "http_elapsed_ms": observation.elapsed_ms,
+                    "http_error": observation.error,
+                })
             if (name == CONTINUUM_NAME and record.port == CONTINUUM_PORT
                 and record.arguments == CONTINUUM_ARGUMENTS and record.state == "running"):
                 entry["ready"] = await continuum_http_ready()
             entries.append(entry)
+        service_id = params.get("service_id")
+        if service_id is not None:
+            if not isinstance(service_id, str) or self.managed_service_lookup is None:
+                raise ProviderError("a persistent managed service registration is required", FailureKind.AUTHORIZATION)
+            service = self.managed_service_lookup(service_id)
+            if service is None:
+                raise ProviderError("the managed service registration is unavailable", FailureKind.AUTHORIZATION)
+            if (name != service["name"] or params.get("health_path") != service["health_path"]
+                or params.get("expected_status") != service["expected_status"]):
+                raise ProviderError("health parameters must match the registered service", FailureKind.INVALID_INPUT)
+            service_entry: dict[str, Any] | None = None
+            for candidate in entries:
+                if candidate.get("label") == service["name"]:
+                    service_entry = candidate
+                    break
+            if service_entry is None:
+                service_entry = {
+                    "service_id": service["service_id"], "label": service["name"],
+                    "kind": "server", "state": "unknown", "process_state": "unknown",
+                    "port": service["port"], "process_id": "",
+                    "listening": await is_listening(service["port"]),
+                }
+                entries.append(service_entry)
+            process_state = str(service_entry.get("state", "unknown"))
+            observation = await loopback_http_observation(
+                int(service["port"]), str(service["health_path"]),
+                expected_status=int(service["expected_status"]),
+                timeout_s=int(service["timeout_ms"]) / 1000,
+            )
+            listener_not_owned = (
+                process_state in {"stopped", "exited", "terminated"}
+                and service_entry.get("listening") is True
+            )
+            http_healthy = (
+                None if observation.state in {"TIMEOUT", "UNKNOWN"}
+                else observation.state == "HEALTHY"
+            )
+            http_state = "UNKNOWN" if listener_not_owned else observation.state
+            if listener_not_owned:
+                http_healthy = None
+            service_entry.update({
+                "service_id": service["service_id"], "process_state": process_state,
+                "http_status": observation.status,
+                "http_healthy": http_healthy,
+                "http_state": http_state,
+                "http_elapsed_ms": observation.elapsed_ms,
+                "http_error": "listener_not_owned" if listener_not_owned else observation.error,
+            })
         result = {
             "servers": entries,
             "count": len(entries),
@@ -1619,6 +1715,8 @@ class LaptopProvider(ActionProvider):
             raise ProviderError(
                 "a path is required", FailureKind.INVALID_INPUT
             )
+        if project and raw.strip() == ".":
+            return ResolvedPath(workspace.root, "")
         try:
             resolved = workspace.resolve(raw, must_exist=True)
         except AgentError as exc:
@@ -1708,7 +1806,11 @@ class LaptopProvider(ActionProvider):
         self._effects[action.action_id] = {
             "action_type": action.type,
             "idempotency_key": action.idempotency_key,
-            "project": target.relative,
+            # Keep the exact typed selector used by this request.  The workspace
+            # root resolves internally to an empty relative path, while callers
+            # address it as "."; recording the resolved form made independent
+            # verification reject a successful root-project inspection.
+            "project": params.get("project"),
             "observed": True,
         }
         return status
@@ -2083,6 +2185,7 @@ class LaptopProvider(ActionProvider):
             "kind": row.get("kind", ""),
             "pid": row.get("pid", 0),
             "pgid": row.get("pgid", 0),
+            "identity": row.get("identity", ""),
             "state": row.get("state", RUNNING),
             "exit_code": row.get("exit_code"),
             "observation": row.get("observation", ""),
@@ -2103,6 +2206,7 @@ class LaptopProvider(ActionProvider):
             kind=record.kind,
             pid=record.pid or 0,
             pgid=record.pgid or record.pid or 0,
+            identity=record.identity or "",
             state=record.state,
             exit_code=record.exit_code,
             ended_at=record.ended_at.isoformat() if record.ended_at else "",
@@ -2136,6 +2240,7 @@ class LaptopProvider(ActionProvider):
             label="",
             command="",
             pid=row.get("pid") or None,
+            identity=row.get("identity") or None,
             pgid=row.get("pgid") or None,
             state=row.get("state") or RUNNING,
             exit_code=row.get("exit_code"),
@@ -2144,7 +2249,9 @@ class LaptopProvider(ActionProvider):
         )
 
     @staticmethod
-    def _observed_action_state(row: dict[str, Any], *, running: bool) -> str:
+    def _observed_action_state(
+        row: dict[str, Any], *, running: bool, uncertain: bool = False
+    ) -> str:
         """What is true of this action now, read from the kernel rather than the row.
 
         The ledger's ``state`` column is written when something *notices* a child
@@ -2157,6 +2264,8 @@ class LaptopProvider(ActionProvider):
         """
         if running:
             return RUNNING
+        if uncertain:
+            return "unknown"
         recorded = row.get("state") or RUNNING
         if recorded != RUNNING:
             return str(recorded)
@@ -2186,13 +2295,16 @@ class LaptopProvider(ActionProvider):
         last_exit: int | None = None
         for row in rows:
             record = self._evidence_row(row)
-            running = record.state == RUNNING and ProcessRegistry.alive(record)
+            observation = self.processes.observe(record)
+            running = observation == ProcessObservation.RUNNING
             if running:
                 live.append(record.pid or 0)
                 handles.append(record.process_id or row["action_id"])
             if record.exit_code is not None:
                 last_exit = record.exit_code
-            observed = self._observed_action_state(row, running=running)
+            observed = self._observed_action_state(
+                row, running=running, uncertain=observation == ProcessObservation.UNKNOWN
+            )
             actions.append(
                 {
                     "action_id": row["action_id"],
@@ -2214,14 +2326,23 @@ class LaptopProvider(ActionProvider):
             state = "running"
         elif any(
             row["exit_code"] is not None
-            or self._observed_action_state(row, running=False) != RUNNING
+            or self._observed_action_state(
+                row,
+                running=False,
+                uncertain=self.processes.observe(self._evidence_row(row))
+                == ProcessObservation.UNKNOWN,
+            ) not in (RUNNING, "unknown")
             for row in rows
         ):
             # Nothing is alive and something finished: that is an answer, and the exit
             # code in it is the kernel's, not this process's memory of one.
             state = "exited"
         else:
-            state = "gone"
+            state = (
+                "unknown"
+                if any(action["state"] == "unknown" for action in actions)
+                else "gone"
+            )
         return {
             "state": state,
             "exit_code": last_exit,
@@ -2249,8 +2370,12 @@ class LaptopProvider(ActionProvider):
         for row in self.ledger.list_dispatch(execution_id):
             record = self._evidence_row(row)
             handle = record.process_id or row["action_id"]
-            if record.state != RUNNING or not ProcessRegistry.alive(record):
+            identity_state = self.processes.observe(record)
+            if record.state != RUNNING or identity_state == ProcessObservation.GONE:
                 already_gone.append(handle)
+                continue
+            if identity_state != ProcessObservation.RUNNING:
+                unconfirmed.append(handle)
                 continue
             if stop_group(record, grace_s=grace_s):
                 stopped.append(handle)
@@ -2427,11 +2552,6 @@ class LaptopProvider(ActionProvider):
                 fresh = self.files.info(action.parameters.get("path", ""))
             except (AgentError, OSError):
                 return None
-            if not fresh.get("exists"):
-                # Metadata that says the path is absent does not witness the
-                # requested lookup; returning it would let the verifier confirm
-                # via the path alone. An absent path is unconfirmed, honestly.
-                return None
             return {
                 "action_type": action.type,
                 "idempotency_key": action.idempotency_key,
@@ -2442,6 +2562,19 @@ class LaptopProvider(ActionProvider):
                     "size": fresh.get("size"),
                     "kind": fresh.get("kind"),
                 },
+            }
+        if action.type == "device.files.hash":
+            if self.files is None:
+                return None
+            try:
+                fresh = self.files.hash(action.parameters.get("path", ""))
+            except (AgentError, ProviderError, OSError):
+                return None
+            return {
+                "action_type": action.type,
+                "idempotency_key": action.idempotency_key,
+                "parameters": {"path": fresh.get("path")},
+                "state": {"sha256": fresh.get("sha256"), "size": fresh.get("size")},
             }
         if action.type == "device.files.open":
             if self.files is None:
@@ -2678,10 +2811,14 @@ class LaptopProvider(ActionProvider):
         if action_type in {"device.process.stop", "device.server.stop"}:
             return self._observe_child(action, recorded, started=False)
         if action_type == "device.server.status":
+            status_parameters: dict[str, Any] = {"name": action.parameters.get("name", "")}
+            for field in ("health_path", "expected_status"):
+                if field in action.parameters:
+                    status_parameters[field] = action.parameters[field]
             return {
                 "action_type": action.type,
                 "idempotency_key": action.idempotency_key,
-                "parameters": {"name": action.parameters.get("name", "")},
+                "parameters": status_parameters,
             }
         if action_type == "device.terminal.execute" and not recorded.get("ran"):
             # The runner stopped this program at its ceiling, so nothing witnessed it

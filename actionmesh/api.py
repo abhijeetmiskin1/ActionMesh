@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
+import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,7 @@ from actionmesh.agent.config import AgentConfig, AgentConfigError
 from actionmesh.agent.definitions import PROVIDER, register_device_actions
 from actionmesh.agent.paths import Workspace
 from actionmesh.agent.presence import LaptopAgent
-from actionmesh.agent.processes import CONTINUUM_NAME
+from actionmesh.agent.processes import CONTINUUM_NAME, ProcessObservation
 from actionmesh.agent.provider import LaptopProvider
 from actionmesh.agent.runner import CommandRunner
 from actionmesh.agent.verification import register_device_strategies
@@ -106,6 +108,7 @@ from actionmesh.voiceos.llm import (
     llm_config_from_env,
 )
 from actionmesh.voiceos.models import Conversation
+from actionmesh.voiceos.project_goals import ProjectGoalStore
 from actionmesh.voiceos.reasoning import describe_session
 from actionmesh.voiceos.targeting import TargetChoice, default_target
 from actionmesh.voiceos.targeting import current as targeting_current
@@ -277,12 +280,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         scheduler.start()
     continuum = app.state.continuum
     continuum_task = asyncio.create_task(continuum.monitor(stop))
+    goal_monitor = getattr(app.state, "project_goal_monitor", None)
+    goal_monitor_task = asyncio.create_task(goal_monitor(stop)) if callable(goal_monitor) else None
     try:
         yield
     finally:
         stop.set()
         await asyncio.gather(continuum_task, return_exceptions=True)
+        if goal_monitor_task is not None:
+            await asyncio.gather(goal_monitor_task, return_exceptions=True)
         continuum.db.close()
+        goal_store = getattr(app.state, "project_goal_store", None)
+        if goal_store is not None:
+            goal_store.close()
         # Stop the ticker before anything it could be writing to is closed. Its own
         # lock guarantees it is not mid-`execute` when this returns.
         if scheduler is not None:
@@ -2317,6 +2327,30 @@ def create_app(
         _voiceos_local_device_id,
     )
     app.state.continuum = continuum
+    goal_database = (
+        str(Path(app_config.audit_db).with_name("continuum.db"))
+        if app_config.audit_db else ":memory:"
+    )
+    project_goal_store = ProjectGoalStore(goal_database)
+    app.state.project_goal_store = project_goal_store
+    laptop_provider = next(
+        (item for item in getattr(engine, "providers", ()) if isinstance(item, LaptopProvider)), None,
+    )
+    if laptop_provider is not None:
+        laptop_provider.managed_service_lookup = project_goal_store.get_service
+
+    def _goal_view(goal: dict[str, Any]) -> dict[str, Any]:
+        observed_at = goal.get("last_observed_at")
+        if goal.get("current_observation") != "UNKNOWN" and isinstance(observed_at, str):
+            try:
+                freshness_deadline = datetime.fromisoformat(observed_at) + timedelta(
+                    seconds=int(goal["interval_seconds"]),
+                )
+                if datetime.now(UTC) > freshness_deadline:
+                    return {**goal, "current_observation": "STALE", "observation_fresh": False}
+            except (ValueError, TypeError, KeyError):
+                return {**goal, "current_observation": "UNKNOWN", "observation_fresh": False}
+        return {**goal, "observation_fresh": goal.get("current_observation") != "UNKNOWN"}
 
     def _continuum_local(request: Request) -> None:
         if not _is_local(request) or getattr(request.state, "credential", None) is not None:
@@ -2378,6 +2412,901 @@ def create_app(
             goal = GoalState.model_validate(saved)
             step = await continuum.run_action(goal, "device.server.stop", {"name": CONTINUUM_NAME})
             return {"state": step.state, "execution_id": step.execution_id, "error": step.error}
+
+    # -- Versioned Projects and Goal Contracts ----------------------------
+    # These records are independent of the legacy single-goal Continuum row above.
+    # Every observed action still enters through VoiceOS -> orchestrator -> engine.
+    def _projects_local(request: Request) -> None:
+        _continuum_local(request)
+
+    @app.get("/api/v1/projects")
+    async def projects_list(request: Request) -> dict[str, Any]:
+        _projects_local(request)
+        rows = project_goal_store.list_projects()
+        return {"projects": rows, "selected": project_goal_store.selected_project()}
+
+    @app.post("/api/v1/projects")
+    async def projects_register(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        _projects_local(request)
+        if "grants" in payload:
+            raise HTTPException(status_code=400, detail="permission grants are server-side")
+        if set(payload) - {"path", "name"}:
+            raise HTTPException(status_code=422, detail="only path and name are accepted")
+        raw_path = payload.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise HTTPException(status_code=422, detail="path must be workspace-relative")
+        workspace = _parallel_workspace()
+        try:
+            if raw_path.strip() == ".":
+                relative, absolute = "", workspace.root
+            else:
+                target = workspace.resolve(raw_path, must_exist=True)
+                relative, absolute = target.relative, target.absolute
+            if not os.path.isdir(absolute):
+                raise HTTPException(status_code=422, detail="project path must be a directory")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="project path is outside the approved workspace") from exc
+        from actionmesh.agent.projects import kinds_of, scripts_of
+
+        kinds = list(kinds_of(absolute))
+        name = str(payload.get("name") or os.path.basename(absolute) or "Workspace")[:120].strip()
+        try:
+            project = project_goal_store.register_project(
+                name=name, root=relative, kind=kinds[0] if kinds else "folder",
+                kinds=kinds, scripts=scripts_of(absolute), owner_id="voiceos-local",
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="this workspace path is already registered") from exc
+        return {**project, "location": absolute}
+
+    @app.post("/api/v1/projects/{project_id}/select")
+    async def projects_select(request: Request, project_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        project = project_goal_store.select_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        workspace = _parallel_workspace()
+        return {**project, "location": os.path.join(workspace.root, project["root"])}
+
+    @app.get("/api/v1/projects/{project_id}/services")
+    async def project_services_list(request: Request, project_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        if project_goal_store.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return {"services": project_goal_store.list_services(project_id)}
+
+    @app.post("/api/v1/projects/{project_id}/services/{service_id}/actions")
+    async def project_service_action(
+        request: Request, project_id: str, service_id: str, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        _projects_local(request)
+        if set(payload) != {"operation"} or payload.get("operation") not in {"start", "stop"}:
+            raise HTTPException(status_code=422, detail="operation must be start or stop")
+        project = project_goal_store.get_project(project_id)
+        service = project_goal_store.get_service(service_id)
+        if project is None or project["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="project not found")
+        if service is None or service["project_id"] != project_id:
+            raise HTTPException(status_code=404, detail="registered service not found in this project")
+        device_id = _voiceos_local_device_id()
+        provider = next(
+            (item for item in getattr(app.state.engine, "providers", ()) if isinstance(item, LaptopProvider)),
+            None,
+        )
+        if not device_id or provider is None:
+            raise HTTPException(status_code=409, detail="the laptop agent is unavailable")
+        if payload["operation"] == "start":
+            known = provider.processes.find_server(service["name"])
+            if known is not None and known.state == "running":
+                observed = provider.processes.observe(known)
+                if observed != ProcessObservation.GONE:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="the service is already running or its process identity is uncertain",
+                    )
+            try:
+                workspace = _parallel_workspace()
+                workdir = workspace.resolve(service["working_directory"] or ".", must_exist=True)
+                if not os.path.isdir(workdir.absolute):
+                    raise ValueError("working directory is not a directory")
+            except Exception as exc:
+                raise HTTPException(status_code=409, detail="service working directory is unavailable") from exc
+            action_type = "device.server.start"
+            parameters = {
+                "name": service["name"], "command": service["command"],
+                "arguments": service["arguments"], "working_directory": service["working_directory"],
+                "port": service["port"],
+            }
+        else:
+            process = provider.processes.find_server(service["name"])
+            provider.processes.reap()
+            if (process is None or process.state != "running"
+                or provider.processes.observe(process) != ProcessObservation.RUNNING):
+                raise HTTPException(
+                    status_code=409,
+                    detail="the agent cannot prove it started this process; refusing to stop an unknown listener",
+                )
+            action_type = "device.server.stop"
+            parameters = {"name": process.label}
+        probe = GoalState(
+            contract=GoalContract(description=f"{payload['operation'].title()} managed service {service['name']}"),
+            device_id=device_id,
+        )
+        step = await continuum.run_action(probe, action_type, parameters)
+        project_goal_store.record_service_event(
+            service_id, event_type=f"service.control.{step.state}",
+            detail=f"Managed service {payload['operation']} action: {step.state}",
+            execution_id=step.execution_id,
+        )
+        return {
+            "project_id": project_id, "service_id": service_id,
+            "operation": payload["operation"], "state": step.state,
+            "execution_id": step.execution_id, "verified": step.verified, "error": step.error,
+        }
+
+    @app.post("/api/v1/projects/{project_id}/services")
+    async def project_services_register(
+        request: Request, project_id: str, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        _projects_local(request)
+        if "grants" in payload:
+            raise HTTPException(status_code=400, detail="permission grants are server-side")
+        allowed = {
+            "name", "command", "arguments", "working_directory", "port", "health_path",
+            "expected_status", "timeout_ms",
+        }
+        if set(payload) - allowed or not {"name", "command", "port"}.issubset(payload):
+            raise HTTPException(status_code=422, detail="invalid managed service fields")
+        project = project_goal_store.get_project(project_id)
+        if project is None or project["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="project not found")
+        name, command = payload["name"], payload["command"]
+        args = payload.get("arguments", [])
+        port = payload["port"]
+        workdir = payload.get("working_directory", "")
+        health_path = payload.get("health_path", "/")
+        expected_status = payload.get("expected_status", 200)
+        timeout_ms = payload.get("timeout_ms", 1500)
+        if (not isinstance(name, str) or not name.strip() or len(name) > 80
+            or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in name)):
+            raise HTTPException(status_code=422, detail="name must use letters, numbers, dash, or underscore")
+        if not isinstance(command, str) or not command.strip() or not isinstance(args, list) \
+            or len(args) > 64 or any(not isinstance(arg, str) or len(arg) > 4096 for arg in args):
+            raise HTTPException(status_code=422, detail="provide a configured command and bounded string arguments")
+        if type(port) is not int or not 1024 <= port <= 65535:
+            raise HTTPException(status_code=422, detail="port must be 1024..65535")
+        if (not isinstance(workdir, str) or workdir.startswith("/") or ".." in Path(workdir).parts):
+            raise HTTPException(status_code=422, detail="working_directory must stay inside the project")
+        if (not isinstance(health_path, str) or not health_path.startswith("/") or health_path.startswith("//")
+            or any(ch in health_path for ch in "\r\n\x00") or len(health_path) > 1024):
+            raise HTTPException(status_code=422, detail="health_path must be a local absolute path")
+        if type(expected_status) is not int or not 100 <= expected_status <= 599:
+            raise HTTPException(status_code=422, detail="expected_status must be 100..599")
+        if type(timeout_ms) is not int or not 100 <= timeout_ms <= 10000:
+            raise HTTPException(status_code=422, detail="timeout_ms must be 100..10000")
+        provider = next((p for p in getattr(app.state.engine, "providers", ()) if isinstance(p, LaptopProvider)), None)
+        if provider is None or provider.command_policy is None:
+            raise HTTPException(status_code=409, detail="the configured laptop command policy is unavailable")
+        working_relative = "/".join(part for part in (project["root"], workdir) if part)
+        try:
+            resolved_workdir = _parallel_workspace().resolve(working_relative or ".", must_exist=True)
+            if not os.path.isdir(resolved_workdir.absolute):
+                raise ValueError("not a directory")
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="working directory is unavailable inside this project") from exc
+        decision = provider.command_policy.evaluate(
+            command, args, working_directory=resolved_workdir.absolute,
+        )
+        if decision.refused:
+            raise HTTPException(status_code=422, detail="command is not allowed by this laptop's configured command policy")
+        try:
+            return project_goal_store.register_service(
+                project_id=project_id, name=name, command=command, arguments=args,
+                working_directory=working_relative, port=port, health_path=health_path,
+                expected_status=expected_status, timeout_ms=timeout_ms, owner_id="voiceos-local",
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="service name already exists for this project") from exc
+
+    @app.get("/api/v1/projects/{project_id}/status")
+    async def projects_status(request: Request, project_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        project = project_goal_store.get_project(project_id)
+        if project is None or project["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="project not found")
+        device_id = _voiceos_local_device_id()
+        if not device_id:
+            raise HTTPException(status_code=409, detail="the laptop agent is unavailable")
+        workspace = _parallel_workspace()
+        target = project["root"] or "."
+        probe = GoalState(
+            contract=GoalContract(description=f"Inspect {project['name'][:80]}"),
+            device_id=device_id,
+        )
+        step = await continuum.run_action(probe, "device.project.status", {"project": target})
+        return {
+            "project_id": project_id,
+            "location": os.path.join(workspace.root, project["root"]),
+            "execution_id": step.execution_id,
+            "state": step.state,
+            "verified": step.verified,
+            "status": step.observed,
+            "error": step.error,
+        }
+
+    @app.post("/api/v1/projects/{project_id}/files/hash")
+    async def projects_file_hash(
+        request: Request, project_id: str, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Capture an operator-requested baseline via the normal file.read policy path."""
+        _projects_local(request)
+        if set(payload) != {"path"} or not isinstance(payload.get("path"), str):
+            raise HTTPException(status_code=422, detail="provide one project-relative path")
+        project = project_goal_store.get_project(project_id)
+        if project is None or project["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="project not found")
+        relative_path = payload["path"].strip()
+        if not relative_path:
+            raise HTTPException(status_code=422, detail="path must be a non-empty project-relative file")
+        workspace = _parallel_workspace()
+        try:
+            target = workspace.resolve(
+                "/".join(part for part in (project["root"], relative_path) if part),
+                must_exist=True,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="file target is unavailable or escapes the project") from exc
+        device_id = _voiceos_local_device_id()
+        if not device_id:
+            raise HTTPException(status_code=409, detail="the laptop agent is unavailable")
+        probe = GoalState(
+            contract=GoalContract(description=f"Capture SHA-256 baseline for {target.relative}"),
+            device_id=device_id,
+        )
+        step = await continuum.run_action(probe, "device.files.hash", {"path": target.relative})
+        digest = step.observed.get("sha256") if isinstance(step.observed, dict) else None
+        size = step.observed.get("size") if isinstance(step.observed, dict) else None
+        if step.verified is not True or not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+            raise HTTPException(
+                status_code=409,
+                detail=step.error or "hash evidence is unavailable; check file.read permission and retry",
+            )
+        return {
+            "project_id": project_id, "path": target.relative, "sha256": digest,
+            "size": size, "execution_id": step.execution_id, "verified": True,
+        }
+
+    @app.post("/api/v1/projects/{project_id}/open")
+    async def projects_open(
+        request: Request, project_id: str, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        _projects_local(request)
+        if set(payload) != {"ide"} or not isinstance(payload.get("ide"), str):
+            raise HTTPException(status_code=422, detail="provide one supported ide name")
+        project = project_goal_store.get_project(project_id)
+        if project is None or project["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="project not found")
+        device_id = _voiceos_local_device_id()
+        if not device_id:
+            raise HTTPException(status_code=409, detail="the laptop agent is unavailable")
+        probe = GoalState(
+            contract=GoalContract(description=f"Open {project['name'][:80]}"), device_id=device_id,
+        )
+        step = await continuum.run_action(
+            probe, "device.project.open", {"project": project["root"] or ".", "ide": payload["ide"]},
+        )
+        return {
+            "project_id": project_id, "execution_id": step.execution_id,
+            "state": step.state, "verified": step.verified, "error": step.error,
+        }
+
+    @app.post("/api/v1/projects/{project_id}/archive")
+    async def projects_archive(request: Request, project_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        project = project_goal_store.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        with project_goal_store.db:
+            project_goal_store.db.execute(
+                "UPDATE projects SET archived_at=?,updated_at=? WHERE project_id=?",
+                (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat(), project_id),
+            )
+        return {"project_id": project_id, "state": "ARCHIVED"}
+
+    @app.get("/api/v1/goals")
+    async def goals_list(
+        request: Request, project_id: str | None = None, limit: int = 50, offset: int = 0,
+        include_archived: bool = False,
+    ) -> dict[str, Any]:
+        _projects_local(request)
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(status_code=422, detail="limit must be 1..100 and offset nonnegative")
+        rows = project_goal_store.list_goals(
+            project_id=project_id, limit=limit, offset=offset, include_archived=include_archived,
+        )
+        return {"goals": [_goal_view(row) for row in rows], "count": len(rows), "limit": limit, "offset": offset}
+
+    def _is_verified_hash_capture(execution_id: str, path: str, digest: str) -> bool:
+        record = engine.record(execution_id)
+        if record is None or record.state.value != "success":
+            return False
+        return any(
+            isinstance(node, dict)
+            and node.get("action_type") == "device.files.hash"
+            and node.get("state") == "success"
+            and node.get("verified") is True
+            and isinstance(node.get("result"), dict)
+            and node["result"].get("path") == path
+            and node["result"].get("sha256") == digest
+            for node in record.results.values()
+        )
+
+    @app.post("/api/v1/goals")
+    async def goals_create(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        _projects_local(request)
+        allowed = {
+            "project_id", "description", "contract_type", "resource", "expected",
+            "interval_seconds", "attempt_budget", "monitoring_enabled", "recovery",
+            "baseline_execution_id",
+        }
+        if "grants" in payload:
+            raise HTTPException(status_code=400, detail="permission grants are server-side")
+        if set(payload) - allowed or not allowed.intersection(payload):
+            raise HTTPException(status_code=422, detail="invalid Goal Contract fields")
+        project_id = payload.get("project_id") or (project_goal_store.selected_project() or {}).get("project_id")
+        project = project_goal_store.get_project(project_id) if isinstance(project_id, str) else None
+        if project is None or project["archived_at"] is not None:
+            raise HTTPException(status_code=409, detail="select or register a project first")
+        project_id = str(project["project_id"])
+        device_id = _voiceos_local_device_id()
+        if not device_id:
+            raise HTTPException(status_code=409, detail="the laptop agent is unavailable")
+        contract_type = payload.get("contract_type")
+        resource = payload.get("resource", "")
+        if contract_type not in {"file_exists", "file_sha256", "managed_process", "app_running", "git_clean", "http_service"}:
+            raise HTTPException(status_code=422, detail="supported goal types: file_exists, file_sha256, managed_process, app_running, git_clean, http_service")
+        if not isinstance(resource, str):
+            raise HTTPException(status_code=422, detail="resource must be text")
+        expected = payload.get("expected", True)
+        if contract_type == "file_sha256":
+            if not isinstance(expected, str) or re.fullmatch(r"[a-fA-F0-9]{64}", expected) is None:
+                raise HTTPException(status_code=422, detail="file_sha256 expected must be a captured 64-character SHA-256 digest")
+            expected_contract: dict[str, Any] = {"sha256": expected.lower()}
+        elif contract_type == "managed_process":
+            if not isinstance(expected, str) or expected not in {"running", "stopped", "exited_successfully", "failed", "uncertain"}:
+                raise HTTPException(status_code=422, detail="managed_process expected must be running, stopped, exited_successfully, failed, or uncertain")
+            expected_contract = {"condition": expected}
+        else:
+            if type(expected) is not bool:
+                raise HTTPException(status_code=422, detail="expected must be boolean")
+            expected_contract = {"value": expected}
+        workspace = _parallel_workspace()
+        if contract_type in {"file_exists", "file_sha256"}:
+            if not resource.strip():
+                raise HTTPException(status_code=422, detail=f"{contract_type} requires a project-relative file")
+            combined = "/".join(part for part in (project["root"], resource.strip()) if part)
+            try:
+                resolved = workspace.resolve(combined, must_exist=False)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail="file target escapes the approved workspace") from exc
+            resource_identity = resolved.relative
+            observer = "workspace.file.sha256" if contract_type == "file_sha256" else "workspace.file.exists"
+        elif contract_type == "app_running":
+            try:
+                app_contract = GoalContract(
+                    description="Observe supported macOS application", invariant="app_running",
+                    resource=resource, expected=expected,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail="application is not in the supported allowlist") from exc
+            resource_identity = app_contract.resource
+            observer = "macos.application.running"
+        elif contract_type == "git_clean":
+            if not project["root"]:
+                raise HTTPException(status_code=422, detail="register a repository below the workspace root")
+            resource_identity = project["root"]
+            observer = "git.working_tree.clean"
+        elif contract_type == "managed_process":
+            service = project_goal_store.get_service(resource)
+            if service is None or service["project_id"] != project_id:
+                raise HTTPException(status_code=422, detail="resource must identify a managed process in this project")
+            resource_identity = service["service_id"]
+            observer = "actionmesh.managed_process.lifecycle"
+        else:
+            service = project_goal_store.get_service(resource)
+            if service is None or service["project_id"] != project_id:
+                raise HTTPException(status_code=422, detail="resource must identify a managed service in this project")
+            resource_identity = service["service_id"]
+            observer = "loopback.http.status"
+        baseline_execution_id = payload.get("baseline_execution_id", "")
+        if contract_type == "file_sha256":
+            if not isinstance(baseline_execution_id, str) or not baseline_execution_id:
+                raise HTTPException(status_code=422, detail="capture a file baseline through ActionMesh before creating this goal")
+            if not _is_verified_hash_capture(
+                baseline_execution_id, resource_identity, expected_contract["sha256"],
+            ):
+                raise HTTPException(status_code=409, detail="baseline execution does not prove this file hash")
+        elif baseline_execution_id:
+            raise HTTPException(status_code=422, detail="baseline_execution_id is only valid for file_sha256 goals")
+        interval = payload.get("interval_seconds", 60)
+        budget = payload.get("attempt_budget", 0)
+        monitoring_enabled = payload.get("monitoring_enabled", False)
+        if type(interval) is not int or not 3 <= interval <= 3600:
+            raise HTTPException(status_code=422, detail="interval_seconds must be 3..3600")
+        if type(budget) is not int or not 0 <= budget <= 10:
+            raise HTTPException(status_code=422, detail="attempt_budget must be 0..10")
+        if type(monitoring_enabled) is not bool:
+            raise HTTPException(status_code=422, detail="monitoring_enabled must be boolean")
+        recovery_payload = payload.get("recovery", {"enabled": False})
+        if not isinstance(recovery_payload, dict) or set(recovery_payload) - {"enabled"} \
+            or type(recovery_payload.get("enabled", False)) is not bool:
+            raise HTTPException(status_code=422, detail="recovery may only contain an enabled boolean")
+        recovery_enabled = bool(recovery_payload.get("enabled", False))
+        if recovery_enabled and (contract_type != "http_service" or not 1 <= budget <= 3):
+            raise HTTPException(status_code=422, detail="manual restart recovery requires an HTTP service and attempt_budget 1..3")
+        if not recovery_enabled and budget:
+            raise HTTPException(status_code=422, detail="attempt_budget requires enabled manual recovery")
+        description = str(payload.get("description") or f"{contract_type}: {resource_identity}")[:120]
+        result = project_goal_store.create_goal(
+            project_id=project_id, owner_id="voiceos-local", device_id=device_id,
+            description=description,
+            resource_identity=resource_identity, contract_type=contract_type,
+            expected=expected_contract, observer=observer, interval_seconds=interval,
+            recovery={"enabled": recovery_enabled, "mode": "manual_approval" if recovery_enabled else "observe_only"}, attempt_budget=budget,
+            monitoring_enabled=monitoring_enabled,
+            baseline_execution_id=baseline_execution_id,
+        )
+        return _goal_view(result)
+
+    @app.get("/api/v1/goals/{goal_id}")
+    async def goals_get(request: Request, goal_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        goal = project_goal_store.get_goal(goal_id)
+        if goal is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return _goal_view(goal)
+
+    @app.patch("/api/v1/goals/{goal_id}")
+    async def goals_update(request: Request, goal_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        _projects_local(request)
+        allowed = {"description", "resource", "expected", "interval_seconds", "monitoring_enabled", "baseline_execution_id"}
+        if "grants" in payload:
+            raise HTTPException(status_code=400, detail="permission grants are server-side")
+        if not payload or set(payload) - allowed:
+            raise HTTPException(status_code=422, detail="invalid Goal Contract update fields")
+        current = project_goal_store.get_goal(goal_id)
+        if current is None or current["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        expected: dict[str, Any] | None = None
+        if "expected" in payload:
+            if current["contract_type"] == "managed_process":
+                if not isinstance(payload["expected"], str) or payload["expected"] not in {"running", "stopped", "exited_successfully", "failed", "uncertain"}:
+                    raise HTTPException(status_code=422, detail="expected must be a supported managed process condition")
+                expected = {"condition": payload["expected"]}
+            elif current["contract_type"] == "file_sha256":
+                if not isinstance(payload["expected"], str) or re.fullmatch(r"[a-fA-F0-9]{64}", payload["expected"]) is None:
+                    raise HTTPException(status_code=422, detail="expected must be a 64-character SHA-256 digest")
+                expected = {"sha256": payload["expected"].lower()}
+            else:
+                if type(payload["expected"]) is not bool:
+                    raise HTTPException(status_code=422, detail="expected must be boolean")
+                expected = {"value": payload["expected"]}
+        interval = payload.get("interval_seconds")
+        if interval is not None and (type(interval) is not int or not 3 <= interval <= 3600):
+            raise HTTPException(status_code=422, detail="interval_seconds must be 3..3600")
+        monitoring = payload.get("monitoring_enabled")
+        if monitoring is not None and type(monitoring) is not bool:
+            raise HTTPException(status_code=422, detail="monitoring_enabled must be boolean")
+        resource_identity: str | None = None
+        if "resource" in payload:
+            resource = payload["resource"]
+            if not isinstance(resource, str):
+                raise HTTPException(status_code=422, detail="resource must be text")
+            if current["contract_type"] in {"file_exists", "file_sha256"}:
+                project = project_goal_store.get_project(current["project_id"])
+                if project is None or not resource.strip():
+                    raise HTTPException(status_code=422, detail="file resource is required")
+                combined = "/".join(part for part in (project["root"], resource.strip()) if part)
+                try:
+                    resource_identity = _parallel_workspace().resolve(
+                        combined, must_exist=False,
+                    ).relative
+                except Exception as exc:
+                    raise HTTPException(status_code=422, detail="file target escapes the approved workspace") from exc
+            elif current["contract_type"] == "app_running":
+                try:
+                    resource_identity = GoalContract(
+                        description="Validate supported application", invariant="app_running",
+                        resource=resource, expected=True,
+                    ).resource
+                except Exception as exc:
+                    raise HTTPException(status_code=422, detail="application is not in the supported allowlist") from exc
+            elif current["contract_type"] in {"http_service", "managed_process"}:
+                service = project_goal_store.get_service(resource)
+                if service is None or service["project_id"] != current["project_id"]:
+                    raise HTTPException(status_code=422, detail="resource must identify a managed service/process in this project")
+                resource_identity = service["service_id"]
+            else:
+                raise HTTPException(status_code=422, detail="git_clean goals do not have a resource field")
+        baseline_execution_id = payload.get("baseline_execution_id", "")
+        if baseline_execution_id and current["contract_type"] != "file_sha256":
+            raise HTTPException(status_code=422, detail="baseline_execution_id is only valid for file_sha256 goals")
+        if current["contract_type"] == "file_sha256" and expected is not None:
+            target_path = resource_identity or current["resource_identity"]
+            digest = expected.get("sha256")
+            if not isinstance(digest, str):
+                raise HTTPException(status_code=422, detail="a SHA-256 digest is required")
+            needs_capture = digest != current["expected"].get("sha256") or bool(baseline_execution_id)
+            if needs_capture and (
+                not isinstance(baseline_execution_id, str)
+                or not _is_verified_hash_capture(baseline_execution_id, target_path, digest)
+            ):
+                raise HTTPException(status_code=409, detail="new file baseline must be captured and verified through ActionMesh")
+        elif baseline_execution_id:
+            raise HTTPException(status_code=422, detail="baseline capture requires a SHA-256 goal update")
+        description = payload.get("description")
+        if description is not None and (not isinstance(description, str) or not description.strip()):
+            raise HTTPException(status_code=422, detail="description must be non-empty text")
+        updated = project_goal_store.update_goal(
+            goal_id, description=description.strip() if isinstance(description, str) else None,
+            resource_identity=resource_identity, expected=expected, interval_seconds=interval,
+            monitoring_enabled=monitoring,
+            baseline_execution_id=baseline_execution_id,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return updated
+
+    @app.post("/api/v1/goals/{goal_id}/observe")
+    async def goals_observe(request: Request, goal_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        return await _observe_goal(goal_id)
+
+    def _reconcile_goal_recoveries(goal_id: str) -> list[dict[str, Any]]:
+        attempts = project_goal_store.list_repairs(goal_id)
+        for attempt in attempts:
+            execution_id = attempt.get("execution_id")
+            if execution_id and attempt["status"] in {"PENDING_APPROVAL", "EXECUTING"}:
+                record = app.state.engine.record(execution_id)
+                if record is None:
+                    project_goal_store.finish_repair(
+                        attempt["attempt_id"], status="INTERRUPTED", execution_id=execution_id,
+                        detail="Execution record is unavailable; inspect before retrying.",
+                    )
+                elif record.state.value in {"success", "failed", "cancelled", "denied", "timeout", "interrupted", "partially_completed"}:
+                    project_goal_store.finish_repair(
+                        attempt["attempt_id"], status=record.state.value.upper(),
+                        execution_id=execution_id, detail=f"ActionMesh execution ended: {record.state.value}",
+                    )
+        return project_goal_store.list_repairs(goal_id)
+
+    def _reconcile_service_controls(goal_id: str | None = None) -> None:
+        terminal_states = {
+            "success", "failed", "cancelled", "denied", "timeout", "interrupted",
+            "partially_completed",
+        }
+        for execution_id in project_goal_store.pending_service_executions(goal_id):
+            record = engine.record(execution_id)
+            if record is None or record.state.value not in terminal_states:
+                continue
+            project_goal_store.reconcile_service_execution(
+                execution_id, terminal_state=record.state.value,
+                detail=f"Managed service action reconciled from ActionMesh execution: {record.state.value}",
+            )
+
+    @app.get("/api/v1/goals/{goal_id}/recoveries")
+    async def goals_recoveries(request: Request, goal_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        goal = project_goal_store.get_goal(goal_id)
+        if goal is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return {"attempts": _reconcile_goal_recoveries(goal_id)}
+
+    @app.post("/api/v1/goals/{goal_id}/recover")
+    async def goals_recover(request: Request, goal_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        goal = project_goal_store.get_goal(goal_id)
+        if goal is None or goal["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        if (goal["contract_type"] != "http_service" or not goal["recovery"].get("enabled")
+            or goal["recovery"].get("mode") != "manual_approval"):
+            raise HTTPException(status_code=409, detail="this goal has no registered manual recovery capability")
+        fresh = await _observe_goal(goal_id)
+        if fresh["verdict"] != "VIOLATED":
+            raise HTTPException(status_code=409, detail="fresh observation did not confirm a service violation")
+        _reconcile_goal_recoveries(goal_id)
+        service = project_goal_store.get_service(goal["resource_identity"])
+        if service is None or service["project_id"] != goal["project_id"]:
+            raise HTTPException(status_code=409, detail="registered service configuration is unavailable")
+        attempt = project_goal_store.begin_repair(
+            goal_id, service["service_id"], budget=int(goal["attempt_budget"]),
+        )
+        if attempt is None:
+            raise HTTPException(status_code=409, detail="recovery attempt budget is exhausted")
+        if not attempt["created"]:
+            return {"attempt": attempt, "state": "already_pending", "execution_id": attempt["execution_id"]}
+        device_id = _voiceos_local_device_id()
+        if not device_id or device_id != goal["device_id"]:
+            project_goal_store.finish_repair(
+                attempt["attempt_id"], status="REFUSED", detail="goal's registered device is unavailable",
+            )
+            raise HTTPException(status_code=409, detail="goal's registered device is unavailable")
+        try:
+            workspace = _parallel_workspace()
+            relative_workdir = service["working_directory"]
+            resolved = workspace.resolve(relative_workdir or ".", must_exist=True)
+            if not os.path.isdir(resolved.absolute):
+                raise ValueError("working directory is not a directory")
+        except Exception as exc:
+            project_goal_store.finish_repair(
+                attempt["attempt_id"], status="REFUSED", detail="service working directory is unavailable",
+            )
+            raise HTTPException(status_code=409, detail="service working directory is unavailable") from exc
+        probe = GoalState(
+            contract=GoalContract(description=f"Restart registered service {service['name']}"),
+            device_id=device_id,
+        )
+        def recovery_checkpoint(session: TaskSession) -> None:
+            current = session.steps[0]
+            status = {
+                "awaiting_approval": "PENDING_APPROVAL", "running": "EXECUTING",
+                "succeeded": "SUCCEEDED", "failed": "FAILED", "denied": "REFUSED",
+            }.get(current.state, current.state.upper())
+            project_goal_store.record_repair_dispatch(
+                attempt["attempt_id"], status=status, execution_id=current.execution_id,
+            )
+
+        step = await continuum.run_action(probe, "device.server.start", {
+            "name": service["name"], "command": service["command"],
+            "arguments": service["arguments"], "working_directory": relative_workdir,
+            "port": service["port"],
+        }, on_checkpoint=recovery_checkpoint, idempotency_key=attempt["idempotency_key"])
+        state = {
+            "awaiting_approval": "PENDING_APPROVAL", "running": "EXECUTING",
+            "succeeded": "SUCCEEDED", "failed": "FAILED", "denied": "REFUSED",
+        }.get(step.state, step.state.upper())
+        project_goal_store.finish_repair(
+            attempt["attempt_id"], status=state, execution_id=step.execution_id,
+            detail=step.error or f"ActionMesh recovery request: {step.state}",
+        )
+        return {"attempt": project_goal_store.list_repairs(goal_id)[0], "state": step.state,
+                "execution_id": step.execution_id, "verified": step.verified, "error": step.error}
+
+    async def _observe_goal(goal_id: str) -> dict[str, Any]:
+        goal = project_goal_store.get_goal(goal_id)
+        if goal is None or goal["archived_at"] is not None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        if goal["state"] != "ACTIVE":
+            raise HTTPException(status_code=409, detail="resume this goal before observing")
+        project = project_goal_store.get_project(goal["project_id"])
+        if project is None:
+            raise HTTPException(status_code=409, detail="registered project is unavailable")
+        device_id = _voiceos_local_device_id()
+        if not device_id or device_id != goal["device_id"]:
+            raise HTTPException(status_code=409, detail="goal's registered device is unavailable")
+        service_info: dict[str, Any] = {}
+        row: dict[str, Any] | None = None
+        if goal["contract_type"] in {"file_exists", "file_sha256"}:
+            action_type, parameters, field = "device.files.info", {"path": goal["resource_identity"]}, "exists"
+            if goal["contract_type"] == "file_sha256":
+                action_type, parameters, field = "device.files.hash", {"path": goal["resource_identity"]}, "sha256"
+        elif goal["contract_type"] == "app_running":
+            action_type, parameters, field = "device.app.status_native", {"app": goal["resource_identity"]}, "running"
+        elif goal["contract_type"] in {"http_service", "managed_process"}:
+            service = project_goal_store.get_service(goal["resource_identity"])
+            if service is None or service["project_id"] != goal["project_id"]:
+                raise HTTPException(status_code=409, detail="registered service/process configuration is unavailable")
+            service_info = service
+            action_type = "device.server.status"
+            if goal["contract_type"] == "http_service":
+                parameters = {
+                    "name": service_info["name"], "health_path": service_info["health_path"],
+                    "expected_status": service_info["expected_status"],
+                    "service_id": service_info["service_id"],
+                }
+                field = "http_healthy"
+            else:
+                parameters = {"name": service_info["name"]}
+                field = "process_state"
+        else:
+            action_type, parameters, field = "device.project.status", {"project": project["root"]}, "changed"
+        probe = GoalState(
+            contract=GoalContract(description=f"Observe {goal['contract_type']}"), device_id=device_id,
+        )
+        step = await continuum.run_action(probe, action_type, parameters)
+        value: bool | str | None = None
+        if step.verified is True:
+            raw: Any
+            if goal["contract_type"] in {"http_service", "managed_process"}:
+                rows = step.observed.get("servers", [])
+                row = next((item for item in rows if item.get("label") == service_info["name"]), None)
+                # This goal is tied to a registered managed service. An empty result
+                # from the agent's own server registry is an observable stopped state,
+                # not an unknown service; a different process on the port is not proof
+                # that this registered service is running.
+                if goal["contract_type"] == "http_service":
+                    raw = row.get("http_healthy") if isinstance(row, dict) else None
+                else:
+                    raw = None
+                    if isinstance(row, dict):
+                        process_state = row.get("state")
+                        exit_code = row.get("exit_code")
+                        if process_state == "running":
+                            raw = "running"
+                        elif process_state == "stopped":
+                            raw = "stopped"
+                        elif process_state in {"exited", "terminated"} and isinstance(exit_code, int):
+                            raw = "exited_successfully" if exit_code == 0 else "failed"
+                        else:
+                            raw = "uncertain"
+            else:
+                raw = step.observed.get(field)
+            if goal["contract_type"] == "git_clean" and type(raw) is int:
+                value = raw == 0
+            elif type(raw) is bool or (goal["contract_type"] == "managed_process" and isinstance(raw, str)):
+                value = raw
+        if goal["contract_type"] == "file_sha256":
+            digest = step.observed.get("sha256") if step.verified is True else None
+            if isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest):
+                value = digest
+            else:
+                value = None
+            expected_hash = goal["expected"].get("sha256")
+            verdict = "UNKNOWN" if value is None else ("VERIFIED" if value == expected_hash else "VIOLATED")
+            observed = {
+                field: value, "size": step.observed.get("size") if step.verified is True else None,
+                "execution_state": step.state,
+            }
+        elif goal["contract_type"] == "managed_process":
+            expected_condition = goal["expected"].get("condition")
+            verdict = "UNKNOWN" if value is None else ("VERIFIED" if value == expected_condition else "VIOLATED")
+            observed = {
+                "process_state": row.get("state") if isinstance(row, dict) else "unknown",
+                "condition": value,
+                "exit_code": row.get("exit_code") if isinstance(row, dict) else None,
+                "pid": row.get("pid") if isinstance(row, dict) else None,
+                "process_id": row.get("process_id") if isinstance(row, dict) else None,
+                "execution_state": step.state,
+            }
+        else:
+            expected_value = bool(goal["expected"].get("value"))
+            verdict = "UNKNOWN" if value is None else ("VERIFIED" if value == expected_value else "VIOLATED")
+            observed = {field: value, "execution_state": step.state}
+        if goal["contract_type"] == "http_service":
+            observed.update({
+                "process_state": row.get("process_state", row.get("state", "unknown")) if isinstance(row, dict) else "unknown",
+                "listening": row.get("listening") if isinstance(row, dict) else None,
+                "http_status": row.get("http_status") if isinstance(row, dict) else None,
+                "health_state": row.get("http_state") if isinstance(row, dict) else "UNKNOWN",
+                "http_state": row.get("http_state") if isinstance(row, dict) else "UNKNOWN",
+                "response_time_ms": row.get("http_elapsed_ms") if isinstance(row, dict) else None,
+                "http_error": row.get("http_error") if isinstance(row, dict) else "service_not_registered",
+                "service": service_info["name"],
+                "observed_at": datetime.now(UTC).isoformat(),
+            })
+        if step.error:
+            observed["error"] = step.error[:240]
+        project_goal_store.record_observation(
+            goal_id, observer=goal["observer"], target_identity=goal["resource_identity"],
+            expected=goal["expected"], observed=observed, verdict=verdict,
+            fresh_until=(datetime.now(UTC) + timedelta(seconds=goal["interval_seconds"])).isoformat(),
+            execution_id=step.execution_id,
+        )
+        return {
+            "goal_id": goal_id, "execution_id": step.execution_id,
+            "state": step.state, "verified": step.verified, "verdict": verdict,
+            "observed": observed,
+        }
+
+    @app.post("/api/v1/goals/{goal_id}/monitor")
+    async def goals_monitor(request: Request, goal_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        _projects_local(request)
+        if set(payload) != {"enabled"} or type(payload["enabled"]) is not bool:
+            raise HTTPException(status_code=422, detail="enabled must be a boolean")
+        goal = project_goal_store.set_monitoring(goal_id, payload["enabled"])
+        if goal is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return goal
+
+    async def _monitor_project_goals(stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            now = datetime.now(UTC)
+            for goal in project_goal_store.monitored_goals():
+                last = goal.get("last_observed_at")
+                due = True
+                if last:
+                    try:
+                        due = (now - datetime.fromisoformat(last)).total_seconds() >= goal["interval_seconds"]
+                    except (TypeError, ValueError):
+                        due = True
+                if not due:
+                    continue
+                try:
+                    await _observe_goal(goal["goal_id"])
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("Project goal observation failed")
+                    fresh_until = (
+                        datetime.now(UTC) + timedelta(seconds=goal["interval_seconds"])
+                    ).isoformat()
+                    project_goal_store.record_observation(
+                        goal["goal_id"], observer=goal["observer"],
+                        target_identity=goal["resource_identity"], expected=goal["expected"],
+                        observed={"error": f"{type(exc).__name__}: {str(exc)[:180]}"},
+                        verdict="UNKNOWN", fresh_until=fresh_until, execution_id="",
+                    )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=1.0)
+
+    app.state.project_goal_monitor = _monitor_project_goals
+
+    @app.post("/api/v1/goals/{goal_id}/pause")
+    async def goals_pause(request: Request, goal_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        goal = project_goal_store.set_state(goal_id, "PAUSED")
+        if goal is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return goal
+
+    @app.post("/api/v1/goals/{goal_id}/resume")
+    async def goals_resume(request: Request, goal_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        goal = project_goal_store.set_state(goal_id, "ACTIVE")
+        if goal is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return goal
+
+    @app.post("/api/v1/goals/{goal_id}/archive")
+    async def goals_archive(request: Request, goal_id: str) -> dict[str, Any]:
+        _projects_local(request)
+        goal = project_goal_store.archive_goal(goal_id)
+        if goal is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        return goal
+
+    @app.get("/api/v1/goals/{goal_id}/events")
+    async def goals_events(
+        request: Request, goal_id: str, limit: int = 50, offset: int = 0,
+        event_type: str | None = None,
+    ) -> dict[str, Any]:
+        _projects_local(request)
+        if project_goal_store.get_goal(goal_id) is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(status_code=422, detail="limit must be 1..100 and offset nonnegative")
+        _reconcile_goal_recoveries(goal_id)
+        _reconcile_service_controls(goal_id)
+        events = project_goal_store.list_events(goal_id, limit=limit, offset=offset, event_type=event_type)
+        return {"events": events, "count": len(events), "limit": limit, "offset": offset}
+
+    @app.get("/api/v1/events")
+    async def project_goal_events(
+        request: Request, project_id: str | None = None, limit: int = 50,
+        offset: int = 0, event_type: str | None = None,
+    ) -> dict[str, Any]:
+        _projects_local(request)
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(status_code=422, detail="limit must be 1..100 and offset nonnegative")
+        for goal in project_goal_store.list_goals(project_id=project_id, limit=100):
+            _reconcile_goal_recoveries(goal["goal_id"])
+            _reconcile_service_controls(goal["goal_id"])
+        events = project_goal_store.list_events(
+            None, project_id=project_id, limit=limit, offset=offset, event_type=event_type,
+        )
+        return {"events": events, "count": len(events), "limit": limit, "offset": offset}
+
+    @app.get("/api/v1/goals/{goal_id}/evidence")
+    async def goals_evidence(
+        request: Request, goal_id: str, limit: int = 50, offset: int = 0,
+    ) -> dict[str, Any]:
+        _projects_local(request)
+        if project_goal_store.get_goal(goal_id) is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        if not 1 <= limit <= 100 or offset < 0:
+            raise HTTPException(status_code=422, detail="limit must be 1..100 and offset nonnegative")
+        evidence = project_goal_store.list_observations(goal_id, limit=limit, offset=offset)
+        return {"observations": evidence, "count": len(evidence), "limit": limit, "offset": offset}
 
     # -- ParallelWorld: preview is a registered read capability; apply is a
     # server-minted sequence of ordinary file actions through this same engine.

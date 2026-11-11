@@ -55,6 +55,63 @@ simulated providers. Deployments and tests may inject an `ExecutionEngine`.
 | GET | `/events` | SSE stream; optional `execution_id`, `ticket`, resumes on `Last-Event-ID` |
 | WS | `/ws/events` | WebSocket event stream; optional `execution_id`, `ticket`, `last_event_id` |
 | GET | `/events/stream-ticket` | Exchange a device credential for a short-lived, watch-only stream ticket |
+| GET | `/api/v1/projects` | List registered local projects and the selected project (loopback operator only) |
+| POST | `/api/v1/projects` | Register an existing directory under the configured workspace; discovers supported project metadata without modifying files |
+| POST | `/api/v1/projects/{project_id}/select` | Select a registered project |
+| GET | `/api/v1/projects/{project_id}/services` | List registered managed services for the project |
+| POST | `/api/v1/projects/{project_id}/services` | Register a typed command, project-confined working directory, loopback port, and HTTP health path |
+| POST | `/api/v1/projects/{project_id}/services/{service_id}/actions` | Request start or stop for one registered service through the existing policy, approval, execution, and verification pipeline; stopping requires a live process identity owned by the current laptop agent |
+| GET | `/api/v1/projects/{project_id}/status` | Inspect the selected directory through the laptop action pipeline; includes the authoritative execution id and verification state |
+| POST | `/api/v1/projects/{project_id}/files/hash` | Capture one bounded, project-relative SHA-256 baseline through the existing `file.read` policy and verification pipeline; response contains digest metadata, never file contents |
+| POST | `/api/v1/projects/{project_id}/open` | Open a registered project with a supported editor through policy and approval |
+| POST | `/api/v1/projects/{project_id}/archive` | Archive a project registration; goal and execution history remains stored |
+| GET | `/api/v1/goals` | List active Goal Contracts, optionally filtered by `project_id`; supports pagination |
+| POST | `/api/v1/goals` | Create a persistent Goal Contract for file existence, captured SHA-256 integrity, managed-process lifecycle, app, Git, or registered local HTTP service observation; SHA-256 goals require the matching `baseline_execution_id` returned by the hash endpoint |
+| GET | `/api/v1/goals/{goal_id}` | Read one Goal Contract and its latest stored observation |
+| PATCH | `/api/v1/goals/{goal_id}` | Update a Goal Contract's description, resource, expected value, interval, or monitoring flag |
+| POST | `/api/v1/goals/{goal_id}/observe` | Request a fresh observation through the existing ActionMesh pipeline |
+| POST | `/api/v1/goals/{goal_id}/pause` | Pause a Goal Contract and its recurring observations |
+| POST | `/api/v1/goals/{goal_id}/resume` | Resume a paused Goal Contract |
+| POST | `/api/v1/goals/{goal_id}/archive` | Archive a Goal Contract without deleting its history |
+| POST | `/api/v1/goals/{goal_id}/monitor` | Enable or disable recurring observation for a goal; observation does not authorize recovery |
+| POST | `/api/v1/goals/{goal_id}/recover` | For a violated HTTP service goal with manual recovery enabled, submit one registered-service restart through ActionMesh policy and approval |
+| GET | `/api/v1/goals/{goal_id}/recoveries` | Review durable recovery attempts and reconcile linked execution outcomes |
+| GET | `/api/v1/goals/{goal_id}/evidence` | List persisted observation evidence with pagination |
+| GET | `/api/v1/goals/{goal_id}/events` | List durable goal events with pagination and linked execution ids |
+| GET | `/api/v1/events` | List durable project and goal events, optionally filtered by project, with pagination |
+
+### Managed local HTTP service goals
+
+Service registration stores a name, command/arguments, working directory relative to the
+configured workspace, port, health path, and expected HTTP status. The executable must
+pass the laptop's configured command policy, and the working directory must resolve
+inside the registered project. The observer connects only to `127.0.0.1`, ignores the
+response body, and does not follow redirects. A service must be running under the
+ActionMesh managed-process registry before it can be reported as observed; an unrelated
+process occupying a port is not accepted as proof.
+
+To create this goal type, `resource` is the registered `service_id`. Recovery is
+disabled by default. Opt-in uses `{"recovery":{"enabled":true},"attempt_budget":2}`;
+it creates a manual restart proposal only after a fresh violated observation. The
+restart uses `device.server.start`, so the existing permission policy and exact-action
+approval flow remain authoritative. Observation never starts a service. A pending or
+uncertain attempt is not replayed automatically; inspect its recovery record and linked
+execution first.
+
+### Managed-process lifecycle and file-integrity goals
+
+`managed_process` goals reference a managed service registration but observe only its
+ActionMesh-owned process record. Expected conditions are `running`, `stopped`,
+`exited_successfully`, `failed`, or `uncertain`. A missing process record is UNKNOWN;
+the monitor does not infer ownership or stop an unrelated PID.
+
+For `file_sha256`, first POST `{"path":"relative/file"}` to the project's `files/hash`
+route. This is an explicit baseline capture under the existing `file.read` consent.
+Create the goal with the returned digest as `expected` and the returned
+`execution_id` as `baseline_execution_id`. The API validates that the execution really
+hashed that project file before saving the contract. Files above 16 MiB, non-regular
+files, symlink escapes, and files that change while being hashed do not produce a
+baseline or a VERIFIED observation.
 
 ## `POST /plan` — proposing, not deciding
 

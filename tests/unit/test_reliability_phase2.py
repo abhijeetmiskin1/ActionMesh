@@ -38,7 +38,7 @@ from datetime import UTC, datetime
 
 from actionmesh.core.observability import Metrics
 from actionmesh.core.sqlite_guard import assert_guarded
-from actionmesh.core.storage import SQLiteStore
+from actionmesh.core.storage import SCHEMA_VERSION, SQLiteStore
 from actionmesh.protocol.models import ActionState, ExecutionRecord, MeshEvent
 
 
@@ -191,7 +191,7 @@ class TestSQLiteConcurrentWriterStress(unittest.TestCase):
                 while not stop.is_set():
                     try:
                         version = store.schema_version
-                        if version != 3:
+                        if version != SCHEMA_VERSION:
                             errors.append(AssertionError(f"schema_version={version}"))
                     except BaseException as exc:
                         errors.append(exc)

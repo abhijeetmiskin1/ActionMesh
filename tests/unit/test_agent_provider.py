@@ -17,11 +17,19 @@ import socket
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from actionmesh.agent.commands import CommandPolicy
 from actionmesh.agent.definitions import CAPABILITIES, IMPLEMENTED, PROVIDER
 from actionmesh.agent.paths import Workspace
-from actionmesh.agent.processes import ProcessRegistry, is_listening
+from actionmesh.agent.processes import (
+    EXITED,
+    HTTPObservation,
+    ProcessRecord,
+    ProcessRegistry,
+    is_listening,
+    loopback_http_status,
+)
 from actionmesh.agent.provider import MAX_READ_BYTES, MAX_WRITE_BYTES, LaptopProvider
 from actionmesh.agent.runner import CommandRunner
 from actionmesh.agent.verification import register_device_strategies
@@ -78,6 +86,31 @@ class TestSelection(unittest.TestCase):
         # A capability in IMPLEMENTED with no handler would be advertised, approved,
         # dispatched, and then fail. These two sets may not drift.
         self.assertEqual(LaptopProvider(None).SUPPORTED, IMPLEMENTED)
+
+
+class TestLoopbackHttpObservation(unittest.TestCase):
+    def test_reads_status_from_loopback_and_rejects_redirect_target_syntax(self) -> None:
+        async def scenario() -> tuple[int | None, int | None]:
+            async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                await reader.readline()
+                while await reader.readline() not in (b"\r\n", b""):
+                    pass
+                writer.write(b"HTTP/1.1 302 Found\r\nLocation: http://example.com/\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(respond, "127.0.0.1", 0)
+            port = int(server.sockets[0].getsockname()[1])
+            try:
+                return await loopback_http_status(port, "/health"), await loopback_http_status(port, "//example.com")
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        observed, rejected = asyncio.run(scenario())
+        self.assertEqual(observed, 302)
+        self.assertIsNone(rejected)
 
     def test_the_provider_declares_itself_real(self) -> None:
         self.assertFalse(LaptopProvider(None).simulated)
@@ -529,6 +562,66 @@ class TestProcessesAndServers(_Fs):
         data = self.start_server()
         # Not "the spawn call returned" -- the loopback port actually answers.
         self.assertTrue(data["listening"], data)
+
+    def test_server_health_is_re_read_from_its_registered_loopback_port(self) -> None:
+        data = self.start_server()
+        self.assertTrue(data["listening"], data)
+        status = self.call(
+            "device.server.status", name="api", health_path="/", expected_status=200,
+        )
+        service = status["servers"][0]
+        self.assertEqual(service["http_status"], 200)
+        self.assertTrue(service["http_healthy"])
+        unsafe = self.call("device.server.status", name="api", health_path="//example.com")
+        self.assertIsNone(unsafe["servers"][0]["http_status"])
+
+    def test_timeout_keeps_http_health_unknown_instead_of_false(self) -> None:
+        port = free_port()
+        self.provider.managed_service_lookup = lambda service_id: {
+            "service_id": service_id, "name": "api", "health_path": "/health",
+            "expected_status": 200, "port": port, "timeout_ms": 1000,
+        }
+        with patch(
+            "actionmesh.agent.provider.loopback_http_observation",
+            new_callable=AsyncMock,
+            return_value=HTTPObservation("TIMEOUT", None, 1000.0, "request_timeout"),
+        ):
+            data = self.run_action(
+                "device.server.status", name="api", service_id="service-1",
+                health_path="/health", expected_status=200,
+            )
+        self.assertIsNone(data["servers"][0]["http_healthy"])
+        self.assertEqual(data["servers"][0]["http_state"], "TIMEOUT")
+        self.assertEqual(data["servers"][0]["http_error"], "request_timeout")
+
+    def test_listener_after_managed_process_exit_is_not_claimed_as_our_service(self) -> None:
+        port = free_port()
+        self.provider.managed_service_lookup = lambda service_id: {
+            "service_id": service_id, "name": "api", "health_path": "/health",
+            "expected_status": 200, "port": port, "timeout_ms": 1000,
+        }
+        record = ProcessRecord(
+            process_id="proc_stopped", kind="server", label="api", command="python3",
+            state=EXITED, port=port,
+        )
+        self.provider.processes._records[record.process_id] = record
+        self.provider.processes._servers[record.label] = record.process_id
+        with (
+            patch("actionmesh.agent.provider.is_listening", new_callable=AsyncMock, return_value=True),
+            patch(
+                "actionmesh.agent.provider.loopback_http_observation",
+                new_callable=AsyncMock,
+                return_value=HTTPObservation("HEALTHY", 200, 3.0),
+            ),
+        ):
+            data = self.run_action(
+                "device.server.status", name="api", service_id="service-1",
+                health_path="/health", expected_status=200,
+            )
+        self.assertTrue(data["servers"][0]["listening"])
+        self.assertIsNone(data["servers"][0]["http_healthy"])
+        self.assertEqual(data["servers"][0]["http_state"], "UNKNOWN")
+        self.assertEqual(data["servers"][0]["http_error"], "listener_not_owned")
 
     def test_a_wrong_port_declaration_is_reported_honestly(self) -> None:
         # Bind one port but declare the next one: the launch result must say it is not

@@ -21,6 +21,7 @@ import asyncio
 import os
 import shutil
 import signal
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,6 +159,12 @@ class TestIdentityOutlivesTheProcessThatRecordedIt(_LedgerCase):
         # The owning process is gone: a new provider, a new registry, the same ledger.
         reopened = self.provider(self.store())
         evidence = reopened.execution_evidence("exec_survivor")
+        if sys.platform == "darwin":
+            self.assertEqual(evidence["state"], "unknown")
+            self.assertEqual(evidence["pids"], [])
+            stopped = reopened.stop_execution("exec_survivor")
+            self.assertEqual(stopped["unconfirmed"], [evidence["actions"][0]["process_id"]])
+            return
         self.assertEqual(
             evidence["state"], "running", "a live child was reported as something else"
         )
@@ -210,6 +217,11 @@ class TestIdentityOutlivesTheProcessThatRecordedIt(_LedgerCase):
 
         evidence = reopened.execution_evidence("exec_killed")
         self.assertIsNotNone(evidence)
+        if sys.platform == "darwin":
+            self.assertEqual(evidence["state"], "unknown")
+            self.assertEqual(evidence["actions"][0]["state"], "unknown")
+            self.assertEqual(evidence["pids"], [])
+            return
         self.assertNotEqual(evidence["state"], "running", "a dead pid was reported as alive")
         self.assertEqual(evidence["pids"], [])
         action = evidence["actions"][0]

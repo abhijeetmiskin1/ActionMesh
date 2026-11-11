@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 from actionmesh.agent.commands import CommandPolicy
 from actionmesh.agent.errors import ProcessError
@@ -26,10 +27,47 @@ from actionmesh.agent.processes import (
     STOPPED,
     TERMINATED,
     TRIM_MARKER,
+    ProcessObservation,
     ProcessRegistry,
     is_listening,
+    loopback_http_observation,
+    observe_process,
+    stop_group,
 )
 from actionmesh.agent.runner import CommandRunner
+
+
+class TestProcessIdentityObservation(unittest.TestCase):
+    def test_pid_reuse_is_gone_and_cannot_be_stopped(self) -> None:
+        from actionmesh.agent.processes import ProcessRecord
+
+        record = ProcessRecord(
+            process_id="proc_old", kind="process", label="old", command="python",
+            pid=321, pgid=321, identity="linux:boot:old:S",
+        )
+        with patch("actionmesh.agent.processes.process_identity", return_value="linux:boot:new:S"):
+            self.assertEqual(observe_process(321, record.identity), ProcessObservation.GONE)
+            with patch("actionmesh.agent.processes.os.killpg") as killpg:
+                self.assertFalse(stop_group(record, grace_s=0))
+                killpg.assert_not_called()
+
+    def test_unavailable_ownership_evidence_is_unknown_and_not_signalled(self) -> None:
+        from actionmesh.agent.processes import ProcessRecord
+
+        record = ProcessRecord(
+            process_id="proc_old", kind="process", label="old", command="python",
+            pid=321, pgid=321, identity=None,
+        )
+        with patch("actionmesh.agent.processes.os.kill", side_effect=PermissionError):
+            self.assertEqual(observe_process(321, None), ProcessObservation.UNKNOWN)
+        with patch("actionmesh.agent.processes.os.killpg") as killpg:
+            self.assertFalse(stop_group(record, grace_s=0))
+            killpg.assert_not_called()
+
+    def test_a_temporary_identity_read_failure_is_unknown(self) -> None:
+        with patch("actionmesh.agent.processes.process_identity", return_value=None), \
+             patch("actionmesh.agent.processes.os.kill", return_value=None):
+            self.assertEqual(observe_process(321, "linux:boot:start:S"), ProcessObservation.UNKNOWN)
 
 
 class _FakeProcess:
@@ -214,6 +252,71 @@ class TestServers(_Spawn):
         self.addCleanup(lambda: self.stop(record.process_id))
         self.assertEqual(self.registry.find_server("api"), record)
         self.assertEqual([r.label for r in self.registry.servers()], ["api"])
+
+    def test_loopback_http_observation_reports_status_and_mismatch(self) -> None:
+        async def check() -> None:
+            async def respond(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                writer.write(b"HTTP/1.0 503 Service Unavailable\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(respond, "127.0.0.1", 0)
+            port = int(server.sockets[0].getsockname()[1])
+            try:
+                observation = await loopback_http_observation(port, "/health", expected_status=200)
+                self.assertEqual(observation.state, "UNHEALTHY")
+                self.assertEqual(observation.status, 503)
+                self.assertGreaterEqual(observation.elapsed_ms, 0)
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(check())
+
+    def test_loopback_http_observation_does_not_follow_redirects(self) -> None:
+        async def check() -> None:
+            async def respond(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                writer.write(b"HTTP/1.0 302 Found\r\nLocation: http://example.invalid/\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(respond, "127.0.0.1", 0)
+            port = int(server.sockets[0].getsockname()[1])
+            try:
+                observation = await loopback_http_observation(port, "/health")
+                self.assertEqual(observation.state, "UNHEALTHY")
+                self.assertEqual(observation.status, 302)
+                self.assertEqual(observation.error, "redirect_not_followed")
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(check())
+
+    def test_loopback_http_observation_times_out_without_claiming_violation(self) -> None:
+        async def check() -> None:
+            async def ignore(_reader: asyncio.StreamReader, _writer: asyncio.StreamWriter) -> None:
+                await asyncio.Event().wait()
+
+            server = await asyncio.start_server(ignore, "127.0.0.1", 0)
+            port = int(server.sockets[0].getsockname()[1])
+            try:
+                observation = await loopback_http_observation(port, "/health", timeout_s=0.05)
+                self.assertEqual(observation.state, "TIMEOUT")
+                self.assertIsNone(observation.status)
+                self.assertEqual(observation.error, "request_timeout")
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(check())
+
+    def test_loopback_http_observation_distinguishes_unreachable(self) -> None:
+        observation = asyncio.run(loopback_http_observation(free_port(), "/health"))
+        self.assertEqual(observation.state, "UNREACHABLE")
+        self.assertEqual(observation.error, "connection_refused")
 
     def test_a_second_server_with_the_same_name_is_refused(self) -> None:
         self.port = free_port()

@@ -49,6 +49,9 @@ from actionmesh.providers.base import ProviderError
 #: Read ceiling for one ``device.files.read`` — the same 256 KiB the existing
 #: ``device.file.read`` handler enforces, so a new capability is never a wider door.
 MAX_READ_BYTES = 256 * 1024
+# File-integrity checks intentionally have a larger but fixed ceiling. Hashing is a
+# read-only capability and must not become an unbounded disk scan.
+MAX_HASH_BYTES = 16 * 1024 * 1024
 #: Write ceiling for one create / edit / edited-file, and the copy ceiling.
 MAX_WRITE_BYTES = 1024 * 1024
 #: Ceiling on one listing or search.
@@ -150,6 +153,7 @@ class FilesEngine:
         "compare": "device.files.compare",
         "open": "device.files.open",
         "info": "device.files.info",
+        "hash": "device.files.hash",
         "create": "device.files.create",
         "rename": "device.files.rename",
         "move": "device.files.move",
@@ -359,6 +363,45 @@ class FilesEngine:
             "mtime": st.st_mtime,
             "kind": _kind_for(st.st_mode),
         }
+
+    def hash(self, path: str) -> dict[str, Any]:
+        """Hash one confined regular file, rejecting links, oversized and racing reads."""
+        resolved = _resolve(self.workspace, path, must_exist=True)
+        try:
+            fd = _open_fd(self.workspace, resolved, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_HASH_BYTES:
+                    raise ProviderError(
+                        f"Choose a regular file no larger than {MAX_HASH_BYTES} bytes.",
+                        FailureKind.INVALID_INPUT,
+                    )
+                digest = hashlib.sha256()
+                total = 0
+                while True:
+                    chunk = handle.read(min(1024 * 1024, MAX_HASH_BYTES + 1 - total))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_HASH_BYTES:
+                        raise ProviderError(
+                            f"File grew beyond the {MAX_HASH_BYTES} byte hashing limit.",
+                            FailureKind.PROVIDER,
+                        )
+                    digest.update(chunk)
+                after = os.fstat(handle.fileno())
+        except OSError as exc:
+            raise ProviderError("Could not hash the confined file.", FailureKind.PROVIDER) from exc
+        if (
+            total != before.st_size
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            raise ProviderError("The file changed while its hash was being captured.", FailureKind.PROVIDER)
+        return {"path": resolved.relative, "size": total, "sha256": digest.hexdigest()}
 
     def create(self, path: str, content: str) -> dict[str, Any]:
         """Write one confined file from scratch (HIGH ``file.write``).
@@ -737,6 +780,7 @@ class FilesEngine:
 
 
 __all__ = [
+    "MAX_HASH_BYTES",
     "MAX_LIST_ENTRIES",
     "MAX_READ_BYTES",
     "MAX_WRITE_BYTES",

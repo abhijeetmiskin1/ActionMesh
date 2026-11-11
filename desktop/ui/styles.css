@@ -962,6 +962,18 @@ h1, h2, h3, h4 { color: var(--ink); }
   gap: var(--sp-3);
 }
 .form-grid > .form-row { margin-bottom: 0; }
+.result-block {
+  max-height: 280px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: #F6F9F6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--ink-dim);
+}
 
 .cfg-status {
   margin-top: var(--sp-3);

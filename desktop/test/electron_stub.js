@@ -203,6 +203,10 @@ const sessionApi = {
   fromPartition() { return sharedSession; },
 };
 
+const dialog = {
+  async showOpenDialog() { return { canceled: true, filePaths: [] }; },
+};
+
 /** Invoke a registered IPC handler the way preload would. */
 function invoke(channel, ...args) {
   const handler = store.handlers.get(channel);
@@ -222,6 +226,7 @@ module.exports = {
   nativeImage,
   shell,
   session: sessionApi,
+  dialog,
   safeStorage,
   ipcMain,
   __store: store,

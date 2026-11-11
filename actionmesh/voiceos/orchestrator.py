@@ -327,6 +327,7 @@ class Orchestrator:
                             "type": step.action_type,
                             "provider": self._provider_for(step.action_type),
                             "parameters": dict(step.parameters),
+                            **({"idempotency_key": step.idempotency_key} if step.idempotency_key else {}),
                             **self._declared_risk(step.action_type),
                         },
                     },

@@ -270,6 +270,28 @@ class TestInfo(_EngineCase):
         self.assert_escape_refused(lambda: self.engine.info(".ssh/id_rsa"))
 
 
+class TestHash(_EngineCase):
+    def test_hash_returns_digest_without_file_contents(self) -> None:
+        body = b"integrity baseline\n"
+        self.make("baseline.txt", body.decode())
+        result = self.engine.hash("baseline.txt")
+        self.assertEqual(result, {
+            "path": "baseline.txt", "size": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        })
+        self.assertNotIn("content", result)
+
+    def test_hash_rejects_symlink_and_oversized_file(self) -> None:
+        victim = os.path.join(self.root, "baseline.txt")
+        self.make("baseline.txt", "safe")
+        os.symlink(victim, os.path.join(self.root, "link.txt"))
+        self.assert_escape_refused(lambda: self.engine.hash("link.txt"))
+        from actionmesh.agent.files import MAX_HASH_BYTES
+        self.make("large.bin", "x" * (MAX_HASH_BYTES + 1))
+        with self.assertRaises(ProviderError):
+            self.engine.hash("large.bin")
+
+
 class TestCreate(_EngineCase):
     def test_create_writes_and_reports_digest(self) -> None:
         result = self.engine.create("new.txt", "hello")

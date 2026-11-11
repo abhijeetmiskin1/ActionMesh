@@ -19,7 +19,7 @@
  *     included, and nothing is written to disk.
  */
 const {
-  app, BrowserWindow, Menu, Tray, Notification, globalShortcut, ipcMain,
+  app, BrowserWindow, Menu, Tray, Notification, globalShortcut, ipcMain, dialog,
   nativeImage, session, shell, safeStorage, screen, systemPreferences,
 } = require('electron');
 const crypto = require('crypto');
@@ -53,7 +53,7 @@ const ALLOWED_PREFIXES = [
   // edited from the Automations and History views. The whole family lives under this
   // one prefix, so it is admitted once and the segment boundary in `assertAllowed`
   // keeps `/automationsX` out.
-  '/automations', '/continuum', '/parallelworld',
+  '/automations', '/continuum', '/parallelworld', '/api/v1',
   '/voiceos', '/manifest.webmanifest',
 ];
 
@@ -688,6 +688,36 @@ function registerIpc() {
     const dir = app.getPath('userData');
     await shell.openPath(dir);
     return dir;
+  });
+
+  ipcMain.handle('projects:pick-folder', async () => {
+    const workspaceRoot = backend?.settings?.workspaceRoot || backend?.dirs?.workspace;
+    if (!workspaceRoot || !fs.existsSync(workspaceRoot)) {
+      return { ok: false, error: 'Configure the approved workspace folder first.' };
+    }
+    const result = await dialog.showOpenDialog(mainWindow || undefined, {
+      title: 'Choose a project inside the approved workspace',
+      defaultPath: workspaceRoot,
+      properties: ['openDirectory'],
+    });
+    if (result.canceled || !result.filePaths || !result.filePaths.length) {
+      return { ok: false, canceled: true };
+    }
+    try {
+      const root = fs.realpathSync(workspaceRoot);
+      const selected = fs.realpathSync(result.filePaths[0]);
+      const relative = path.relative(root, selected);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        return { ok: false, error: 'Choose a folder inside the approved workspace.' };
+      }
+      return {
+        ok: true,
+        path: relative || '.',
+        name: path.basename(selected) || 'Workspace',
+      };
+    } catch {
+      return { ok: false, error: 'The selected folder is not available.' };
+    }
   });
 
   ipcMain.handle('api:request', async (_event, request) => {

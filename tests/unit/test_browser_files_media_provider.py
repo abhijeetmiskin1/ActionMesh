@@ -116,7 +116,7 @@ class TestC42Registration(unittest.TestCase):
         files = {c for c in CAPABILITIES if c.startswith("device.files.")}
         media = {c for c in CAPABILITIES if c.startswith("media.")}
         self.assertEqual(len(browser), 14, browser)
-        self.assertEqual(len(files), 13, files)
+        self.assertEqual(len(files), 14, files)
         self.assertEqual(len(media), 8, media)
         for capability in browser | files | media:
             self.assertIn(capability, IMPLEMENTED, capability)
